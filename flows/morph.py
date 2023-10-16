@@ -76,9 +76,15 @@ Once the OpenAI API key is added, you can proceed with running the program.
     @staticmethod
     def build_generate_transition():
 
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+
         async def transition(action):
 
-            text = "mrph> Enter the file name for saving the generated file:"
+            if not openai_api_key:
+                text = "mrph> Please, configure the LLM API key as stated in \"/settings\"."
+            else:
+                text = "mrph> Enter the file name for saving the generated file:"
+
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
         return transition
@@ -151,6 +157,7 @@ You can always return to the main menu by typing "/start".''',
             .edge("/analyze", "/start", "/start") \
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
             .edge("/generate_file_name_input", "/start", "/start") \
+            .edge("/generate_file_name_input", "/start", "/settings", on_transition=self.build_settings_transition()) \
             .edge(
                 "/generate_file_name_input",
                 "/generate_prompt_input",
