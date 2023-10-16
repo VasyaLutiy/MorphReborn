@@ -112,6 +112,11 @@ Once the OpenAI API key is added, you can proceed with running the program.
             response = MorphBot.augment_chat(messages)
 
             file_name = action["context"].get("generate_file_name")
+
+            # Save the response to a text file
+            with open(file_name, 'w', encoding='utf-8') as file:
+                file.write(response)
+
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
             await nested_transition(action)
