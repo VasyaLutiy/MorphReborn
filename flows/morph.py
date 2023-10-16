@@ -102,9 +102,6 @@ Once the OpenAI API key is added, you can proceed with running the program.
             prompt = action['text']
 
             messages = [{
-                "role": "assistant",
-                "content": ""
-            }, {
                 "role": "user",
                 "content": prompt
             }]
@@ -113,9 +110,13 @@ Once the OpenAI API key is added, you can proceed with running the program.
 
             file_name = action["context"].get("generate_file_name")
 
-            # Save the response to a text file
-            with open(file_name, 'w', encoding='utf-8') as file:
-                file.write(response)
+            # Parse code blocks
+            code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+
+            # Save code blocks to a text file
+            for language, code_block in code_blocks:
+                with open(file_name, 'w', encoding='utf-8') as file:
+                    file.write(f"{code_block}\n")
 
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
