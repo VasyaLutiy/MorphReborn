@@ -44,7 +44,7 @@ To get started with the GPT Morph CLI Bot, follow these steps:
 - To view your OpenAI API key settings, select the "/settings" option.
 - Explore other available commands in the main menu.
 
-### Example #1 - a new Python "Hello, world!" application
+### Example #1 - generating a new Python "Hello, world!" application
 ```text
 $ mkdir python_hello_world
 
@@ -82,6 +82,64 @@ print("Hello, world!")
 
 $ python main.py
 Hello, world!
+```
+
+### Example #2 - generating a Rust socket application
+```text
+$ mkdir rust_hello_socket
+
+$ cd rust_hello_socket/
+
+$ gedit .env
+
+$ cat .env
+OPENAI_API_KEY=sk-********
+
+$ mrph
+mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
+            
+Please choose one of the following options:
+1. /generate - Generate a new file for your project.
+2. /settings - Display your LLM settings.
+3. /graph - Graphviz representation for this bot's API.
+
+To execute a command, type the corresponding option and press Enter.
+
+You can always return to the main menu by typing "/start".
+[['Analyze', 'Generate', 'Patch'], ['Settings', 'Help']]
+/generate
+mrph> Enter the file name for saving the generated file:
+main.rs
+mrph> Ok, I will create a file "main.rs" when finished. What should be in this file?
+Please, generate a Rust application, showing how to use sockets to access https://google.com.
+mrph> Your "main.rs" file was saved.
+
+$ ls
+main.rs
+
+$ cat main.rs 
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::str;
+
+fn main() {
+    // Connect to Google's server on port 443 using a TCP stream
+    let mut stream = TcpStream::connect("google.com:443").expect("Failed to connect to Google");
+
+    // Send an HTTP GET request to the server
+    let request = "GET / HTTP/1.1\r\nHost: google.com\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("Failed to send request");
+
+    // Read the response from the server
+    let mut buffer = [0; 2048];
+    let response = stream.read(&mut buffer).expect("Failed to read response");
+
+    // Convert the response bytes to a string
+    let response_str = str::from_utf8(&buffer[..response]).unwrap();
+
+    // Print the response
+    println!("Response from Google:\n{}", response_str);
+}
 ```
 
 ## BASH Bot API graph
