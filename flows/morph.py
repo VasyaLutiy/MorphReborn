@@ -1,5 +1,6 @@
 import os
 import re
+import openai
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
 
@@ -7,7 +8,37 @@ from pysyun.conversation.flow.console_bot import ConsoleBot
 class MorphBot(ConsoleBot):
 
     def __init__(self, token):
+
         super().__init__(token)
+
+        openai.api_key = os.getenv('OPENAI_API_KEY')
+
+    @staticmethod
+    def augment_chat(messages):
+
+        total_word_count = 0
+        bottom_items = []
+
+        for item in reversed(messages):
+            word_count = len(item['content'].split())
+            total_word_count += word_count
+            if total_word_count < 4097:
+                bottom_items.append(item)
+            else:
+                print("Skipping context", item)
+
+        bottom_items.reverse()
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=bottom_items
+        )
+
+        result = ''
+        for choice in response.choices:
+            result += choice.message.content
+
+        return result
 
     @staticmethod
     def build_settings_transition():
@@ -67,6 +98,19 @@ Once the OpenAI API key is added, you can proceed with running the program.
     def build_generate_prompt_input_transition(nested_transition):
 
         async def transition(action):
+
+            prompt = action['text']
+
+            messages = [{
+                "role": "assistant",
+                "content": ""
+            }, {
+                "role": "user",
+                "content": prompt
+            }]
+
+            response = MorphBot.augment_chat(messages)
+
             file_name = action["context"].get("generate_file_name")
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
