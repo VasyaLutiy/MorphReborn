@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+
 import openai
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
@@ -130,6 +132,14 @@ Once the OpenAI API key is added, you can proceed with running the program.
 
         return transition
 
+    @staticmethod
+    def build_exit_transition():
+
+        async def transition(action):
+            sys.exit()
+
+        return transition
+
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
             '''mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
@@ -153,10 +163,10 @@ You can always return to the main menu by typing "/start".''',
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/start", "/settings", on_transition=self.build_settings_transition()) \
             .edge("/start", "/start", "/help") \
-            .edge("/start", "/analyze", "/analyze") \
-            .edge("/analyze", "/start", "/start") \
+            .edge("/start", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
             .edge("/generate_file_name_input", "/start", "/start") \
+            .edge("/generate_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/generate_file_name_input", "/start", "/settings", on_transition=self.build_settings_transition()) \
             .edge(
                 "/generate_file_name_input",
@@ -164,10 +174,11 @@ You can always return to the main menu by typing "/start".''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_generate_file_name_input_transition()) \
+            .edge("/generate_prompt_input", "/start", "/start") \
+            .edge("/generate_prompt_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/generate_prompt_input",
                 "/start",
                 None,
                 matcher=re.compile("^.*$"),
-                on_transition=self.build_generate_prompt_input_transition(main_menu_transition)) \
-            .edge("/generate_prompt_input", "/start", "/start")
+                on_transition=self.build_generate_prompt_input_transition(main_menu_transition))
