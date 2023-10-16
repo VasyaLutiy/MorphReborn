@@ -8,34 +8,81 @@ The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's 
 - **Settings Display:** Check and display your OpenAI API key settings.
 - **Graph Visualization:** View a Graphviz representation of the bot's API.
 
+## Installing the GPT Morph CLI
+```shell
+pip install git+https://github.com/pysyun/python_gptmorph_cli.git
+```
+
 ## Getting Started
 
 To get started with the GPT Morph CLI Bot, follow these steps:
 
-1. Clone this repository to your local machine.
+1. Install it using PIP as stated above.
 
-2. Set up your OpenAI API Key:
+2. Navigate to a project having the OpenAI API Key in the ".env" file.
+
+3. Or, set up your OpenAI API Key for a new project:
    - Create a file named ".env" in the project folder.
    - Open the .env file and add the following line:
      ```
      OPENAI_API_KEY=<YOUR_API_KEY>
      ```
-     Replace `<YOUR_API_KEY>` with your actual OpenAI API key.
+   - Replace `<YOUR_API_KEY>` with your actual OpenAI API key.
      If you don't have an API key yet, sign up at [OpenAI Platform](https://platform.openai.com/signup).
    - Save the .env file.
 
-3. Run the program:
+4. Run the bot:
     ```shell
-    python main.py
+    mrph
     ```
 
-4. You will be prompted with a main menu that allows you to choose different options, such as text generation, settings display, and more.
+5. You will be prompted with a main menu that allows you to choose different options, such as text generation, settings display, and more.
 
 ## Usage
 
 - To generate text, select the "/generate" option and follow the prompts.
 - To view your OpenAI API key settings, select the "/settings" option.
 - Explore other available commands in the main menu.
+
+### Example #1 - a new Python "Hello, world!" application
+```text
+$ mkdir python_hello_world
+
+$ cd python_hello_world/
+
+$ gedit .env
+
+$ cat .env
+OPENAI_API_KEY=sk-*********
+
+$ mrph
+mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
+            
+Please choose one of the following options:
+1. /generate - Generate a new file for your project.
+2. /settings - Display your LLM settings.
+3. /graph - Graphviz representation for this bot's API.
+
+To execute a command, type the corresponding option and press Enter.
+
+You can always return to the main menu by typing "/start".
+[['Analyze', 'Generate', 'Patch'], ['Settings', 'Help']]
+/generate
+mrph> Enter the file name for saving the generated file:
+main.py
+mrph> Ok, I will create a file "main.py" when finished. What should be in this file?
+Please, generate a Python "Hello, world" application.   
+mrph> Your "main.py" file was saved.
+
+$ ls
+main.py
+
+$ cat main.py 
+print("Hello, world!")
+
+$ python main.py
+Hello, world!
+```
 
 ## BASH Bot API graph
 ![GPT Morph CLI Bot API graph](./flows/morph.png)
