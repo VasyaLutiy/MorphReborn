@@ -19,7 +19,7 @@ class RefactorBot(ConsoleBot):
             if openai_api_key:
                 text = f"Your OpenAI API key (.env): \"{openai_api_key}\""
             else:
-                text = '''
+                text = '''mrph>
                 --------------------------------------------------
                     OPENAI API KEY NOT FOUND
 
@@ -43,10 +43,42 @@ class RefactorBot(ConsoleBot):
 
         return transition
 
+    @staticmethod
+    def build_generate_transition():
+
+        async def transition(action):
+
+            text = "mrph> Enter the file name for saving the generated file:"
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
+    def build_generate_file_name_input_transition():
+
+        async def transition(action):
+
+            text = f"mrph> Ok, I will create a file \"{action['text']}\" when finished. What should be in this file?"
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
+    def build_generate_prompt_input_transition(nested_transition):
+
+        async def transition(action):
+
+            text = f"mrph> Your \"\" file was saved."
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+            await nested_transition(action)
+
+        return transition
+
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
-            "GPT Morph CLI",
-            [["Analyze", "Generate"], ["Settings", "Help"]])
+            "mrph> Welcome to the GPT Morph CLI!",
+            [["Analyze", "Generate", "Patch"], ["Settings", "Help"]])
 
         return builder \
             .edge(
@@ -56,4 +88,21 @@ class RefactorBot(ConsoleBot):
                 on_transition=self.build_graphviz_response_transition()) \
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/start", "/settings", on_transition=self.build_settings_transition()) \
-            .edge("/start", "/start", None, matcher=re.compile("/help|Help"))
+            .edge("/start", "/start", "/help") \
+            .edge("/start", "/analyze", "/analyze") \
+            .edge("/analyze", "/start", "/start") \
+            .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
+            .edge("/generate_file_name_input", "/start", "/start") \
+            .edge(
+                "/generate_file_name_input",
+                "/generate_prompt_input",
+                None,
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_generate_file_name_input_transition()) \
+            .edge(
+                "/generate_prompt_input",
+                "/start",
+                None,
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_generate_prompt_input_transition(main_menu_transition)) \
+            .edge("/generate_prompt_input", "/start", "/start")

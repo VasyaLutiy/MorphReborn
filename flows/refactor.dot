@@ -1,0 +1,13 @@
+digraph G {
+	"/start" -> "/start" [label="/graph"]
+	"/start" -> "/start" [label="/start"]
+	"/start" -> "/start" [label="/settings"]
+	"/start" -> "/start" [label="/help"]
+	"/start" -> "/analyze" [label="/analyze"]
+	"/analyze" -> "/start" [label="/start"]
+	"/start" -> "/generate_file_name_input" [label="/generate"]
+	"/generate_file_name_input" -> "/start" [label="/start"]
+	"/generate_file_name_input" -> "/generate_prompt_input" [label="^.*$"]
+	"/generate_prompt_input" -> "/start" [label="^.*$"]
+	"/generate_prompt_input" -> "/start" [label="/start"]
+}
