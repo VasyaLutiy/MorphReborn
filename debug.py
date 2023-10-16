@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 
-from flows.refactor import RefactorBot
+from flows.morph import MorphBot
 
 load_dotenv()
 
-RefactorBot(None).run()
+MorphBot(None).run()

@@ -4,7 +4,7 @@ import re
 from pysyun.conversation.flow.console_bot import ConsoleBot
 
 
-class RefactorBot(ConsoleBot):
+class MorphBot(ConsoleBot):
 
     def __init__(self, token):
         super().__init__(token)
@@ -20,24 +20,23 @@ class RefactorBot(ConsoleBot):
                 text = f"Your OpenAI API key (.env): \"{openai_api_key}\""
             else:
                 text = '''mrph>
-                --------------------------------------------------
-                    OPENAI API KEY NOT FOUND
+--------------------------------------------------
+    OPENAI API KEY NOT FOUND
 
-                Please set your OpenAI API key by following these steps:
+Please set your OpenAI API key by following these steps:
 
-                1. Create a file named ".env" in the project folder.
-                2. Open the .env file and add the following line:
-                      OPENAI_API_KEY=<YOUR_API_KEY>
-                   Replace <YOUR_API_KEY> with your actual OpenAI API key.
+1. Create a file named ".env" in the project folder.
+2. Open the .env file and add the following line:
+      OPENAI_API_KEY=<YOUR_API_KEY>
+   Replace <YOUR_API_KEY> with your actual OpenAI API key.
 
-                   If you don't have an API key yet, sign up at https://platform.openai.com/signup
+   If you don't have an API key yet, sign up at https://platform.openai.com/signup
 
-                3. Save the .env file.
+3. Save the .env file.
 
-                Once the OpenAI API key is added, you can proceed with running the program.
+Once the OpenAI API key is added, you can proceed with running the program.
 
-                --------------------------------------------------
-                '''
+--------------------------------------------------'''
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
@@ -77,7 +76,16 @@ class RefactorBot(ConsoleBot):
 
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
-            "mrph> Welcome to the GPT Morph CLI!",
+            '''mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
+            
+Please choose one of the following options:
+1. /generate - Generate a new file for your project.
+2. /settings - Display your LLM settings.
+3. /graph - Graphviz representation for this bot's API.
+
+To execute a command, type the corresponding option and press Enter.
+
+You can always return to the main menu by typing "/start".''',
             [["Analyze", "Generate", "Patch"], ["Settings", "Help"]])
 
         return builder \
