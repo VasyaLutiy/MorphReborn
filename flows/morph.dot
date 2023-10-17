@@ -12,4 +12,12 @@ digraph G {
 	"/generate_prompt_input" -> "/start" [label="/start"]
 	"/generate_prompt_input" -> "/start" [label="/exit"]
 	"/generate_prompt_input" -> "/start" [label="^.*$"]
+	"/start" -> "/patch_file_name_input" [label="/patch"]
+	"/patch_file_name_input" -> "/start" [label="/start"]
+	"/patch_file_name_input" -> "/start" [label="/exit"]
+	"/patch_file_name_input" -> "/start" [label="/settings"]
+	"/patch_file_name_input" -> "/patch_prompt_input" [label="^.*$"]
+	"/patch_prompt_input" -> "/start" [label="/start"]
+	"/patch_prompt_input" -> "/start" [label="/exit"]
+	"/patch_prompt_input" -> "/start" [label="^.*$"]
 }
