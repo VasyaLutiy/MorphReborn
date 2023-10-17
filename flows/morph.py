@@ -174,10 +174,10 @@ Once the OpenAI API key is added, you can proceed with running the program.
 
                 messages = [{
                     "role": "system",
-                    "content": "Let's re-factor the file provided."
+                    "content": f"Let's update the {file_name} file provided."
                 }, {
                     "role": "assistant",
-                    "content": f"Original file:\n\n{file_contents}"
+                    "content": f"Original file:\n\n---\n{file_contents}\n---\n"
                 }, {
                     "role": "user",
                     "content": prompt
@@ -185,6 +185,7 @@ Once the OpenAI API key is added, you can proceed with running the program.
 
                 # Augment the file contents based on the user's prompt
                 response = MorphBot.augment_chat(messages)
+                print(response)
 
                 # Parse code blocks
                 code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
