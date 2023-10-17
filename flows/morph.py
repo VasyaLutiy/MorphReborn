@@ -76,6 +76,22 @@ Once the OpenAI API key is added, you can proceed with running the program.
         return transition
 
     @staticmethod
+    def build_help_transition():
+        async def transition(action):
+
+            text = '''/generate - Generate a new file for your project based on a human language description.
+/patch - Update an existing file (re-factor) by prompting what the update should be.
+/settings - Display your LLM settings.
+/graph - Graphviz representation for this bot's API.
+/help - Show this help page.
+/exit - Close the application.
+            '''
+
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
     def build_generate_transition():
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -142,6 +158,7 @@ Once the OpenAI API key is added, you can proceed with running the program.
             }]
 
             response = MorphBot.augment_chat(messages)
+            print(f"llm> {response}")
 
             file_name = action["context"].get("generate_file_name")
 
@@ -185,7 +202,7 @@ Once the OpenAI API key is added, you can proceed with running the program.
 
                 # Augment the file contents based on the user's prompt
                 response = MorphBot.augment_chat(messages)
-                print(response)
+                print(f"llm> {response}")
 
                 # Parse code blocks
                 code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
@@ -215,16 +232,9 @@ Once the OpenAI API key is added, you can proceed with running the program.
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
             '''mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
-            
-Please choose one of the following options:
-1. /generate - Generate a new file for your project based on a human language description.
-2. /patch - Update an existing file (re-factor) by prompting what the update should be.
-3. /settings - Display your LLM settings.
-4. /graph - Graphviz representation for this bot's API.
-
 To execute a command, type the corresponding option and press Enter.
-
-You can always return to the main menu by typing "/start".''',
+You can always return to the main menu by typing "/start".
+Type "/help" for more.\n''',
             [["Analyze", "Generate", "Patch"], ["Settings", "Help"]])
 
         return builder \
@@ -235,7 +245,7 @@ You can always return to the main menu by typing "/start".''',
                 on_transition=self.build_graphviz_response_transition()) \
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/start", "/settings", on_transition=self.build_settings_transition()) \
-            .edge("/start", "/start", "/help") \
+            .edge("/start", "/start", "/help", on_transition=self.build_help_transition()) \
             .edge("/start", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
             .edge("/generate_file_name_input", "/start", "/start") \
@@ -248,7 +258,6 @@ You can always return to the main menu by typing "/start".''',
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_generate_file_name_input_transition()) \
             .edge("/generate_prompt_input", "/start", "/start") \
-            .edge("/generate_prompt_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/generate_prompt_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/generate_prompt_input",
