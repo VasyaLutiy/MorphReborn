@@ -5,6 +5,7 @@ import sys
 import openai
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
+from authenticator import ClaudeAuthenticator
 
 
 class MorphBot(ConsoleBot):
@@ -46,15 +47,18 @@ class MorphBot(ConsoleBot):
     def build_settings_transition():
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
+        claude_cookie = os.getenv("CLAUDE_COOKIE")
 
         async def transition(action):
 
+            text = "mrph>\n"
+            help_prompt = ""
+
             if openai_api_key:
-                text = f"Your OpenAI API key (.env): \"{openai_api_key}\""
+                text += f"Your OpenAI API key (.env): \"{openai_api_key}\"\n\n"
             else:
-                text = '''mrph>
---------------------------------------------------
-    OPENAI API KEY NOT FOUND
+                help_prompt += '''--------------------------------------------------
+    HOW TO GET OPENAI API KEY?
 
 Please set your OpenAI API key by following these steps:
 
@@ -69,9 +73,36 @@ Please set your OpenAI API key by following these steps:
 
 Once the OpenAI API key is added, you can proceed with running the program.
 
---------------------------------------------------'''
+--------------------------------------------------
+'''
+
+            if claude_cookie:
+                text += f"Your Claude (Anthropic) API key (.env): \"{claude_cookie}\"\n\n"
+            else:
+                help_prompt += '''--------------------------------------------------
+    HOW TO GET Claude (Anthropic) API KEY?
+    
+Claude official API is not for all.
+Therefore, we are using the Web API for accessing Claude:
+
+1. Open the Claude Web Authenticator by typing "/authenticate_claude".
+2. Enter your credentials to authenticate into https://claude.ai/.
+3. Enjoy!
+
+--------------------------------------------------
+'''
+
+            text += help_prompt
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
+    def build_authenticate_claude_transition():
+
+        async def transition(action):
+            await ClaudeAuthenticator().process_async([])
 
         return transition
 
@@ -244,7 +275,13 @@ Type "/help" for more.\n''',
                 "/graph",
                 on_transition=self.build_graphviz_response_transition()) \
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
-            .edge("/start", "/start", "/settings", on_transition=self.build_settings_transition()) \
+            .edge("/start", "/settings", "/settings", on_transition=self.build_settings_transition()) \
+            .edge(
+                "/settings",
+                "/start",
+                "/authenticate_claude",
+                on_transition=self.build_authenticate_claude_transition()) \
+            .edge("/settings", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/start", "/help", on_transition=self.build_help_transition()) \
             .edge("/start", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \

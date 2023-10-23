@@ -1,7 +1,9 @@
 digraph G {
 	"/start" -> "/start" [label="/graph"]
 	"/start" -> "/start" [label="/start"]
-	"/start" -> "/start" [label="/settings"]
+	"/start" -> "/settings" [label="/settings"]
+	"/settings" -> "/start" [label="/authenticate_claude"]
+	"/settings" -> "/start" [label="/start"]
 	"/start" -> "/start" [label="/help"]
 	"/start" -> "/start" [label="/exit"]
 	"/start" -> "/generate_file_name_input" [label="/generate"]
