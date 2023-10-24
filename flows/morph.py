@@ -7,6 +7,8 @@ import openai
 from pysyun.conversation.flow.console_bot import ConsoleBot
 from authenticator import ClaudeAuthenticator
 
+from settings import load_settings
+
 
 class MorphBot(ConsoleBot):
 
@@ -14,7 +16,7 @@ class MorphBot(ConsoleBot):
 
         super().__init__(token)
 
-        openai.api_key = os.getenv('OPENAI_API_KEY')
+        load_settings()
 
     @staticmethod
     def augment_chat(messages):
@@ -43,13 +45,12 @@ class MorphBot(ConsoleBot):
 
         return result
 
-    @staticmethod
-    def build_settings_transition():
-
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        claude_cookie = os.getenv("CLAUDE_COOKIE")
+    def build_settings_transition(self):
 
         async def transition(action):
+
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            claude_cookie = os.getenv("CLAUDE_COOKIE")
 
             text = "mrph>\n"
             help_prompt = ""
@@ -94,7 +95,8 @@ Therefore, we are using the Web API for accessing Claude:
 
             text += help_prompt
 
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+            nested_transition = self.build_menu_response_transition(text, ["Start", "Authenticate Claude", "Exit"])
+            await nested_transition(action)
 
         return transition
 
@@ -102,7 +104,12 @@ Therefore, we are using the Web API for accessing Claude:
     def build_authenticate_claude_transition():
 
         async def transition(action):
+
             await ClaudeAuthenticator().process_async([])
+
+            load_settings()
+
+            print("Claude API authenticated")
 
         return transition
 
@@ -266,7 +273,7 @@ Therefore, we are using the Web API for accessing Claude:
 To execute a command, type the corresponding option and press Enter.
 You can always return to the main menu by typing "/start".
 Type "/help" for more.\n''',
-            [["Analyze", "Generate", "Patch"], ["Settings", "Help"]])
+            [["Analyze", "Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph"]])
 
         return builder \
             .edge(
