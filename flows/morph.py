@@ -295,7 +295,7 @@ Type "/help" for more.\n''',
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
             .edge("/generate_file_name_input", "/start", "/start") \
             .edge("/generate_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge("/generate_file_name_input", "/start", "/settings", on_transition=self.build_settings_transition()) \
+            .edge("/generate_file_name_input", "/settings", "/settings", on_transition=self.build_settings_transition()) \
             .edge(
                 "/generate_file_name_input",
                 "/generate_prompt_input",
@@ -313,7 +313,7 @@ Type "/help" for more.\n''',
             .edge("/start", "/patch_file_name_input", "/patch", on_transition=self.build_patch_transition()) \
             .edge("/patch_file_name_input", "/start", "/start") \
             .edge("/patch_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge("/patch_file_name_input", "/start", "/settings", on_transition=self.build_settings_transition()) \
+            .edge("/patch_file_name_input", "/settings", "/settings", on_transition=self.build_settings_transition()) \
             .edge(
                 "/patch_file_name_input",
                 "/patch_prompt_input",
@@ -327,4 +327,8 @@ Type "/help" for more.\n''',
                 "/start",
                 None,
                 matcher=re.compile("^.*$"),
-                on_transition=self.build_patch_prompt_input_transition(main_menu_transition))
+                on_transition=self.build_patch_prompt_input_transition(main_menu_transition)) \
+            .edge("/start", "/analyze", "/analyze") \
+            .edge("/analyze", "/start", "/start") \
+            .edge("/analyze", "/settings", "/settings") \
+            .edge("/analyze", "/start", "/exit", on_transition=self.build_exit_transition())
