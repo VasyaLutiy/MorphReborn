@@ -276,6 +276,7 @@ Type "/help" for more.\n''',
                 on_transition=self.build_graphviz_response_transition()) \
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/settings", "/settings", on_transition=self.build_settings_transition()) \
+            .edge("/settings", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/settings",
                 "/start",

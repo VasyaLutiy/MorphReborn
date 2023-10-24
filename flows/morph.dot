@@ -2,6 +2,7 @@ digraph G {
 	"/start" -> "/start" [label="/graph"]
 	"/start" -> "/start" [label="/start"]
 	"/start" -> "/settings" [label="/settings"]
+	"/settings" -> "/start" [label="/exit"]
 	"/settings" -> "/start" [label="/authenticate_claude"]
 	"/settings" -> "/start" [label="/start"]
 	"/start" -> "/start" [label="/help"]
