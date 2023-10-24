@@ -332,7 +332,26 @@ Type "/help" for more.\n''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_patch_prompt_input_transition(main_menu_transition)) \
-            .edge("/start", "/analyze", "/analyze") \
-            .edge("/analyze", "/start", "/start") \
-            .edge("/analyze", "/settings", "/settings") \
-            .edge("/analyze", "/start", "/exit", on_transition=self.build_exit_transition())
+            .edge("/start", "/analyze_file_name_input", "/analyze") \
+            .edge("/analyze_file_name_input", "/start", "/start") \
+            .edge("/analyze_file_name_input", "/settings", "/settings") \
+            .edge("/analyze_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/analyze_file_name_input",
+                "/analyze_file_name_output",
+                None,
+                matcher=re.compile("^.*$")) \
+            .edge("/analyze_file_name_output", "/start", "/start") \
+            .edge("/analyze_file_name_output", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/analyze_file_name_output",
+                "/analyze_type",
+                None,
+                matcher=re.compile("^.*$")) \
+            .edge("/analyze_type", "/start", "/start") \
+            .edge("/analyze_type", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/analyze_type",
+                "/start",
+                None,
+                matcher=re.compile("^.*$"))
