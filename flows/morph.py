@@ -103,7 +103,7 @@ Therefore, we are using the Web API for accessing Claude:
     @staticmethod
     def build_authenticate_claude_transition():
 
-        async def transition(action):
+        async def transition(_):
 
             await ClaudeAuthenticator().process_async([])
 
@@ -262,7 +262,7 @@ Therefore, we are using the Web API for accessing Claude:
     @staticmethod
     def build_exit_transition():
 
-        async def transition(action):
+        async def transition(_):
             sys.exit()
 
         return transition
@@ -295,7 +295,11 @@ Type "/help" for more.\n''',
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
             .edge("/generate_file_name_input", "/start", "/start") \
             .edge("/generate_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge("/generate_file_name_input", "/settings", "/settings", on_transition=self.build_settings_transition()) \
+            .edge(
+                "/generate_file_name_input",
+                "/settings",
+                "/settings",
+                on_transition=self.build_settings_transition()) \
             .edge(
                 "/generate_file_name_input",
                 "/generate_prompt_input",
