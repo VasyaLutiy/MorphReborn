@@ -146,6 +146,22 @@ Therefore, we are using the Web API for accessing Claude:
         return transition
 
     @staticmethod
+    def build_analyze_transition():
+
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+
+        async def transition(action):
+
+            if not openai_api_key:
+                text = "mrph> Please, configure the LLM API key as stated in \"/settings\"."
+            else:
+                text = "mrph> Enter the file name to be analyzed:"
+
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
     def build_patch_transition():
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -180,6 +196,29 @@ Therefore, we are using the Web API for accessing Claude:
             action["context"].add("patch_file_name", file_name)
             text = f"mrph> Loaded \"{file_name}\". How to augment that?"
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
+    def build_analyze_file_name_input_transition():
+
+        async def transition(action):
+            file_name = action['text']
+            action["context"].add("analyze_file_name_input", file_name)
+            text = f"mrph> Loaded \"{file_name}\". Where to save a report?"
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    def build_analyze_file_name_output_transition(self):
+
+        async def transition(action):
+            file_name = action['text']
+            action["context"].add("analyze_file_name_output", file_name)
+            text = f"mrph> Will be saving report to \"{file_name}\". How do you want to analyze?"
+
+            nested_transition = self.build_menu_response_transition(text, ["Crypto Audit"])
+            await nested_transition(action)
 
         return transition
 
@@ -251,6 +290,52 @@ Therefore, we are using the Web API for accessing Claude:
                         file.write(f"{code_block}\n")
 
                 text = f"mrph> File \"{file_name}\" has been augmented based on your prompt."
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+                await nested_transition(action)
+            except Exception as e:
+                text = f"mrph> An error occurred while processing the file: {str(e)}"
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
+    def build_crypto_audit_transition(nested_transition):
+        async def transition(action):
+
+            analyze_file_name_input = action['context'].get("analyze_file_name_input")
+            analyze_file_name_output = action['context'].get("analyze_file_name_output")
+
+            try:
+                # Load file contents
+                with open(analyze_file_name_input, 'r', encoding='utf-8') as file:
+                    file_contents = file.read()
+
+                # The agent profile
+                profile = '''You are a Solidity smart contract audit expert. The user sends you a smart contract 
+                code. You return the list of possible errors in this contract including: 1. Security issues. 2. Code 
+                style issues. 3. Performance improvements. Please, return results as a report in the Markdown format.'''
+
+                messages = [{
+                    "role": "system",
+                    "content": profile
+                }, {
+                    "role": "user",
+                    "content": f"The file name is: {analyze_file_name_input}."
+                }, {
+                    "role": "user",
+                    "content": file_contents
+                }]
+
+                # Augment the file contents based on the user's prompt
+                response = MorphBot.augment_chat(messages)
+                print(f"llm> {response}")
+
+                # Save response to a text file
+                with open(analyze_file_name_output, 'w', encoding='utf-8') as file:
+                    file.write(response)
+
+                text = f"mrph> File \"{analyze_file_name_input}\" analysis report \"{analyze_file_name_output}\" has " \
+                       f"been saved."
                 await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
                 await nested_transition(action)
             except Exception as e:
@@ -332,7 +417,7 @@ Type "/help" for more.\n''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_patch_prompt_input_transition(main_menu_transition)) \
-            .edge("/start", "/analyze_file_name_input", "/analyze") \
+            .edge("/start", "/analyze_file_name_input", "/analyze", on_transition=self.build_analyze_transition()) \
             .edge("/analyze_file_name_input", "/start", "/start") \
             .edge("/analyze_file_name_input", "/settings", "/settings") \
             .edge("/analyze_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
@@ -340,18 +425,20 @@ Type "/help" for more.\n''',
                 "/analyze_file_name_input",
                 "/analyze_file_name_output",
                 None,
-                matcher=re.compile("^.*$")) \
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_analyze_file_name_input_transition()) \
             .edge("/analyze_file_name_output", "/start", "/start") \
             .edge("/analyze_file_name_output", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/analyze_file_name_output",
                 "/analyze_type",
                 None,
-                matcher=re.compile("^.*$")) \
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_analyze_file_name_output_transition()) \
             .edge("/analyze_type", "/start", "/start") \
             .edge("/analyze_type", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/analyze_type",
                 "/start",
-                None,
-                matcher=re.compile("^.*$"))
+                "/crypto_audit",
+                on_transition=self.build_crypto_audit_transition(main_menu_transition))
