@@ -3,6 +3,7 @@ import re
 import sys
 
 import openai
+from dialog import ClaudeDialog
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
 from authenticator import ClaudeAuthenticator
@@ -47,7 +48,13 @@ class MorphBot(ConsoleBot):
 
     @staticmethod
     def augment_chat_with_claude(messages):
-        return messages[0]["content"]
+
+        content = "\n".join(item["content"] for item in messages)
+
+        dialog = ClaudeDialog()
+        data = dialog.process([content])
+
+        return data[0]
 
     @staticmethod
     def augment_chat(messages):
