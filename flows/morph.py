@@ -19,7 +19,7 @@ class MorphBot(ConsoleBot):
         load_settings()
 
     @staticmethod
-    def augment_chat(messages):
+    def augment_chat_with_openai(messages):
 
         total_word_count = 0
         bottom_items = []
@@ -44,6 +44,22 @@ class MorphBot(ConsoleBot):
             result += choice.message.content
 
         return result
+
+    @staticmethod
+    def augment_chat_with_claude(messages):
+        return messages[0]["content"]
+
+    @staticmethod
+    def augment_chat(messages):
+
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        claude_cookie = os.getenv("CLAUDE_COOKIE")
+
+        # Prefer Claude over OpenAI
+        if claude_cookie is not None:
+            return MorphBot.augment_chat_with_claude(messages)
+        elif openai_api_key is not None:
+            return MorphBot.augment_chat_with_openai(messages)
 
     def build_settings_transition(self):
 
@@ -215,7 +231,8 @@ Therefore, we are using the Web API for accessing Claude:
         async def transition(action):
             file_name = action['text']
             action["context"].add("analyze_file_name_output", file_name)
-            text = f"mrph> Will be saving report to \"{file_name}\". How do you want to analyze?"
+            text = f"mrph> Will be saving report to \"{file_name}\". Which AI assistant profile would you prefer to " \
+                   f"use for analyzing your code?"
 
             nested_transition = self.build_menu_response_transition(text, ["Crypto Audit"])
             await nested_transition(action)
