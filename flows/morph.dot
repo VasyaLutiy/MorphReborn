@@ -33,5 +33,5 @@ digraph G {
 	"/analyze_file_name_output" -> "/analyze_type" [label="^.*$"]
 	"/analyze_type" -> "/start" [label="/start"]
 	"/analyze_type" -> "/start" [label="/exit"]
-	"/analyze_type" -> "/start" [label="^.*$"]
+	"/analyze_type" -> "/start" [label="/crypto_audit"]
 }

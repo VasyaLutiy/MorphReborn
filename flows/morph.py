@@ -211,14 +211,15 @@ Therefore, we are using the Web API for accessing Claude:
 
         return transition
 
-    @staticmethod
-    def build_patch_file_name_input_transition():
+    def build_patch_file_name_input_transition(self):
 
         async def transition(action):
+
             file_name = action['text']
             action["context"].add("patch_file_name", file_name)
             text = f"mrph> Loaded \"{file_name}\". How to augment that?"
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+            await self.build_menu_response_transition(text, ['/todo (criticize and add comments)', '*'])(action)
 
         return transition
 
@@ -369,6 +370,50 @@ Therefore, we are using the Web API for accessing Claude:
         return transition
 
     @staticmethod
+    def build_todo_transition(nested_transition):
+        async def transition(action):
+
+            file_name = action['context'].get("patch_file_name")
+
+            try:
+                # Load file contents
+                with open(file_name, 'r', encoding='utf-8') as file:
+                    file_contents = file.read()
+
+                messages = [{
+                    "role": "system",
+                    "content": f"Let's update the {file_name} file provided."
+                }, {
+                    "role": "assistant",
+                    "content": f"Original file:\n\n---\n{file_contents}\n---\n"
+                }, {
+                    "role": "user",
+                    "content": "Please, criticize this file contents and add \"TODO:\" comments, saying, what can be "
+                               "improved."
+                }]
+
+                # Augment the file contents based on the user's prompt
+                response = MorphBot.augment_chat(messages)
+                print(f"llm> {response}")
+
+                # Parse code blocks
+                code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+
+                text = f"mrph> The file \"{file_name}\" has been criticized. Please, review \"TODO:\" comments."
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+                await nested_transition(action)
+            except Exception as e:
+                text = f"mrph> An error occurred while processing the file: {str(e)}"
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
     def build_exit_transition():
 
         async def transition(_):
@@ -435,6 +480,11 @@ Type "/help" for more.\n''',
                 on_transition=self.build_patch_file_name_input_transition()) \
             .edge("/patch_prompt_input", "/start", "/start") \
             .edge("/patch_prompt_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/patch_prompt_input",
+                "/start",
+                "/todo",
+                on_transition=self.build_todo_transition(main_menu_transition)) \
             .edge(
                 "/patch_prompt_input",
                 "/start",
