@@ -15,7 +15,7 @@ class LLMDialog:
         self.conversation.append({
             self.speaker_field: speaker,
             self.text_field: text,
-            "time": time
+            "time": int(time.timestamp()) * 1000
         })
 
     def json(self):

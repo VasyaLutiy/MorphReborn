@@ -8,6 +8,7 @@ from dialog import ClaudeDialog
 from pysyun.conversation.flow.console_bot import ConsoleBot
 from authenticator import ClaudeAuthenticator
 
+from llm_dialog import LLMDialog
 from settings import load_settings
 
 
@@ -57,16 +58,16 @@ class MorphBot(ConsoleBot):
         return data[0]
 
     @staticmethod
-    def augment_chat(messages):
+    def augment_chat(dialog):
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
         claude_cookie = os.getenv("CLAUDE_COOKIE")
 
         # Prefer Claude over OpenAI
         if claude_cookie is not None:
-            return MorphBot.augment_chat_with_claude(messages)
+            return MorphBot.augment_chat_with_claude(dialog.conversation)
         elif openai_api_key is not None:
-            return MorphBot.augment_chat_with_openai(messages)
+            return MorphBot.augment_chat_with_openai(dialog.conversation)
 
     def build_settings_transition(self):
 
@@ -254,12 +255,11 @@ Therefore, we are using the Web API for accessing Claude:
 
             prompt = action['text']
 
-            messages = [{
-                "role": "user",
-                "content": prompt
-            }]
+            # The dialog
+            dialog = LLMDialog()
+            dialog.assign("user", prompt)
 
-            response = MorphBot.augment_chat(messages)
+            response = MorphBot.augment_chat(dialog)
             print(f"llm> {response}")
 
             file_name = action["context"].get("generate_file_name")
@@ -291,19 +291,14 @@ Therefore, we are using the Web API for accessing Claude:
 
                 prompt = action['text']
 
-                messages = [{
-                    "role": "system",
-                    "content": f"Let's update the {file_name} file provided."
-                }, {
-                    "role": "assistant",
-                    "content": f"Original file:\n\n---\n{file_contents}\n---\n"
-                }, {
-                    "role": "user",
-                    "content": prompt
-                }]
+                # The dialog
+                dialog = LLMDialog()
+                dialog.assign("system", f"Let's update the {file_name} file provided.")
+                dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
+                dialog.assign("user", prompt)
 
                 # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(messages)
+                response = MorphBot.augment_chat(dialog)
                 print(f"llm> {response}")
 
                 # Parse code blocks
@@ -340,19 +335,14 @@ Therefore, we are using the Web API for accessing Claude:
                 code. You return the list of possible errors in this contract including: 1. Security issues. 2. Code 
                 style issues. 3. Performance improvements. Please, return results as a report in the Markdown format.'''
 
-                messages = [{
-                    "role": "system",
-                    "content": profile
-                }, {
-                    "role": "user",
-                    "content": f"The file name is: {analyze_file_name_input}."
-                }, {
-                    "role": "user",
-                    "content": file_contents
-                }]
+                # The dialog
+                dialog = LLMDialog()
+                dialog.assign("system", profile)
+                dialog.assign("user", f"The file name is: {analyze_file_name_input}.")
+                dialog.assign("user", file_contents)
 
                 # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(messages)
+                response = MorphBot.augment_chat(dialog)
                 print(f"llm> {response}")
 
                 # Save response to a text file
@@ -380,20 +370,15 @@ Therefore, we are using the Web API for accessing Claude:
                 with open(file_name, 'r', encoding='utf-8') as file:
                     file_contents = file.read()
 
-                messages = [{
-                    "role": "system",
-                    "content": f"Let's update the {file_name} file provided."
-                }, {
-                    "role": "assistant",
-                    "content": f"Original file:\n\n---\n{file_contents}\n---\n"
-                }, {
-                    "role": "user",
-                    "content": "Please, criticize this file contents and add \"TODO:\" comments, saying, what can be "
-                               "improved."
-                }]
+                # The dialog
+                dialog = LLMDialog()
+                dialog.assign("system", f"Let's update the {file_name} file provided.")
+                dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
+                dialog.assign("user", "Please, criticize this file contents and add \"TODO:\" comments, saying, "
+                                      "what can be improved.")
 
                 # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(messages)
+                response = MorphBot.augment_chat(dialog)
                 print(f"llm> {response}")
 
                 # Parse code blocks
