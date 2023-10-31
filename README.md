@@ -201,6 +201,37 @@ In this updated code, we:
 mrph> File "tests/test_source.py" has been augmented based on your prompt.
 ```
 
+### Example #4 - code reviews by injecting "TODO:" comments
+```text
+mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
+To execute a command, type the corresponding option and press Enter.
+You can always return to the main menu by typing "/start".
+Type "/help" for more.
+
+[['Analyze', 'Generate', 'Patch'], ['Settings', 'Help', 'Exit'], ['Graph']]
+/patch
+mrph> Enter the file name to be patched:
+main.py
+mrph> Loaded "main.py". How to augment that?
+['/todo (criticize and add comments)', '*']
+/todo
+llm>  Here is the updated main.py file with some suggested improvements:
+
+---
+# TODO: Add module docstring explaining what this module does
+
+print("Hello, world!") 
+
+# TODO: Print output could be improved to be more descriptive
+# TODO: Add input validation to handle invalid input
+# TODO: Wrap code in function to allow reuse
+
+---
+mrph> The file "main.py" has been criticized. Please, review "TODO:" comments.
+
+/exit
+```
+
 ## BASH Bot API graph
 ![GPT Morph CLI Bot API graph](./flows/morph.png)
 [morph.dot](./flows/morph.dot)
