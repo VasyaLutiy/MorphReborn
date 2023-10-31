@@ -3,8 +3,12 @@ import re
 import sys
 
 import openai
+from dialog import ClaudeDialog
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
+from authenticator import ClaudeAuthenticator
+
+from settings import load_settings
 
 
 class MorphBot(ConsoleBot):
@@ -13,10 +17,10 @@ class MorphBot(ConsoleBot):
 
         super().__init__(token)
 
-        openai.api_key = os.getenv('OPENAI_API_KEY')
+        load_settings()
 
     @staticmethod
-    def augment_chat(messages):
+    def augment_chat_with_openai(messages):
 
         total_word_count = 0
         bottom_items = []
@@ -43,18 +47,42 @@ class MorphBot(ConsoleBot):
         return result
 
     @staticmethod
-    def build_settings_transition():
+    def augment_chat_with_claude(messages):
+
+        content = "\n".join(item["content"] for item in messages)
+
+        dialog = ClaudeDialog()
+        data = dialog.process([content])
+
+        return data[0]
+
+    @staticmethod
+    def augment_chat(messages):
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
+        claude_cookie = os.getenv("CLAUDE_COOKIE")
+
+        # Prefer Claude over OpenAI
+        if claude_cookie is not None:
+            return MorphBot.augment_chat_with_claude(messages)
+        elif openai_api_key is not None:
+            return MorphBot.augment_chat_with_openai(messages)
+
+    def build_settings_transition(self):
 
         async def transition(action):
 
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            claude_cookie = os.getenv("CLAUDE_COOKIE")
+
+            text = "mrph>\n"
+            help_prompt = ""
+
             if openai_api_key:
-                text = f"Your OpenAI API key (.env): \"{openai_api_key}\""
+                text += f"Your OpenAI API key (.env): \"{openai_api_key}\"\n\n"
             else:
-                text = '''mrph>
---------------------------------------------------
-    OPENAI API KEY NOT FOUND
+                help_prompt += '''--------------------------------------------------
+    HOW TO GET OPENAI API KEY?
 
 Please set your OpenAI API key by following these steps:
 
@@ -69,9 +97,42 @@ Please set your OpenAI API key by following these steps:
 
 Once the OpenAI API key is added, you can proceed with running the program.
 
---------------------------------------------------'''
+--------------------------------------------------
+'''
 
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+            if claude_cookie:
+                text += f"Your Claude (Anthropic) API key (.env): \"{claude_cookie}\"\n\n"
+            else:
+                help_prompt += '''--------------------------------------------------
+    HOW TO GET Claude (Anthropic) API KEY?
+    
+Claude official API is not for all.
+Therefore, we are using the Web API for accessing Claude:
+
+1. Open the Claude Web Authenticator by typing "/authenticate_claude".
+2. Enter your credentials to authenticate into https://claude.ai/.
+3. Enjoy!
+
+--------------------------------------------------
+'''
+
+            text += help_prompt
+
+            nested_transition = self.build_menu_response_transition(text, ["Start", "Authenticate Claude", "Exit"])
+            await nested_transition(action)
+
+        return transition
+
+    @staticmethod
+    def build_authenticate_claude_transition():
+
+        async def transition(_):
+
+            await ClaudeAuthenticator().process_async([])
+
+            load_settings()
+
+            print("Claude API authenticated")
 
         return transition
 
@@ -108,6 +169,22 @@ Once the OpenAI API key is added, you can proceed with running the program.
         return transition
 
     @staticmethod
+    def build_analyze_transition():
+
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+
+        async def transition(action):
+
+            if not openai_api_key:
+                text = "mrph> Please, configure the LLM API key as stated in \"/settings\"."
+            else:
+                text = "mrph> Enter the file name to be analyzed:"
+
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
     def build_patch_transition():
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -134,14 +211,39 @@ Once the OpenAI API key is added, you can proceed with running the program.
 
         return transition
 
-    @staticmethod
-    def build_patch_file_name_input_transition():
+    def build_patch_file_name_input_transition(self):
 
         async def transition(action):
+
             file_name = action['text']
             action["context"].add("patch_file_name", file_name)
             text = f"mrph> Loaded \"{file_name}\". How to augment that?"
+
+            await self.build_menu_response_transition(text, ['/todo (criticize and add comments)', '*'])(action)
+
+        return transition
+
+    @staticmethod
+    def build_analyze_file_name_input_transition():
+
+        async def transition(action):
+            file_name = action['text']
+            action["context"].add("analyze_file_name_input", file_name)
+            text = f"mrph> Loaded \"{file_name}\". Where to save a report?"
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    def build_analyze_file_name_output_transition(self):
+
+        async def transition(action):
+            file_name = action['text']
+            action["context"].add("analyze_file_name_output", file_name)
+            text = f"mrph> Will be saving report to \"{file_name}\". Which AI assistant profile would you prefer to " \
+                   f"use for analyzing your code?"
+
+            nested_transition = self.build_menu_response_transition(text, ["Crypto Audit"])
+            await nested_transition(action)
 
         return transition
 
@@ -222,9 +324,99 @@ Once the OpenAI API key is added, you can proceed with running the program.
         return transition
 
     @staticmethod
+    def build_crypto_audit_transition(nested_transition):
+        async def transition(action):
+
+            analyze_file_name_input = action['context'].get("analyze_file_name_input")
+            analyze_file_name_output = action['context'].get("analyze_file_name_output")
+
+            try:
+                # Load file contents
+                with open(analyze_file_name_input, 'r', encoding='utf-8') as file:
+                    file_contents = file.read()
+
+                # The agent profile
+                profile = '''You are a Solidity smart contract audit expert. The user sends you a smart contract 
+                code. You return the list of possible errors in this contract including: 1. Security issues. 2. Code 
+                style issues. 3. Performance improvements. Please, return results as a report in the Markdown format.'''
+
+                messages = [{
+                    "role": "system",
+                    "content": profile
+                }, {
+                    "role": "user",
+                    "content": f"The file name is: {analyze_file_name_input}."
+                }, {
+                    "role": "user",
+                    "content": file_contents
+                }]
+
+                # Augment the file contents based on the user's prompt
+                response = MorphBot.augment_chat(messages)
+                print(f"llm> {response}")
+
+                # Save response to a text file
+                with open(analyze_file_name_output, 'w', encoding='utf-8') as file:
+                    file.write(response)
+
+                text = f"mrph> File \"{analyze_file_name_input}\" analysis report \"{analyze_file_name_output}\" has " \
+                       f"been saved."
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+                await nested_transition(action)
+            except Exception as e:
+                text = f"mrph> An error occurred while processing the file: {str(e)}"
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
+    def build_todo_transition(nested_transition):
+        async def transition(action):
+
+            file_name = action['context'].get("patch_file_name")
+
+            try:
+                # Load file contents
+                with open(file_name, 'r', encoding='utf-8') as file:
+                    file_contents = file.read()
+
+                messages = [{
+                    "role": "system",
+                    "content": f"Let's update the {file_name} file provided."
+                }, {
+                    "role": "assistant",
+                    "content": f"Original file:\n\n---\n{file_contents}\n---\n"
+                }, {
+                    "role": "user",
+                    "content": "Please, criticize this file contents and add \"TODO:\" comments, saying, what can be "
+                               "improved."
+                }]
+
+                # Augment the file contents based on the user's prompt
+                response = MorphBot.augment_chat(messages)
+                print(f"llm> {response}")
+
+                # Parse code blocks
+                code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+
+                text = f"mrph> The file \"{file_name}\" has been criticized. Please, review \"TODO:\" comments."
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+                await nested_transition(action)
+            except Exception as e:
+                text = f"mrph> An error occurred while processing the file: {str(e)}"
+                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
     def build_exit_transition():
 
-        async def transition(action):
+        async def transition(_):
             sys.exit()
 
         return transition
@@ -235,7 +427,7 @@ Once the OpenAI API key is added, you can proceed with running the program.
 To execute a command, type the corresponding option and press Enter.
 You can always return to the main menu by typing "/start".
 Type "/help" for more.\n''',
-            [["Analyze", "Generate", "Patch"], ["Settings", "Help"]])
+            [["Analyze", "Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph"]])
 
         return builder \
             .edge(
@@ -244,13 +436,24 @@ Type "/help" for more.\n''',
                 "/graph",
                 on_transition=self.build_graphviz_response_transition()) \
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
-            .edge("/start", "/start", "/settings", on_transition=self.build_settings_transition()) \
+            .edge("/start", "/settings", "/settings", on_transition=self.build_settings_transition()) \
+            .edge("/settings", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/settings",
+                "/start",
+                "/authenticate_claude",
+                on_transition=self.build_authenticate_claude_transition()) \
+            .edge("/settings", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/start", "/help", on_transition=self.build_help_transition()) \
             .edge("/start", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
             .edge("/generate_file_name_input", "/start", "/start") \
             .edge("/generate_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge("/generate_file_name_input", "/start", "/settings", on_transition=self.build_settings_transition()) \
+            .edge(
+                "/generate_file_name_input",
+                "/settings",
+                "/settings",
+                on_transition=self.build_settings_transition()) \
             .edge(
                 "/generate_file_name_input",
                 "/generate_prompt_input",
@@ -268,7 +471,7 @@ Type "/help" for more.\n''',
             .edge("/start", "/patch_file_name_input", "/patch", on_transition=self.build_patch_transition()) \
             .edge("/patch_file_name_input", "/start", "/start") \
             .edge("/patch_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge("/patch_file_name_input", "/start", "/settings", on_transition=self.build_settings_transition()) \
+            .edge("/patch_file_name_input", "/settings", "/settings", on_transition=self.build_settings_transition()) \
             .edge(
                 "/patch_file_name_input",
                 "/patch_prompt_input",
@@ -280,6 +483,36 @@ Type "/help" for more.\n''',
             .edge(
                 "/patch_prompt_input",
                 "/start",
+                "/todo",
+                on_transition=self.build_todo_transition(main_menu_transition)) \
+            .edge(
+                "/patch_prompt_input",
+                "/start",
                 None,
                 matcher=re.compile("^.*$"),
-                on_transition=self.build_patch_prompt_input_transition(main_menu_transition))
+                on_transition=self.build_patch_prompt_input_transition(main_menu_transition)) \
+            .edge("/start", "/analyze_file_name_input", "/analyze", on_transition=self.build_analyze_transition()) \
+            .edge("/analyze_file_name_input", "/start", "/start") \
+            .edge("/analyze_file_name_input", "/settings", "/settings") \
+            .edge("/analyze_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/analyze_file_name_input",
+                "/analyze_file_name_output",
+                None,
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_analyze_file_name_input_transition()) \
+            .edge("/analyze_file_name_output", "/start", "/start") \
+            .edge("/analyze_file_name_output", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/analyze_file_name_output",
+                "/analyze_type",
+                None,
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_analyze_file_name_output_transition()) \
+            .edge("/analyze_type", "/start", "/start") \
+            .edge("/analyze_type", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/analyze_type",
+                "/start",
+                "/crypto_audit",
+                on_transition=self.build_crypto_audit_transition(main_menu_transition))

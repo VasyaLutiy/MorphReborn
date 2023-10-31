@@ -1,3 +1,4 @@
 openai
 python-dotenv
 git+https://github.com/pysyun/pysyun_conversation_flow.git
+git+https://github.com/pysyun/python_claude_web_authenticator.git
