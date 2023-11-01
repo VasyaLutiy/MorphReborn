@@ -292,6 +292,9 @@ Therefore, we are using the Web API for accessing Claude:
                     if 'node_modules' in file_path:
                         return False
 
+                    if 'typechain-types' in file_path:
+                        return False
+
                     return (
                             file_path.endswith('.py') or
                             file_path.endswith('.sol') or
