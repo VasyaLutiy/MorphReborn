@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="mrph",
-    version="1.0.19",
+    version="1.0.20",
     scripts=["bin/mrph"],
     py_modules=["flows.morph", "settings", "llm_dialog", "folder_context_dialog"],
     install_requires=['openai', 'python-dotenv',
