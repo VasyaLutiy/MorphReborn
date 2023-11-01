@@ -287,8 +287,17 @@ Therefore, we are using the Web API for accessing Claude:
 
             try:
 
+                def filter_source_code_file_names(file_path):
+                    return \
+                            file_path.endswith('.py') or \
+                            file_path.endswith('.sol') or \
+                            file_path.endswith('.sh') or \
+                            file_path.endswith('.rs') or \
+                            file_path.endswith('.js') or \
+                            file_path.endswith('.ts')
+
                 # Load the current folder context
-                context_folder = ContextFolderDialog(".")
+                context_folder = ContextFolderDialog(".", filter_callback=filter_source_code_file_names)
                 context_folder.process([])
 
                 # Load file contents
