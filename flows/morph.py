@@ -8,6 +8,7 @@ from dialog import ClaudeDialog
 from pysyun.conversation.flow.console_bot import ConsoleBot
 from authenticator import ClaudeAuthenticator
 
+from folder_context_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
 from settings import load_settings
 
@@ -285,6 +286,11 @@ Therefore, we are using the Web API for accessing Claude:
             file_name = action['context'].get("patch_file_name")
 
             try:
+
+                # Load the current folder context
+                context_folder = ContextFolderDialog(".")
+                context_folder.process([])
+
                 # Load file contents
                 with open(file_name, 'r', encoding='utf-8') as file:
                     file_contents = file.read()
@@ -295,6 +301,7 @@ Therefore, we are using the Web API for accessing Claude:
                 dialog = LLMDialog()
                 dialog.assign("system", f"Let's update the {file_name} file provided.")
                 dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
+                dialog += context_folder
                 dialog.assign("user", prompt)
 
                 # Augment the file contents based on the user's prompt

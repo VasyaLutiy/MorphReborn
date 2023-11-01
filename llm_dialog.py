@@ -12,10 +12,11 @@ class LLMDialog:
     def assign(self, speaker, text, time=None):
         if time is None:
             time = datetime.datetime.now()
+            time = int(time.timestamp()) * 1000
         self.conversation.append({
             self.speaker_field: speaker,
             self.text_field: text,
-            "time": int(time.timestamp()) * 1000
+            "time": time
         })
 
     def json(self):
