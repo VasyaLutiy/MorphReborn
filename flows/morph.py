@@ -8,9 +8,34 @@ from dialog import ClaudeDialog
 from pysyun.conversation.flow.console_bot import ConsoleBot
 from authenticator import ClaudeAuthenticator
 
-from folder_context_dialog import ContextFolderDialog
+from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
 from settings import load_settings
+
+
+def filter_source_code_file_names(file_path):
+    if 'node_modules' in file_path:
+        return False
+
+    if 'typechain-types' in file_path:
+        return False
+
+    return (
+            file_path.endswith('.py') or
+            file_path.endswith('.sol') or
+            file_path.endswith('.sh') or
+            file_path.endswith('.rs') or
+            file_path.endswith('.js') or
+            file_path.endswith('.ts')
+    )
+
+
+def build_current_project_context():
+    # Load the current folder context
+    context_folder = ContextFolderDialog(".", filter_callback=filter_source_code_file_names)
+    context_folder.process([])
+
+    return context_folder
 
 
 class MorphBot(ConsoleBot):
@@ -202,14 +227,13 @@ Therefore, we are using the Web API for accessing Claude:
 
         return transition
 
-    @staticmethod
-    def build_generate_file_name_input_transition():
+    def build_generate_file_name_input_transition(self):
 
         async def transition(action):
             file_name = action['text']
             action["context"].add("generate_file_name", file_name)
             text = f"mrph> Ok, I will create a file \"{file_name}\" when finished. What should be in this file?"
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+            await self.build_menu_response_transition(text, ['/unit_test', '*'])(action)
 
         return transition
 
@@ -287,27 +311,6 @@ Therefore, we are using the Web API for accessing Claude:
 
             try:
 
-                def filter_source_code_file_names(file_path):
-
-                    if 'node_modules' in file_path:
-                        return False
-
-                    if 'typechain-types' in file_path:
-                        return False
-
-                    return (
-                            file_path.endswith('.py') or
-                            file_path.endswith('.sol') or
-                            file_path.endswith('.sh') or
-                            file_path.endswith('.rs') or
-                            file_path.endswith('.js') or
-                            file_path.endswith('.ts')
-                    )
-
-                # Load the current folder context
-                context_folder = ContextFolderDialog(".", filter_callback=filter_source_code_file_names)
-                context_folder.process([])
-
                 # Load file contents
                 with open(file_name, 'r', encoding='utf-8') as file:
                     file_contents = file.read()
@@ -318,7 +321,7 @@ Therefore, we are using the Web API for accessing Claude:
                 dialog = LLMDialog()
                 dialog.assign("system", f"Let's update the {file_name} file provided.")
                 dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
-                dialog += context_folder
+                dialog += build_current_project_context()
                 dialog.assign("user", prompt)
 
                 # Augment the file contents based on the user's prompt
