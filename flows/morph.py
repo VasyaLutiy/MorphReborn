@@ -21,6 +21,7 @@ def filter_source_code_file_names(file_path):
         return False
 
     return (
+            file_path.endswith('.env') or
             file_path.endswith('.py') or
             file_path.endswith('.sol') or
             file_path.endswith('.sh') or
@@ -282,6 +283,7 @@ Therefore, we are using the Web API for accessing Claude:
 
             # The dialog
             dialog = LLMDialog()
+            dialog += build_current_project_context()
             dialog.assign("user", prompt)
 
             response = MorphBot.augment_chat(dialog)
