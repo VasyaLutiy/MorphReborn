@@ -1,4 +1,4 @@
-<img src="./mrph.png" style="float: right; width: 250px;" />
+<img src="./mrph.png" style="float: right; width: 750px;" />
 
 # GPT Morph CLI Bot
 
