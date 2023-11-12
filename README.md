@@ -1,5 +1,3 @@
-<img src="./mrph.png" style="float: right; width: 750px;" />
-
 # GPT Morph CLI Bot
 
 The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's GPT-3.5 or Anthropic's Claude. It allows you to interact with the GPT model to generate text and perform various tasks through a console-based interface.
@@ -14,6 +12,8 @@ The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's 
 ```shell
 pip install git+https://github.com/pysyun/python_gptmorph_cli.git
 ```
+
+<img src="./mrph.png" style="width: 750px;" />
 
 ## Getting Started
 
@@ -53,7 +53,7 @@ To get started with the **GPT Morph CLI Bot**, follow these steps:
 
 5. You will be prompted with a main menu that allows you to choose different options, such as text generation, settings display, and more.
 
-## Usage
+## Using the "mrph" CLI
 
 - To analyze project code, choose the "**/analyze**" option and follow the prompts.
 - To generate new code artifacts, select the "**/generate**" option and follow the prompts.
@@ -78,6 +78,7 @@ This project is licensed under the LGPL License - see the [LICENSE](LICENSE) fil
 
 ## Acknowledgments
 
-- This project uses OpenAI's GPT-3.5 for text generation.
+- This project uses **OpenAI's GPT-3.5** for text generation.
+- This project uses **Anthropic Claude** for text generation.
 
 Enjoy using the GPT Morph CLI Bot!
