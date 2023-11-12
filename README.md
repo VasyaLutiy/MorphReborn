@@ -29,6 +29,24 @@ Code morphing utilizes large language models (LLMs) like GPT-3.5, LLAMA or Claud
 
 By leveraging the understanding and generative abilities of LLMs, code morphing automates lower-level coding tasks so developers can focus on high-value priorities. The morphs act as a starting point that developers can further refine.
 
+## Glossary
+
+Here's a brief explanation of the terms "**morphs**", "**morpher**", and "**morphing**" in the context of **code morphing**:
+ 
+- The **MORPHS** refer to the outputs of the code morphing process - the modified code containing the requested changes. The morphs are the code snippets, files, or components that have been automatically transformed by the system.
+- The **MORPHER** is the core component that performs the morphing operation. It is the code morphing system, algorithm, or model (like GPT-3.5) that analyzes the code and generates the morphs. The morpher could be thought of as the "engine" that powers code morphing.
+- **MORPHING** is the process of automatically modifying the source code according to the requested changes. It involves the morpher understanding the existing code, interpreting the desired edits, and outputting the morphs. Morphing is the application of the morpher to transform code from one state to another per the prompts.
+
+In summary:
+
+**MORPHS** are the outputs - the modified code files and components.
+
+The **MORPHER** is the code morphing model or system carrying out the morphing process.
+
+**MORPHING** is the act of automatically transforming the code by applying the **MORPHER** to generate morphs.
+
+So **CODE MORPHING** leverages the **MORPHER** to perform **MORPHING** on source code and produce useful **MORPHS** for developers.
+
 ## Getting Started
 
 To get started with the **GPT Morph CLI Bot**, follow these steps:
