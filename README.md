@@ -1,3 +1,5 @@
+<img src="./mrph.png" style="float: right; width: 250px;" />
+
 # GPT Morph CLI Bot
 
 The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's GPT-3.5 or Anthropic's Claude. It allows you to interact with the GPT model to generate text and perform various tasks through a console-based interface.
