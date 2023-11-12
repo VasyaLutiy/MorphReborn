@@ -1,12 +1,10 @@
 # GPT Morph CLI Bot
 
+      **MORPHING** is the act of automatically transforming the code by applying the **MORPHER** to generate **MORPHS**.
+      
+      Andrew. (2023). *The Large Language Model code morphing*. Andrew's Blog. Retrieved 2023-11-12, from [https://andrewmikhailov.wordpress.com/2023/11/12/code-morphing/](https://andrewmikhailov.wordpress.com/2023/11/12/code-morphing/)
+
 The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's GPT-3.5 or Anthropic's Claude. It allows you to interact with the GPT model to generate text and perform various tasks through a console-based interface.
-
-## Features
-
-- **Text Generation:** You can use this bot to generate text based on your input and project requirements.
-- **Settings Display:** Check and display your OpenAI API key settings.
-- **Graph Visualization:** View a Graphviz representation of the bot's API.
 
 ## Installing the GPT Morph CLI
 ```shell
@@ -36,6 +34,7 @@ Here's a brief explanation of the terms "**morphs**", "**morpher**", and "**morp
 - The **MORPHS** refer to the outputs of the code morphing process - the modified code containing the requested changes. The morphs are the code snippets, files, or components that have been automatically transformed by the system.
 - The **MORPHER** is the core component that performs the morphing operation. It is the code morphing system, algorithm, or model (like GPT-3.5) that analyzes the code and generates the morphs. The morpher could be thought of as the "engine" that powers code morphing.
 - **MORPHING** is the process of automatically modifying the source code according to the requested changes. It involves the morpher understanding the existing code, interpreting the desired edits, and outputting the morphs. Morphing is the application of the morpher to transform code from one state to another per the prompts.
+- **CLI bot**, or command-line interface bot, is a bot or assistant program designed to be interacted with via a text-based command-line or terminal interface rather than a graphical user interface.
 
 In summary:
 
@@ -43,7 +42,7 @@ In summary:
 
 The **MORPHER** is the code morphing model or system carrying out the morphing process.
 
-**MORPHING** is the act of automatically transforming the code by applying the **MORPHER** to generate morphs.
+**MORPHING** is the act of automatically transforming the code by applying the **MORPHER** to generate **MORPHS**.
 
 So **CODE MORPHING** leverages the **MORPHER** to perform **MORPHING** on source code and produce useful **MORPHS** for developers.
 
@@ -84,6 +83,15 @@ To get started with the **GPT Morph CLI Bot**, follow these steps:
     ```
 
 5. You will be prompted with a main menu that allows you to choose different options, such as text generation, settings display, and more.
+
+## Features
+
+- **Text Generation:** You can use this bot to generate text based on your input and project requirements.
+- **Re-factoring**.
+- **Code audits**.
+- **Unit testing**.
+- **Settings Display:** Check and display your OpenAI API key settings.
+- **Graph Visualization:** View a Graphviz representation of the bot's API.
 
 ## Using the "mrph" CLI
 
