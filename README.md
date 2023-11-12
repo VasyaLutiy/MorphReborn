@@ -15,6 +15,20 @@ pip install git+https://github.com/pysyun/python_gptmorph_cli.git
 
 <img src="./mrph.png" style="width: 750px;" />
 
+## How code morphing works
+
+Code morphing utilizes large language models (LLMs) like GPT-3.5, LLAMA or Claude to analyze and modify source code. It takes as input the original code as well as a natural language description of the desired changes.
+
+1. The system first tries to deeply understand the existing code - its structure, intent, logic, dependencies, etc. It builds an abstract representation of the code.
+
+2. Next, it interprets the natural language prompt to determine the required modifications - adding/removing functions, changing algorithms, updating APIs, etc.
+
+3. It then generates new code by combining its understanding of the original code with the requested edits. The system is constrained to keep existing code structure and behavior unchanged where possible.
+
+4. Finally, it outputs the modified code with the changes applied. The programmer can then review, test, and integrate the morphs.
+
+By leveraging the understanding and generative abilities of LLMs, code morphing automates lower-level coding tasks so developers can focus on high-value priorities. The morphs act as a starting point that developers can further refine.
+
 ## Getting Started
 
 To get started with the **GPT Morph CLI Bot**, follow these steps:
