@@ -14,10 +14,14 @@ from settings import load_settings
 
 
 def filter_source_code_file_names(file_path):
+
     if 'node_modules' in file_path:
         return False
 
     if 'typechain-types' in file_path:
+        return False
+
+    if 'venv/' in file_path:
         return False
 
     return (
