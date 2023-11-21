@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import copy
 
 import openai
 from dialog import ClaudeDialog
@@ -98,11 +99,19 @@ class MorphBot(ConsoleBot):
         openai_api_key = os.getenv("OPENAI_API_KEY")
         claude_cookie = os.getenv("CLAUDE_COOKIE")
 
+        # Make a deep copy of the conversation
+        conversation = copy.deepcopy(dialog.conversation)
+
+        # Remove time fields
+        for message in conversation:
+            if 'time' in message:
+                del message['time']
+
         # Prefer Claude over OpenAI
         if claude_cookie is not None:
-            return MorphBot.augment_chat_with_claude(dialog.conversation)
+            return MorphBot.augment_chat_with_claude(conversation)
         elif openai_api_key is not None:
-            return MorphBot.augment_chat_with_openai(dialog.conversation)
+            return MorphBot.augment_chat_with_openai(conversation)
 
     def build_settings_transition(self):
 
