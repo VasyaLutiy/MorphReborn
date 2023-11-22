@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import copy
 
 import openai
 from dialog import ClaudeDialog
@@ -8,7 +9,43 @@ from dialog import ClaudeDialog
 from pysyun.conversation.flow.console_bot import ConsoleBot
 from authenticator import ClaudeAuthenticator
 
+from context_folder_dialog import ContextFolderDialog
+from llm_dialog import LLMDialog
 from settings import load_settings
+
+
+def filter_source_code_file_names(file_path):
+
+    if 'node_modules' in file_path:
+        return False
+
+    if 'typechain-types' in file_path:
+        return False
+
+    if 'venv/' in file_path:
+        return False
+
+    return (
+            file_path.endswith('Dockerfile') or
+            file_path.endswith('package.json') or
+            file_path.endswith('requirements.txt') or
+            file_path.endswith('.md') or
+            file_path.endswith('.env') or
+            file_path.endswith('.py') or
+            file_path.endswith('.sol') or
+            file_path.endswith('.sh') or
+            file_path.endswith('.rs') or
+            file_path.endswith('.js') or
+            file_path.endswith('.ts')
+    )
+
+
+def build_current_project_context():
+    # Load the current folder context
+    context_folder = ContextFolderDialog(".", filter_callback=filter_source_code_file_names)
+    context_folder.process([])
+
+    return context_folder
 
 
 class MorphBot(ConsoleBot):
@@ -57,16 +94,24 @@ class MorphBot(ConsoleBot):
         return data[0]
 
     @staticmethod
-    def augment_chat(messages):
+    def augment_chat(dialog):
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
         claude_cookie = os.getenv("CLAUDE_COOKIE")
 
+        # Make a deep copy of the conversation
+        conversation = copy.deepcopy(dialog.conversation)
+
+        # Remove time fields
+        for message in conversation:
+            if 'time' in message:
+                del message['time']
+
         # Prefer Claude over OpenAI
         if claude_cookie is not None:
-            return MorphBot.augment_chat_with_claude(messages)
+            return MorphBot.augment_chat_with_claude(conversation)
         elif openai_api_key is not None:
-            return MorphBot.augment_chat_with_openai(messages)
+            return MorphBot.augment_chat_with_openai(conversation)
 
     def build_settings_transition(self):
 
@@ -200,14 +245,13 @@ Therefore, we are using the Web API for accessing Claude:
 
         return transition
 
-    @staticmethod
-    def build_generate_file_name_input_transition():
+    def build_generate_file_name_input_transition(self):
 
         async def transition(action):
             file_name = action['text']
             action["context"].add("generate_file_name", file_name)
             text = f"mrph> Ok, I will create a file \"{file_name}\" when finished. What should be in this file?"
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+            await self.build_menu_response_transition(text, ['Unit test', '*'])(action)
 
         return transition
 
@@ -254,12 +298,12 @@ Therefore, we are using the Web API for accessing Claude:
 
             prompt = action['text']
 
-            messages = [{
-                "role": "user",
-                "content": prompt
-            }]
+            # The dialog
+            dialog = LLMDialog()
+            dialog += build_current_project_context()
+            dialog.assign("user", prompt)
 
-            response = MorphBot.augment_chat(messages)
+            response = MorphBot.augment_chat(dialog)
             print(f"llm> {response}")
 
             file_name = action["context"].get("generate_file_name")
@@ -279,31 +323,73 @@ Therefore, we are using the Web API for accessing Claude:
         return transition
 
     @staticmethod
+    def build_generate_unit_test_prompt_input_transition(nested_transition):
+
+        async def transition(action):
+
+            prompt = action['text']
+
+            # The dialog
+            dialog = LLMDialog()
+            dialog += build_current_project_context()
+            dialog.assign("user", "Please, generate a unit test for my project.")
+            dialog.assign("user", prompt)
+
+            response = MorphBot.augment_chat(dialog)
+            print(f"llm> {response}")
+
+            file_name = action["context"].get("generate_file_name")
+
+            # Parse code blocks
+            code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+
+            # Save code blocks to a text file
+            for language, code_block in code_blocks:
+                with open(file_name, 'w', encoding='utf-8') as file:
+                    file.write(f"{code_block}\n")
+
+            text = f"mrph> Your \"{file_name}\" file was saved."
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+            await nested_transition(action)
+
+        return transition
+
+    @staticmethod
+    def build_generate_prompt_input_unit_test_choice_transition():
+
+        async def transition(action):
+
+            file_name = action["context"].get("generate_file_name")
+
+            text = f"mrph> Will generate the \"{file_name}\" unit test. Please, describe, what should " \
+                   f"be checked in this test."
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
+
+        return transition
+
+    @staticmethod
     def build_patch_prompt_input_transition(nested_transition):
         async def transition(action):
 
             file_name = action['context'].get("patch_file_name")
 
             try:
+
                 # Load file contents
                 with open(file_name, 'r', encoding='utf-8') as file:
                     file_contents = file.read()
 
                 prompt = action['text']
 
-                messages = [{
-                    "role": "system",
-                    "content": f"Let's update the {file_name} file provided."
-                }, {
-                    "role": "assistant",
-                    "content": f"Original file:\n\n---\n{file_contents}\n---\n"
-                }, {
-                    "role": "user",
-                    "content": prompt
-                }]
+                # The dialog
+                dialog = LLMDialog()
+                dialog.assign("system", f"Let's update the {file_name} file provided.")
+                dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
+                dialog += build_current_project_context()
+                dialog.assign("user", prompt)
 
                 # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(messages)
+                response = MorphBot.augment_chat(dialog)
                 print(f"llm> {response}")
 
                 # Parse code blocks
@@ -340,19 +426,14 @@ Therefore, we are using the Web API for accessing Claude:
                 code. You return the list of possible errors in this contract including: 1. Security issues. 2. Code 
                 style issues. 3. Performance improvements. Please, return results as a report in the Markdown format.'''
 
-                messages = [{
-                    "role": "system",
-                    "content": profile
-                }, {
-                    "role": "user",
-                    "content": f"The file name is: {analyze_file_name_input}."
-                }, {
-                    "role": "user",
-                    "content": file_contents
-                }]
+                # The dialog
+                dialog = LLMDialog()
+                dialog.assign("system", profile)
+                dialog.assign("user", f"The file name is: {analyze_file_name_input}.")
+                dialog.assign("user", file_contents)
 
                 # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(messages)
+                response = MorphBot.augment_chat(dialog)
                 print(f"llm> {response}")
 
                 # Save response to a text file
@@ -380,20 +461,15 @@ Therefore, we are using the Web API for accessing Claude:
                 with open(file_name, 'r', encoding='utf-8') as file:
                     file_contents = file.read()
 
-                messages = [{
-                    "role": "system",
-                    "content": f"Let's update the {file_name} file provided."
-                }, {
-                    "role": "assistant",
-                    "content": f"Original file:\n\n---\n{file_contents}\n---\n"
-                }, {
-                    "role": "user",
-                    "content": "Please, criticize this file contents and add \"TODO:\" comments, saying, what can be "
-                               "improved."
-                }]
+                # The dialog
+                dialog = LLMDialog()
+                dialog.assign("system", f"Let's update the {file_name} file provided.")
+                dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
+                dialog.assign("user", "Please, criticize this file contents and add \"TODO:\" comments, saying, "
+                                      "what can be improved.")
 
                 # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(messages)
+                response = MorphBot.augment_chat(dialog)
                 print(f"llm> {response}")
 
                 # Parse code blocks
@@ -447,7 +523,7 @@ Type "/help" for more.\n''',
             .edge("/start", "/start", "/help", on_transition=self.build_help_transition()) \
             .edge("/start", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
-            .edge("/generate_file_name_input", "/start", "/start") \
+            .edge("/generate_file_name_input", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/generate_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/generate_file_name_input",
@@ -460,16 +536,29 @@ Type "/help" for more.\n''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_generate_file_name_input_transition()) \
-            .edge("/generate_prompt_input", "/start", "/start") \
+            .edge("/generate_prompt_input", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/generate_prompt_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/generate_prompt_input",
+                "/generate_unit_test_prompt_input",
+                "/unit_test",
+                on_transition=self.build_generate_prompt_input_unit_test_choice_transition()) \
             .edge(
                 "/generate_prompt_input",
                 "/start",
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_generate_prompt_input_transition(main_menu_transition)) \
+            .edge("/generate_unit_test_prompt_input", "/start", "/start", on_transition=main_menu_transition) \
+            .edge("/generate_unit_test_prompt_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/generate_unit_test_prompt_input",
+                "/start",
+                None,
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_generate_unit_test_prompt_input_transition(main_menu_transition)) \
             .edge("/start", "/patch_file_name_input", "/patch", on_transition=self.build_patch_transition()) \
-            .edge("/patch_file_name_input", "/start", "/start") \
+            .edge("/patch_file_name_input", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/patch_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/patch_file_name_input", "/settings", "/settings", on_transition=self.build_settings_transition()) \
             .edge(
@@ -478,7 +567,7 @@ Type "/help" for more.\n''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_patch_file_name_input_transition()) \
-            .edge("/patch_prompt_input", "/start", "/start") \
+            .edge("/patch_prompt_input", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/patch_prompt_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/patch_prompt_input",
@@ -492,7 +581,7 @@ Type "/help" for more.\n''',
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_patch_prompt_input_transition(main_menu_transition)) \
             .edge("/start", "/analyze_file_name_input", "/analyze", on_transition=self.build_analyze_transition()) \
-            .edge("/analyze_file_name_input", "/start", "/start") \
+            .edge("/analyze_file_name_input", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/analyze_file_name_input", "/settings", "/settings") \
             .edge("/analyze_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
@@ -501,7 +590,7 @@ Type "/help" for more.\n''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_analyze_file_name_input_transition()) \
-            .edge("/analyze_file_name_output", "/start", "/start") \
+            .edge("/analyze_file_name_output", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/analyze_file_name_output", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/analyze_file_name_output",
@@ -509,7 +598,7 @@ Type "/help" for more.\n''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_analyze_file_name_output_transition()) \
-            .edge("/analyze_type", "/start", "/start") \
+            .edge("/analyze_type", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/analyze_type", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
                 "/analyze_type",
