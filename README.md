@@ -6,6 +6,11 @@
 
 The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's GPT-3.5 or Anthropic's Claude. It allows you to interact with the GPT model to generate text and perform various tasks through a console-based interface.
 
+## GPT Morph Status
+✅ `ChatGPT API` active.
+
+🔴 `Claude Unofficial API` temporarily disabled.
+
 ## Installing the GPT Morph CLI
 ```shell
 pip install git+https://github.com/pysyun/python_gptmorph_cli.git
