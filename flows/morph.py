@@ -366,7 +366,7 @@ Therefore, we are using the Web API for accessing Claude:
             dialog = LLMDialog()
             dialog += build_current_project_context()
             message = f"Please, generate a logical statement flow graph in the Graphviz format for the \"{prompt}\" " \
-                      f"method."
+                      f"method. When necessary, expand methods being called."
             dialog.assign("user", message)
 
             response = MorphBot.augment_chat(dialog)
