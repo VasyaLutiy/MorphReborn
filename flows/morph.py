@@ -42,6 +42,7 @@ def filter_source_code_file_names(file_path):
             file_path.endswith('.yml') or
             file_path.endswith('.sql') or
             file_path.endswith('.ino') or
+            file_path.endswith('.proto') or
             file_path.endswith('.ts')
     )
 
