@@ -38,6 +38,7 @@ def filter_source_code_file_names(file_path):
             file_path.endswith('.rs') or
             file_path.endswith('.js') or
             file_path.endswith('.go') or
+            file_path.endswith('.fc') or
             file_path.endswith('.yaml') or
             file_path.endswith('.yml') or
             file_path.endswith('.sql') or
