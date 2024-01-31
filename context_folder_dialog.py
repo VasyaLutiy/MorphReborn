@@ -22,7 +22,7 @@ class ContextFolderDialog(LLMDialog):
                     continue
 
                 time = datetime.fromtimestamp(os.path.getmtime(file_path))
-                with open(file_path) as file:
+                with open(file_path, encoding='utf-8') as file:
                     print(f"Folder context file: {file_path}")
                     file_contents = file.read()
                     self.assign("user", f"Contents for another file \"{file_path}\" in this project:\n\n---\n{file_contents}\n---\n", int(time.timestamp()) * 1000)
