@@ -490,8 +490,8 @@ Therefore, we are using the Web API for accessing Claude:
                             file.write(f"{code_block}\n")
                 else:
 
-                    # Otherwise - save the complete response
-                    with open(file_name, 'w', encoding='utf-8') as file:
+                    # Otherwise - append the complete response
+                    with open(file_name, 'a', encoding='utf-8') as file:
                         file.write(response)
 
                 text = f"mrph> File \"{file_name}\" has been augmented based on your prompt."
