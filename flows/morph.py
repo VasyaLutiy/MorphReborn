@@ -67,7 +67,13 @@ class MorphBot(ConsoleBot):
 
     @staticmethod
     def augment_chat_with_ollama(uri, model, messages):
-        return OllamaProcessor(uri, model).process(messages)
+        stream = OllamaProcessor(uri, model).process(messages)
+
+        result = ''
+        if 0 < len(stream):
+            return stream[0]["value"]
+
+        return result
 
     @staticmethod
     def augment_chat_with_openai(messages):
