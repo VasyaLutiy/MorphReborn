@@ -334,11 +334,17 @@ Therefore, we are using the Web API for accessing Claude:
 
             # Parse code blocks
             code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+            if 0 < len(code_blocks):
 
-            # Save code blocks to a text file
-            for language, code_block in code_blocks:
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+            else:
+
+                # Otherwise - save the complete response
                 with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(f"{code_block}\n")
+                    file.write(response)
 
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -366,11 +372,17 @@ Therefore, we are using the Web API for accessing Claude:
 
             # Parse code blocks
             code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+            if 0 < len(code_blocks):
 
-            # Save code blocks to a text file
-            for language, code_block in code_blocks:
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+            else:
+
+                # Otherwise - save the complete response
                 with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(f"{code_block}\n")
+                    file.write(response)
 
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -399,11 +411,17 @@ Therefore, we are using the Web API for accessing Claude:
 
             # Parse code blocks
             code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+            if 0 < len(code_blocks):
 
-            # Save code blocks to a text file
-            for language, code_block in code_blocks:
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+            else:
+
+                # Otherwise - save the complete response
                 with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(f"{code_block}\n")
+                    file.write(response)
 
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -464,11 +482,17 @@ Therefore, we are using the Web API for accessing Claude:
 
                 # Parse code blocks
                 code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+                if 0 < len(code_blocks):
 
-                # Save code blocks to a text file
-                for language, code_block in code_blocks:
+                    # Save code blocks to a text file
+                    for language, code_block in code_blocks:
+                        with open(file_name, 'w', encoding='utf-8') as file:
+                            file.write(f"{code_block}\n")
+                else:
+
+                    # Otherwise - save the complete response
                     with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(f"{code_block}\n")
+                        file.write(response)
 
                 text = f"mrph> File \"{file_name}\" has been augmented based on your prompt."
                 await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -544,11 +568,17 @@ Therefore, we are using the Web API for accessing Claude:
 
                 # Parse code blocks
                 code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+                if 0 < len(code_blocks):
 
-                # Save code blocks to a text file
-                for language, code_block in code_blocks:
+                    # Save code blocks to a text file
+                    for language, code_block in code_blocks:
+                        with open(file_name, 'w', encoding='utf-8') as file:
+                            file.write(f"{code_block}\n")
+                else:
+
+                    # Otherwise - save the complete response
                     with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(f"{code_block}\n")
+                        file.write(response)
 
                 text = f"mrph> The file \"{file_name}\" has been criticized. Please, review \"TODO:\" comments."
                 await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
