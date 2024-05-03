@@ -11,6 +11,7 @@ from authenticator import ClaudeAuthenticator
 
 from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
+from ollama_processor import OllamaProcessor
 from settings import load_settings
 
 
@@ -64,6 +65,10 @@ class MorphBot(ConsoleBot):
         load_settings()
 
     @staticmethod
+    def augment_chat_with_ollama(uri, model, messages):
+        return OllamaProcessor(uri, model).process(messages)
+
+    @staticmethod
     def augment_chat_with_openai(messages):
 
         total_word_count = 0
@@ -103,6 +108,8 @@ class MorphBot(ConsoleBot):
     @staticmethod
     def augment_chat(dialog):
 
+        ollama_endpoint_uri = os.getenv("OLLAMA_ENDPOINT_URI")
+        ollama_model = os.getenv("OLLAMA_MODEL")
         openai_api_key = os.getenv("OPENAI_API_KEY")
         claude_cookie = os.getenv("CLAUDE_COOKIE")
 
@@ -114,8 +121,11 @@ class MorphBot(ConsoleBot):
             if 'time' in message:
                 del message['time']
 
-        # Prefer Claude over OpenAI
-        if claude_cookie is not None:
+        if ollama_endpoint_uri is not None and ollama_model is not None:
+            # Prefer Ollama over Claude
+            return MorphBot.augment_chat_with_ollama(ollama_endpoint_uri, ollama_model, conversation)
+        elif claude_cookie is not None:
+            # Prefer Claude over OpenAI
             return MorphBot.augment_chat_with_claude(conversation)
         elif openai_api_key is not None:
             return MorphBot.augment_chat_with_openai(conversation)
