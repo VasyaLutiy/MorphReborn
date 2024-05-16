@@ -32,7 +32,7 @@ def filter_source_code_file_names(file_path):
             file_path.endswith('requirements.txt') or
             file_path.endswith('.md') or
             file_path.endswith('.dot') or
-            file_path.endswith('.env') or
+            # file_path.endswith('.env') or
             file_path.endswith('.py') or
             file_path.endswith('.sol') or
             file_path.endswith('.sh') or
