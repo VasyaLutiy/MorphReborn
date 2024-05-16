@@ -98,6 +98,12 @@ To get started with the **GPT Morph CLI Bot**, follow these steps:
 - **Settings Display:** Check and display your OpenAI API key settings.
 - **Graph Visualization:** View a Graphviz representation of the bot's API.
 
+## Extending the LLM text corpus
+
+To morph projects, which are developed using rare programming languages, rare technical approaches or internal libraries, it is possible to extend the LLM's text corpus using the:
+
+[`.corpora`](./corpora.md) folder.
+
 ## Using the "mrph" CLI
 
 - To analyze project code, choose the "**/analyze**" option and follow the prompts.

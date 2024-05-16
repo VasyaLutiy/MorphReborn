@@ -1,5 +1,7 @@
+.svn
 .idea
 venv
 .env
 build
 *.egg-info
+__pycache__

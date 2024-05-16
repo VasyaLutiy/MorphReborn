@@ -11,6 +11,7 @@ from authenticator import ClaudeAuthenticator
 
 from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
+from ollama_processor import OllamaProcessor
 from settings import load_settings
 
 
@@ -38,6 +39,7 @@ def filter_source_code_file_names(file_path):
             file_path.endswith('.rs') or
             file_path.endswith('.js') or
             file_path.endswith('.go') or
+            file_path.endswith('.fc') or
             file_path.endswith('.yaml') or
             file_path.endswith('.yml') or
             file_path.endswith('.sql') or
@@ -64,24 +66,35 @@ class MorphBot(ConsoleBot):
         load_settings()
 
     @staticmethod
+    def augment_chat_with_ollama(uri, model, messages):
+        stream = OllamaProcessor(uri, model).process(messages)
+
+        result = ''
+        if 0 < len(stream):
+            return stream[0]["value"]
+
+        return result
+
+    @staticmethod
     def augment_chat_with_openai(messages):
 
-        total_word_count = 0
-        bottom_items = []
+        # v.1.0. We do not skip the context anymore
+        # total_word_count = 0
+        # bottom_items = []
 
-        for item in reversed(messages):
-            word_count = len(item['content'].split())
-            total_word_count += word_count
-            if total_word_count < 4097:
-                bottom_items.append(item)
-            else:
-                print("Skipping context", item)
+        # for item in reversed(messages):
+        #     word_count = len(item['content'].split())
+        #     total_word_count += word_count
+        #     if total_word_count < 4097:
+        #         bottom_items.append(item)
+        #     else:
+        #         print("Skipping context", item)
 
-        bottom_items.reverse()
+        # bottom_items.reverse()
 
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=bottom_items
+        response = openai.OpenAI().chat.completions.create(
+            model="gpt-4o",
+            messages=messages
         )
 
         result = ''
@@ -103,6 +116,8 @@ class MorphBot(ConsoleBot):
     @staticmethod
     def augment_chat(dialog):
 
+        ollama_endpoint_uri = os.getenv("OLLAMA_ENDPOINT_URI")
+        ollama_model = os.getenv("OLLAMA_MODEL")
         openai_api_key = os.getenv("OPENAI_API_KEY")
         claude_cookie = os.getenv("CLAUDE_COOKIE")
 
@@ -114,8 +129,11 @@ class MorphBot(ConsoleBot):
             if 'time' in message:
                 del message['time']
 
-        # Prefer Claude over OpenAI
-        if claude_cookie is not None:
+        if ollama_endpoint_uri is not None and ollama_model is not None:
+            # Prefer Ollama over Claude
+            return MorphBot.augment_chat_with_ollama(ollama_endpoint_uri, ollama_model, conversation)
+        elif claude_cookie is not None:
+            # Prefer Claude over OpenAI
             return MorphBot.augment_chat_with_claude(conversation)
         elif openai_api_key is not None:
             return MorphBot.augment_chat_with_openai(conversation)
@@ -317,11 +335,17 @@ Therefore, we are using the Web API for accessing Claude:
 
             # Parse code blocks
             code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+            if 0 < len(code_blocks):
 
-            # Save code blocks to a text file
-            for language, code_block in code_blocks:
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+            else:
+
+                # Otherwise - save the complete response
                 with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(f"{code_block}\n")
+                    file.write(response)
 
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -349,11 +373,17 @@ Therefore, we are using the Web API for accessing Claude:
 
             # Parse code blocks
             code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+            if 0 < len(code_blocks):
 
-            # Save code blocks to a text file
-            for language, code_block in code_blocks:
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+            else:
+
+                # Otherwise - save the complete response
                 with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(f"{code_block}\n")
+                    file.write(response)
 
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -382,11 +412,17 @@ Therefore, we are using the Web API for accessing Claude:
 
             # Parse code blocks
             code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+            if 0 < len(code_blocks):
 
-            # Save code blocks to a text file
-            for language, code_block in code_blocks:
+                # Save code blocks to a text file
+                for language, code_block in code_blocks:
+                    with open(file_name, 'w', encoding='utf-8') as file:
+                        file.write(f"{code_block}\n")
+            else:
+
+                # Otherwise - save the complete response
                 with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(f"{code_block}\n")
+                    file.write(response)
 
             text = f"mrph> Your \"{file_name}\" file was saved."
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -447,11 +483,17 @@ Therefore, we are using the Web API for accessing Claude:
 
                 # Parse code blocks
                 code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+                if 0 < len(code_blocks):
 
-                # Save code blocks to a text file
-                for language, code_block in code_blocks:
-                    with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(f"{code_block}\n")
+                    # Save code blocks to a text file
+                    for language, code_block in code_blocks:
+                        with open(file_name, 'w', encoding='utf-8') as file:
+                            file.write(f"{code_block}\n")
+                else:
+
+                    # Otherwise - append the complete response
+                    with open(file_name, 'a', encoding='utf-8') as file:
+                        file.write(response)
 
                 text = f"mrph> File \"{file_name}\" has been augmented based on your prompt."
                 await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -527,11 +569,17 @@ Therefore, we are using the Web API for accessing Claude:
 
                 # Parse code blocks
                 code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+                if 0 < len(code_blocks):
 
-                # Save code blocks to a text file
-                for language, code_block in code_blocks:
+                    # Save code blocks to a text file
+                    for language, code_block in code_blocks:
+                        with open(file_name, 'w', encoding='utf-8') as file:
+                            file.write(f"{code_block}\n")
+                else:
+
+                    # Otherwise - save the complete response
                     with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(f"{code_block}\n")
+                        file.write(response)
 
                 text = f"mrph> The file \"{file_name}\" has been criticized. Please, review \"TODO:\" comments."
                 await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
