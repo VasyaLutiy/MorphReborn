@@ -78,22 +78,23 @@ class MorphBot(ConsoleBot):
     @staticmethod
     def augment_chat_with_openai(messages):
 
-        total_word_count = 0
-        bottom_items = []
+        # v.1.0. We do not skip the context anymore
+        # total_word_count = 0
+        # bottom_items = []
 
-        for item in reversed(messages):
-            word_count = len(item['content'].split())
-            total_word_count += word_count
-            if total_word_count < 4097:
-                bottom_items.append(item)
-            else:
-                print("Skipping context", item)
+        # for item in reversed(messages):
+        #     word_count = len(item['content'].split())
+        #     total_word_count += word_count
+        #     if total_word_count < 4097:
+        #         bottom_items.append(item)
+        #     else:
+        #         print("Skipping context", item)
 
-        bottom_items.reverse()
+        # bottom_items.reverse()
 
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=bottom_items
+            model="gpt-4o",
+            messages=messages
         )
 
         result = ''
