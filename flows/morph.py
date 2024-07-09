@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import copy
+import pkg_resources
 
 import openai
 from dialog import ClaudeDialog
@@ -590,6 +591,20 @@ Therefore, we are using the Web API for accessing Claude:
 
         return transition
 
+    def build_version_transition(self):
+        menu = self.build_menu([['Analyze', 'Generate', 'Patch'], ['Settings', 'Help', 'Exit'], ['Graph'], ['Version']])
+
+        async def transition(action):
+            version_morph = pkg_resources.get_distribution("mrph").version
+            version_authenticator = pkg_resources.get_distribution("python_claude_web_authenticator").version
+
+            text = f"GPT Morph CLI Bot: {version_morph}\nClaude Integration: {version_authenticator}"
+
+            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text,
+                                                     reply_markup=menu)
+
+        return transition
+
     @staticmethod
     def build_exit_transition():
 
@@ -598,13 +613,21 @@ Therefore, we are using the Web API for accessing Claude:
 
         return transition
 
+    def build_menu(self, menu_items):
+        buttons = [[self.build_button(item) for item in row] for row in menu_items]
+        return {"keyboard": buttons, "resize_keyboard": True}
+
+    @staticmethod
+    def build_button(label):
+        return label
+
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
             '''mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
 To execute a command, type the corresponding option and press Enter.
 You can always return to the main menu by typing "/start".
 Type "/help" for more.\n''',
-            [["Analyze", "Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph"]])
+            [["Analyze", "Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph"], ["Version"]])
 
         return builder \
             .edge(
@@ -612,6 +635,7 @@ Type "/help" for more.\n''',
                 "/start",
                 "/graph",
                 on_transition=self.build_graphviz_response_transition()) \
+            .edge("/start", "/start", "/version", on_transition=self.build_version_transition()) \
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/settings", "/settings", on_transition=self.build_settings_transition()) \
             .edge("/settings", "/start", "/exit", on_transition=self.build_exit_transition()) \
