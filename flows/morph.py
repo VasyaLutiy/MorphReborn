@@ -27,6 +27,9 @@ def filter_source_code_file_names(file_path):
     if 'venv/' in file_path:
         return False
 
+    if 'venvy/' in file_path:
+        return False
+    
     return (
             file_path.endswith('Dockerfile') or
             file_path.endswith('package.json') or
