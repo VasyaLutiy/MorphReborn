@@ -98,7 +98,7 @@ class MorphBot(ConsoleBot):
         # bottom_items.reverse()
 
         response = openai.OpenAI().chat.completions.create(
-            model="gpt-4o",
+            model="o1-preview",
             messages=messages
         )
 
