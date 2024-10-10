@@ -94,7 +94,7 @@ class MorphBot(ConsoleBot):
 
         # bottom_items.reverse()
 
-        response = openai_client().ChatCompletion.create(
+        response = openai_client().chat.completions.create(
             model=openai_model_name,
             messages=messages
         )
@@ -121,6 +121,7 @@ class MorphBot(ConsoleBot):
         ollama_endpoint_uri = os.getenv("OLLAMA_ENDPOINT_URI")
         ollama_model = os.getenv("OLLAMA_MODEL")
         openai_api_key = os.getenv("OPENAI_API_KEY")
+        azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")
         claude_cookie = os.getenv("CLAUDE_COOKIE")
 
         # Make a deep copy of the conversation
@@ -137,7 +138,7 @@ class MorphBot(ConsoleBot):
         elif claude_cookie is not None:
             # Prefer Claude over OpenAI
             return MorphBot.augment_chat_with_claude(conversation)
-        elif openai_api_key is not None:
+        elif openai_api_key is not None or azure_openai_api_key is not None:
             return MorphBot.augment_chat_with_openai(conversation)
 
     def build_settings_transition(self):
@@ -154,39 +155,39 @@ class MorphBot(ConsoleBot):
                 text += f"Your OpenAI API key (.env): \"{openai_api_key}\"\n\n"
             else:
                 help_prompt += '''--------------------------------------------------
-    HOW TO GET OPENAI API KEY?
+        HOW TO GET OPENAI API KEY?
 
-Please set your OpenAI API key by following these steps:
+    Please obtain and configure your OpenAI API key by following these steps:
 
-1. Create a file named ".env" in the project folder.
-2. Open the .env file and add the following line:
-      OPENAI_API_KEY=<YOUR_API_KEY>
-   Replace <YOUR_API_KEY> with your actual OpenAI API key.
+    1. Create a file named ".env" in your project folder, if it doesn't already exist.
+    2. Add the following line to the .env file:
+          OPENAI_API_KEY=<YOUR_API_KEY>
+       Replace <YOUR_API_KEY> with your actual OpenAI API key.
 
-   If you don't have an API key yet, sign up at https://platform.openai.com/signup
+       If you don't have an API key, sign up at https://platform.openai.com/signup to generate one.
 
-3. Save the .env file.
+    3. Save the .env file.
+    4. OPENAI_MODEL_NAME setting is also required, containing the valid OpenAI LLM model name.
 
-Once the OpenAI API key is added, you can proceed with running the program.
-
---------------------------------------------------
-'''
+    Once you have added your OpenAI API key, you can proceed with using the bot features.
+    --------------------------------------------------
+    '''
 
             if claude_cookie:
-                text += f"Your Claude (Anthropic) API key (.env): \"{claude_cookie}\"\n\n"
+                text += f"Your Claude (Anthropic) API cookie (.env): \"{claude_cookie}\"\n\n"
             else:
                 help_prompt += '''--------------------------------------------------
-    HOW TO GET Claude (Anthropic) API KEY?
-    
-Claude official API is not for all.
-Therefore, we are using the Web API for accessing Claude:
+        HOW TO GET CLAUDE (ANTHROPIC) API COOKIE?
 
-1. Open the Claude Web Authenticator by typing "/authenticate_claude".
-2. Enter your credentials to authenticate into https://claude.ai/.
-3. Enjoy!
+    Claude's official API might not be available for everyone.
+    We are using a Web API to access Claude, which requires the following steps:
 
---------------------------------------------------
-'''
+    1. Use the Claude Web Authenticator by typing "/authenticate_claude" in the CLI.
+    2. Follow the instructions to authenticate into https://claude.ai/ using your credentials.
+
+    This process will generate an API cookie stored in your environment settings.
+    --------------------------------------------------
+    '''
 
             text += help_prompt
 
@@ -230,10 +231,11 @@ Therefore, we are using the Web API for accessing Claude:
     def build_generate_transition():
 
         openai_api_key = os.getenv("OPENAI_API_KEY")
+        azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")
 
         async def transition(action):
 
-            if not openai_api_key:
+            if not openai_api_key and not azure_openai_api_key:
                 text = "mrph> Please, configure the LLM API key as stated in \"/settings\"."
             else:
                 text = "mrph> Enter the file name for saving the generated file:"
