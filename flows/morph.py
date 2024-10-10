@@ -3,7 +3,6 @@ import re
 import sys
 import copy
 
-import openai
 from dialog import ClaudeDialog
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
@@ -12,6 +11,7 @@ from authenticator import ClaudeAuthenticator
 from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
 from ollama_processor import OllamaProcessor
+from openai_client import openai_client
 from settings import load_settings
 
 
@@ -78,6 +78,8 @@ class MorphBot(ConsoleBot):
     @staticmethod
     def augment_chat_with_openai(messages):
 
+        openai_model_name = os.environ.get("OPENAI_MODEL_NAME")
+
         # v.1.0. We do not skip the context anymore
         # total_word_count = 0
         # bottom_items = []
@@ -92,8 +94,8 @@ class MorphBot(ConsoleBot):
 
         # bottom_items.reverse()
 
-        response = openai.ChatCompletion.create(
-            model="gpt-4o",
+        response = openai_client().ChatCompletion.create(
+            model=openai_model_name,
             messages=messages
         )
 
