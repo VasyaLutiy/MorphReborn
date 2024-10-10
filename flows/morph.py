@@ -483,7 +483,7 @@ class MorphBot(ConsoleBot):
 
                 # The dialog
                 dialog = LLMDialog()
-                dialog.assign("system", f"Let's update the {file_name} file provided.")
+                dialog.assign("assistant", f"Let's update the {file_name} file provided.") # Original: "system"
                 dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
                 dialog += build_current_project_context()
                 dialog.assign("user", prompt)
@@ -534,7 +534,7 @@ class MorphBot(ConsoleBot):
 
                 # The dialog
                 dialog = LLMDialog()
-                dialog.assign("system", profile)
+                dialog.assign("assistant", profile) # Original: "system"
                 dialog.assign("user", f"The file name is: {analyze_file_name_input}.")
                 dialog.assign("user", file_contents)
 
@@ -569,7 +569,7 @@ class MorphBot(ConsoleBot):
 
                 # The dialog
                 dialog = LLMDialog()
-                dialog.assign("system", f"Let's update the {file_name} file provided.")
+                dialog.assign("assistant", f"Let's update the {file_name} file provided.") # Original: "system"
                 dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
                 dialog.assign("user", "Please, criticize this file contents and add \"TODO:\" comments, saying, "
                                       "what can be improved.")
