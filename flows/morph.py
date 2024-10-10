@@ -211,13 +211,15 @@ Therefore, we are using the Web API for accessing Claude:
     @staticmethod
     def build_help_transition():
         async def transition(action):
-
-            text = '''/generate - Generate a new file for your project based on a human language description.
-/patch - Update an existing file (re-factor) by prompting what the update should be.
-/settings - Display your LLM settings.
-/graph - Graphviz representation for this bot's API.
-/help - Show this help page.
-/exit - Close the application.
+            # Updated help text to reflect current bot features
+            text = '''/generate - Generate a new file for your project based on a description or selection.
+/patch - Update an existing file by providing instructions on what needs to be changed.
+/analyze - Analyze a file and produce a report based on the selected assistant profile.
+/settings - Display your configured settings for the LLM API keys.
+/authenticate_claude - Authenticate the Claude API using web authenticator if needed.
+/graph - Display a Graphviz representation of this bot's API for better visualization.
+/help - Show this help message with the list of available commands.
+/exit - Exit the application gracefully.
             '''
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
