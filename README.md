@@ -13,6 +13,8 @@ The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's 
 
 ✅ `Ollama API` active.
 
+✅ `Llama.cpp API` (local Tesla K80 inference) active.
+
 ## Installing the GPT Morph CLI
 ```shell
 pip install git+https://github.com/pysyun/python_gptmorph_cli.git --upgrade --break-system-packages

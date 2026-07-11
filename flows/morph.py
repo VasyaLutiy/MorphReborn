@@ -12,6 +12,7 @@ from authenticator import ClaudeAuthenticator
 from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
 from ollama_processor import OllamaProcessor
+from llama_cpp_processor import LlamaCppProcessor
 from openai_client import openai_client
 from settings import load_settings
 
@@ -81,6 +82,16 @@ class MorphBot(ConsoleBot):
         return result
 
     @staticmethod
+    def augment_chat_with_llama_cpp(uri, model, messages):
+        stream = LlamaCppProcessor(uri, model).process(messages)
+
+        result = ''
+        if 0 < len(stream):
+            return stream[0]["value"]
+
+        return result
+
+    @staticmethod
     def augment_chat_with_openai(messages):
 
         openai_model_name = os.environ.get("OPENAI_MODEL_NAME")
@@ -123,6 +134,8 @@ class MorphBot(ConsoleBot):
     @staticmethod
     def augment_chat(dialog):
 
+        llama_cpp_endpoint_uri = os.getenv("LLAMA_CPP_ENDPOINT_URI")
+        llama_cpp_model = os.getenv("LLAMA_CPP_MODEL")
         ollama_endpoint_uri = os.getenv("OLLAMA_ENDPOINT_URI")
         ollama_model = os.getenv("OLLAMA_MODEL")
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -137,7 +150,10 @@ class MorphBot(ConsoleBot):
             if 'time' in message:
                 del message['time']
 
-        if ollama_endpoint_uri is not None and ollama_model is not None:
+        if llama_cpp_endpoint_uri is not None and llama_cpp_model is not None:
+            # Prefer the local llama.cpp K80 node (local inference) over everything else
+            return MorphBot.augment_chat_with_llama_cpp(llama_cpp_endpoint_uri, llama_cpp_model, conversation)
+        elif ollama_endpoint_uri is not None and ollama_model is not None:
             # Prefer Ollama over Claude
             return MorphBot.augment_chat_with_ollama(ollama_endpoint_uri, ollama_model, conversation)
         elif claude_cookie is not None:
