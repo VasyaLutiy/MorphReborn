@@ -34,6 +34,8 @@ Code morphing utilizes large language models (LLMs) like GPT-3.5, LLAMA or Claud
 
 By leveraging the understanding and generative abilities of LLMs, code morphing automates lower-level coding tasks so developers can focus on high-value priorities. The morphs act as a starting point that developers can further refine.
 
+GPT Morph's distinguishing trait is that it loads the **whole project** as the LLM context for every morph, rather than retrieving snippets or compressing history like other coding assistants. See [`documentation/modeling-approach.md`](./documentation/modeling-approach.md) for the full explanation.
+
 ## Glossary
 
 Here's a brief explanation of the terms "**morphs**", "**morpher**", and "**morphing**" in the context of **code morphing**:
