@@ -38,6 +38,7 @@ def filter_source_code_file_names(file_path):
             file_path.endswith('.sh') or
             file_path.endswith('.rs') or
             file_path.endswith('.js') or
+            file_path.endswith('.jsx') or
             file_path.endswith('.go') or
             file_path.endswith('.fc') or
             file_path.endswith('.yaml') or
@@ -46,7 +47,8 @@ def filter_source_code_file_names(file_path):
             file_path.endswith('.ino') or
             file_path.endswith('.proto') or
             file_path.endswith('.txt') or
-            file_path.endswith('.ts')
+            file_path.endswith('.ts') or
+            file_path.endswith('.tsx')
     )
 
 
