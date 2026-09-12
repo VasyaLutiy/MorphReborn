@@ -2,19 +2,14 @@ import os
 import re
 import sys
 import copy
+import asyncio
 import pkg_resources
 
-from dialog import ClaudeDialog
-
 from pysyun.conversation.flow.console_bot import ConsoleBot
-from authenticator import ClaudeAuthenticator
 
 from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
-from ollama_processor import OllamaProcessor
-from llama_cpp_processor import LlamaCppProcessor
-from openai_client import openai_client
-from settings import load_settings
+from settings import load_settings, load_registry
 
 
 def filter_source_code_file_names(file_path):
@@ -71,162 +66,193 @@ class MorphBot(ConsoleBot):
 
         load_settings()
 
-    @staticmethod
-    def augment_chat_with_ollama(uri, model, messages):
-        stream = OllamaProcessor(uri, model).process(messages)
+        # The registry of every named processor instance configured in ``.env``.
+        # This is the backbone of the multi-agent behaviour: a single command can
+        # fan a morph out across many of these instances at once.
+        self.registry = load_registry()
 
-        result = ''
-        if 0 < len(stream):
-            return stream[0]["value"]
-
-        return result
+    # -- processor selection ----------------------------------------------
 
     @staticmethod
-    def augment_chat_with_llama_cpp(uri, model, messages):
-        stream = LlamaCppProcessor(uri, model).process(messages)
+    def parse_processor_spec(text):
+        """Extract the processor identifiers requested on a command line.
 
-        result = ''
-        if 0 < len(stream):
-            return stream[0]["value"]
-
-        return result
-
-    @staticmethod
-    def augment_chat_with_openai(messages):
-
-        openai_model_name = os.environ.get("OPENAI_MODEL_NAME")
-
-        # v.1.0. We do not skip the context anymore
-        # total_word_count = 0
-        # bottom_items = []
-
-        # for item in reversed(messages):
-        #     word_count = len(item['content'].split())
-        #     total_word_count += word_count
-        #     if total_word_count < 4097:
-        #         bottom_items.append(item)
-        #     else:
-        #         print("Skipping context", item)
-
-        # bottom_items.reverse()
-
-        response = openai_client().chat.completions.create(
-            model=openai_model_name,
-            messages=messages
-        )
-
-        result = ''
-        for choice in response.choices:
-            result += choice.message.content
-
-        return result
+        Accepts forms such as ``/generate @k80``, ``/generate @k80,@gpt4`` or
+        ``/generate @all``. Returns a list of raw tokens (``@`` stripped), or
+        ``None`` when no identifier was supplied.
+        """
+        if not text:
+            return None
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            return None
+        tokens = [token.lstrip("@") for token in re.split(r"[\s,]+", parts[1].strip())]
+        tokens = [token for token in tokens if token]
+        return tokens or None
 
     @staticmethod
-    def augment_chat_with_claude(messages):
+    def resolve_processor_ids(registry, spec):
+        """Turn a raw spec into a concrete, de-duplicated list of known ids.
 
-        content = "\n".join(item["content"] for item in messages)
+        ``None``/empty -> the single default processor (legacy behaviour).
+        ``all``/``*`` -> every configured processor (full multi-agent fan-out).
+        """
+        available = registry.ids
+        if not spec:
+            default = registry.default_id()
+            return [default] if default else []
 
-        dialog = ClaudeDialog()
-        data = dialog.process([content])
-
-        return data[0]
+        resolved = []
+        for token in spec:
+            if token.lower() in ("all", "*"):
+                return list(available)
+            if token in available and token not in resolved:
+                resolved.append(token)
+        return resolved
 
     @staticmethod
-    def augment_chat(dialog):
-
-        llama_cpp_endpoint_uri = os.getenv("LLAMA_CPP_ENDPOINT_URI")
-        llama_cpp_model = os.getenv("LLAMA_CPP_MODEL")
-        ollama_endpoint_uri = os.getenv("OLLAMA_ENDPOINT_URI")
-        ollama_model = os.getenv("OLLAMA_MODEL")
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        claude_cookie = os.getenv("CLAUDE_COOKIE")
-
-        # Make a deep copy of the conversation
+    def clean_conversation(dialog):
+        # Make a deep copy of the conversation and strip the transport-only time fields.
         conversation = copy.deepcopy(dialog.conversation)
-
-        # Remove time fields
         for message in conversation:
             if 'time' in message:
                 del message['time']
+        return conversation
 
-        if llama_cpp_endpoint_uri is not None and llama_cpp_model is not None:
-            # Prefer the local llama.cpp K80 node (local inference) over everything else
-            return MorphBot.augment_chat_with_llama_cpp(llama_cpp_endpoint_uri, llama_cpp_model, conversation)
-        elif ollama_endpoint_uri is not None and ollama_model is not None:
-            # Prefer Ollama over Claude
-            return MorphBot.augment_chat_with_ollama(ollama_endpoint_uri, ollama_model, conversation)
-        elif claude_cookie is not None:
-            # Prefer Claude over OpenAI
-            return MorphBot.augment_chat_with_claude(conversation)
-        elif openai_api_key is not None or azure_openai_api_key is not None:
-            return MorphBot.augment_chat_with_openai(conversation)
+    @staticmethod
+    async def run_morphers(registry, processor_ids, dialog):
+        """Run every selected processor concurrently and collect their morphs.
+
+        Each processor call is blocking (network I/O), so it is dispatched to a
+        thread; ``asyncio.gather`` then lets all of them run in parallel. Returns
+        an ``{id: response_or_None}`` mapping (``None`` marks a failed instance).
+        """
+        conversation = MorphBot.clean_conversation(dialog)
+        loop = asyncio.get_event_loop()
+
+        async def run_one(processor_id):
+            try:
+                value = await loop.run_in_executor(None, registry.run, processor_id, conversation)
+                return processor_id, value
+            except Exception as error:
+                print(f"llm[{processor_id}]> processor failed: {error}")
+                return processor_id, None
+
+        pairs = await asyncio.gather(*[run_one(pid) for pid in processor_ids])
+        return dict(pairs)
+
+    @staticmethod
+    def output_file_name(file_name, processor_id, multi):
+        """Single processor keeps the target name; parallel morphs get suffixed."""
+        if not multi:
+            return file_name
+        root, ext = os.path.splitext(file_name)
+        return f"{root}.{processor_id}{ext}"
+
+    @staticmethod
+    def response_to_file_body(response, append_if_plain=False):
+        """Extract the file body from a response and choose the write mode."""
+        code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
+        if 0 < len(code_blocks):
+            body = "".join(f"{code_block}\n" for _, code_block in code_blocks)
+            return body, 'w'
+        return response, ('a' if append_if_plain else 'w')
+
+    async def morph_and_save(self, action, dialog, file_name, nested_transition,
+                             append_if_plain=False):
+        """Shared finisher: fan the dialog out across the selected processors,
+        write one morph per processor, then return to the nested transition."""
+        spec = self.context_get(action, "processor_spec")
+        processor_ids = self.resolve_processor_ids(self.registry, spec)
+
+        if not processor_ids:
+            text = "mrph> No matching processor. Configure one (see \"/settings\") " \
+                   "or pick a valid id, e.g. \"/generate @all\"."
+            await action["context"].bot.send_message(
+                chat_id=action["update"]["effective_chat"]["id"], text=text)
+            await nested_transition(action)
+            return
+
+        results = await self.run_morphers(self.registry, processor_ids, dialog)
+        multi = 1 < len(processor_ids)
+
+        saved = []
+        for processor_id in processor_ids:
+            response = results.get(processor_id)
+            print(f"llm[{processor_id}]> {response}")
+            if response is None:
+                continue
+            out_name = self.output_file_name(file_name, processor_id, multi)
+            body, mode = self.response_to_file_body(response, append_if_plain)
+            with open(out_name, mode, encoding='utf-8') as file:
+                file.write(body)
+            saved.append(out_name)
+
+        if saved:
+            if multi:
+                text = "mrph> Saved (parallel):\n  " + "\n  ".join(saved)
+            else:
+                text = f"mrph> Your \"{saved[0]}\" file was saved."
+        else:
+            text = "mrph> No morph was produced (all selected processors failed)."
+
+        await action["context"].bot.send_message(
+            chat_id=action["update"]["effective_chat"]["id"], text=text)
+        await nested_transition(action)
+
+    @staticmethod
+    def context_get(action, name, default=None):
+        try:
+            return action["context"].get(name)
+        except KeyError:
+            return default
 
     def build_settings_transition(self):
 
         async def transition(action):
 
-            openai_api_key = os.getenv("OPENAI_API_KEY")
-            claude_cookie = os.getenv("CLAUDE_COOKIE")
-
             text = "mrph>\n"
-            help_prompt = ""
 
-            if openai_api_key:
-                text += f"Your OpenAI API key (.env): \"{openai_api_key}\"\n\n"
+            if len(self.registry):
+                default_id = self.registry.default_id()
+                text += f"Configured processors ({len(self.registry)}), " \
+                        f"default is \"{default_id}\":\n\n"
+                for description in self.registry.describe_all():
+                    text += f"    {description}\n"
+                text += "\n"
+                text += "Address them by id: \"/generate @<id>\" or \"/patch @<id>\".\n"
+                text += "Run several in parallel (multi-agent): " \
+                        "\"/generate @a,@b\" or \"/generate @all\".\n\n"
             else:
-                help_prompt += '''--------------------------------------------------
-        HOW TO GET OPENAI API KEY?
+                text += '''No processors are configured yet.
+--------------------------------------------------
+        HOW TO CONFIGURE PROCESSORS?
 
-    Please obtain and configure your OpenAI API key by following these steps:
+    Each processor is a named instance in your ".env" file. Define as many as
+    you like - many instances of each backend are allowed (multi-agent):
 
-    1. Create a file named ".env" in your project folder, if it doesn't already exist.
-    2. Add the following line to the .env file:
-          OPENAI_API_KEY=<YOUR_API_KEY>
-       Replace <YOUR_API_KEY> with your actual OpenAI API key.
+          MRPH_PROCESSORS=k80-a,k80-b,gpt4
 
-       If you don't have an API key, sign up at https://platform.openai.com/signup to generate one.
+          MRPH_PROCESSOR_k80-a_TYPE=llama_cpp
+          MRPH_PROCESSOR_k80-a_ENDPOINT_URI=http://192.168.0.14:8080/v1
+          MRPH_PROCESSOR_k80-a_MODEL=k80-model
 
-    3. Save the .env file.
-    4. OPENAI_MODEL_NAME setting is also required, containing the valid OpenAI LLM model name.
+          MRPH_PROCESSOR_k80-b_TYPE=llama_cpp
+          MRPH_PROCESSOR_k80-b_ENDPOINT_URI=http://192.168.0.15:8080/v1
+          MRPH_PROCESSOR_k80-b_MODEL=k80-model
 
-    Once you have added your OpenAI API key, you can proceed with using the bot features.
-    --------------------------------------------------
-    '''
+          MRPH_PROCESSOR_gpt4_TYPE=openai
+          MRPH_PROCESSOR_gpt4_API_KEY=<YOUR_API_KEY>
+          MRPH_PROCESSOR_gpt4_MODEL=gpt-4o
 
-            if claude_cookie:
-                text += f"Your Claude (Anthropic) API cookie (.env): \"{claude_cookie}\"\n\n"
-            else:
-                help_prompt += '''--------------------------------------------------
-        HOW TO GET CLAUDE (ANTHROPIC) API COOKIE?
+    Supported TYPE values: llama_cpp, ollama, openai.
+    (The classic LLAMA_CPP_*, OLLAMA_*, OPENAI_* variables still work and map
+    to the default ids "llama_cpp", "ollama" and "openai".)
+--------------------------------------------------
+'''
 
-    Claude's official API might not be available for everyone.
-    We are using a Web API to access Claude, which requires the following steps:
-
-    1. Use the Claude Web Authenticator by typing "/authenticate_claude" in the CLI.
-    2. Follow the instructions to authenticate into https://claude.ai/ using your credentials.
-
-    This process will generate an API cookie stored in your environment settings.
-    --------------------------------------------------
-    '''
-
-            text += help_prompt
-
-            nested_transition = self.build_menu_response_transition(text, ["Start", "Authenticate Claude", "Exit"])
+            nested_transition = self.build_menu_response_transition(text, ["Start", "Exit"])
             await nested_transition(action)
-
-        return transition
-
-    @staticmethod
-    def build_authenticate_claude_transition():
-
-        async def transition(_):
-
-            await ClaudeAuthenticator().process_async([])
-
-            load_settings()
-
-            print("Claude API authenticated")
 
         return transition
 
@@ -236,62 +262,57 @@ class MorphBot(ConsoleBot):
             # Updated help text to reflect current bot features
             text = '''/generate - Generate a new file for your project based on a description or selection.
 /patch - Update an existing file by providing instructions on what needs to be changed.
-/analyze - Analyze a file and produce a report based on the selected assistant profile.
-/settings - Display your configured settings for the LLM API keys.
-/authenticate_claude - Authenticate the Claude API using web authenticator if needed.
+/settings - List your configured processor instances and the default one.
 /graph - Display a Graphviz representation of this bot's API for better visualization.
 /help - Show this help message with the list of available commands.
 /exit - Exit the application gracefully.
+
+Choosing processors (multi-agent):
+    /generate            - use the default processor.
+    /generate @gpt4      - use the processor with id "gpt4".
+    /generate @k80,@gpt4 - run both in parallel; each writes its own file (foo.<id>.ext).
+    /generate @all       - fan out across every configured processor.
+    (The same @id syntax works for /patch.)
             '''
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
         return transition
 
-    @staticmethod
-    def build_generate_transition():
-
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    def build_generate_transition(self):
 
         async def transition(action):
 
-            if not openai_api_key and not azure_openai_api_key:
-                text = "mrph> Please, configure the LLM API key as stated in \"/settings\"."
+            # Parse and remember which processor(s) this command targets.
+            spec = self.parse_processor_spec(action.get("text"))
+            action["context"].add("processor_spec", spec)
+
+            processor_ids = self.resolve_processor_ids(self.registry, spec)
+
+            if not processor_ids:
+                text = "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
             else:
-                text = "mrph> Enter the file name for saving the generated file:"
+                text = f"mrph> Will generate using: {', '.join(processor_ids)}.\n" \
+                       f"mrph> Enter the file name for saving the generated file:"
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
         return transition
 
-    @staticmethod
-    def build_analyze_transition():
-
-        openai_api_key = os.getenv("OPENAI_API_KEY")
+    def build_patch_transition(self):
 
         async def transition(action):
 
-            if not openai_api_key:
-                text = "mrph> Please, configure the LLM API key as stated in \"/settings\"."
+            spec = self.parse_processor_spec(action.get("text"))
+            action["context"].add("processor_spec", spec)
+
+            processor_ids = self.resolve_processor_ids(self.registry, spec)
+
+            if not processor_ids:
+                text = "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
             else:
-                text = "mrph> Enter the file name to be analyzed:"
-
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-
-        return transition
-
-    @staticmethod
-    def build_patch_transition():
-
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-
-        async def transition(action):
-
-            if not openai_api_key:
-                text = "mrph> Please, configure the LLM API key as stated in \"/settings\"."
-            else:
-                text = "mrph> Enter the file name to be patched:"
+                text = f"mrph> Will patch using: {', '.join(processor_ids)}.\n" \
+                       f"mrph> Enter the file name to be patched:"
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
@@ -319,32 +340,7 @@ class MorphBot(ConsoleBot):
 
         return transition
 
-    @staticmethod
-    def build_analyze_file_name_input_transition():
-
-        async def transition(action):
-            file_name = action['text']
-            action["context"].add("analyze_file_name_input", file_name)
-            text = f"mrph> Loaded \"{file_name}\". Where to save a report?"
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-
-        return transition
-
-    def build_analyze_file_name_output_transition(self):
-
-        async def transition(action):
-            file_name = action['text']
-            action["context"].add("analyze_file_name_output", file_name)
-            text = f"mrph> Will be saving report to \"{file_name}\". Which AI assistant profile would you prefer to " \
-                   f"use for analyzing your code?"
-
-            nested_transition = self.build_menu_response_transition(text, ["Crypto Audit"])
-            await nested_transition(action)
-
-        return transition
-
-    @staticmethod
-    def build_generate_prompt_input_transition(nested_transition):
+    def build_generate_prompt_input_transition(self, nested_transition):
 
         async def transition(action):
 
@@ -355,33 +351,12 @@ class MorphBot(ConsoleBot):
             dialog += build_current_project_context()
             dialog.assign("user", prompt)
 
-            response = MorphBot.augment_chat(dialog)
-            print(f"llm> {response}")
-
             file_name = action["context"].get("generate_file_name")
-
-            # Parse code blocks
-            code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
-            if 0 < len(code_blocks):
-
-                # Save code blocks to a text file
-                for language, code_block in code_blocks:
-                    with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(f"{code_block}\n")
-            else:
-
-                # Otherwise - save the complete response
-                with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(response)
-
-            text = f"mrph> Your \"{file_name}\" file was saved."
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-            await nested_transition(action)
+            await self.morph_and_save(action, dialog, file_name, nested_transition)
 
         return transition
 
-    @staticmethod
-    def build_generate_unit_test_prompt_input_transition(nested_transition):
+    def build_generate_unit_test_prompt_input_transition(self, nested_transition):
 
         async def transition(action):
 
@@ -393,33 +368,12 @@ class MorphBot(ConsoleBot):
             dialog.assign("user", "Please, generate a unit test for my project.")
             dialog.assign("user", prompt)
 
-            response = MorphBot.augment_chat(dialog)
-            print(f"llm> {response}")
-
             file_name = action["context"].get("generate_file_name")
-
-            # Parse code blocks
-            code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
-            if 0 < len(code_blocks):
-
-                # Save code blocks to a text file
-                for language, code_block in code_blocks:
-                    with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(f"{code_block}\n")
-            else:
-
-                # Otherwise - save the complete response
-                with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(response)
-
-            text = f"mrph> Your \"{file_name}\" file was saved."
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-            await nested_transition(action)
+            await self.morph_and_save(action, dialog, file_name, nested_transition)
 
         return transition
 
-    @staticmethod
-    def build_generate_statement_flow_prompt_input_transition(nested_transition):
+    def build_generate_statement_flow_prompt_input_transition(self, nested_transition):
 
         async def transition(action):
 
@@ -432,28 +386,8 @@ class MorphBot(ConsoleBot):
                       f"method. When necessary, expand methods being called."
             dialog.assign("user", message)
 
-            response = MorphBot.augment_chat(dialog)
-            print(f"llm> {response}")
-
             file_name = action["context"].get("generate_file_name")
-
-            # Parse code blocks
-            code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
-            if 0 < len(code_blocks):
-
-                # Save code blocks to a text file
-                for language, code_block in code_blocks:
-                    with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(f"{code_block}\n")
-            else:
-
-                # Otherwise - save the complete response
-                with open(file_name, 'w', encoding='utf-8') as file:
-                    file.write(response)
-
-            text = f"mrph> Your \"{file_name}\" file was saved."
-            await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-            await nested_transition(action)
+            await self.morph_and_save(action, dialog, file_name, nested_transition)
 
         return transition
 
@@ -483,8 +417,7 @@ class MorphBot(ConsoleBot):
 
         return transition
 
-    @staticmethod
-    def build_patch_prompt_input_transition(nested_transition):
+    def build_patch_prompt_input_transition(self, nested_transition):
         async def transition(action):
 
             file_name = action['context'].get("patch_file_name")
@@ -504,76 +437,18 @@ class MorphBot(ConsoleBot):
                 dialog += build_current_project_context()
                 dialog.assign("user", prompt)
 
-                # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(dialog)
-                print(f"llm> {response}")
-
-                # Parse code blocks
-                code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
-                if 0 < len(code_blocks):
-
-                    # Save code blocks to a text file
-                    for language, code_block in code_blocks:
-                        with open(file_name, 'w', encoding='utf-8') as file:
-                            file.write(f"{code_block}\n")
-                else:
-
-                    # Otherwise - append the complete response
-                    with open(file_name, 'a', encoding='utf-8') as file:
-                        file.write(response)
-
-                text = f"mrph> File \"{file_name}\" has been augmented based on your prompt."
-                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-                await nested_transition(action)
+                # Augment the file contents based on the user's prompt, fanning out
+                # across the selected processor(s). For a plain (non-code-block)
+                # response the morph is appended to the original file.
+                await self.morph_and_save(action, dialog, file_name, nested_transition,
+                                          append_if_plain=True)
             except Exception as e:
                 text = f"mrph> An error occurred while processing the file: {str(e)}"
                 await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
         return transition
 
-    @staticmethod
-    def build_crypto_audit_transition(nested_transition):
-        async def transition(action):
-
-            analyze_file_name_input = action['context'].get("analyze_file_name_input")
-            analyze_file_name_output = action['context'].get("analyze_file_name_output")
-
-            try:
-                # Load file contents
-                with open(analyze_file_name_input, 'r', encoding='utf-8') as file:
-                    file_contents = file.read()
-
-                # The agent profile
-                profile = '''You are a Solidity smart contract audit expert. The user sends you a smart contract 
-                code. You return the list of possible errors in this contract including: 1. Security issues. 2. Code 
-                style issues. 3. Performance improvements. Please, return results as a report in the Markdown format.'''
-
-                # The dialog
-                dialog = LLMDialog()
-                dialog.assign("assistant", profile) # Original: "system"
-                dialog.assign("user", f"The file name is: {analyze_file_name_input}.")
-                dialog.assign("user", file_contents)
-
-                # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(dialog)
-                print(f"llm> {response}")
-
-                # Save response to a text file
-                with open(analyze_file_name_output, 'w', encoding='utf-8') as file:
-                    file.write(response)
-
-                text = f"mrph> File \"{analyze_file_name_input}\" analysis report \"{analyze_file_name_output}\" has " \
-                       f"been saved."
-                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-                await nested_transition(action)
-            except Exception as e:
-                text = f"mrph> An error occurred while processing the file: {str(e)}"
-                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-
-        return transition
-
-    @staticmethod
-    def build_todo_transition(nested_transition):
+    def build_todo_transition(self, nested_transition):
         async def transition(action):
 
             file_name = action['context'].get("patch_file_name")
@@ -590,27 +465,7 @@ class MorphBot(ConsoleBot):
                 dialog.assign("user", "Please, criticize this file contents and add \"TODO:\" comments, saying, "
                                       "what can be improved.")
 
-                # Augment the file contents based on the user's prompt
-                response = MorphBot.augment_chat(dialog)
-                print(f"llm> {response}")
-
-                # Parse code blocks
-                code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
-                if 0 < len(code_blocks):
-
-                    # Save code blocks to a text file
-                    for language, code_block in code_blocks:
-                        with open(file_name, 'w', encoding='utf-8') as file:
-                            file.write(f"{code_block}\n")
-                else:
-
-                    # Otherwise - save the complete response
-                    with open(file_name, 'w', encoding='utf-8') as file:
-                        file.write(response)
-
-                text = f"mrph> The file \"{file_name}\" has been criticized. Please, review \"TODO:\" comments."
-                await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
-                await nested_transition(action)
+                await self.morph_and_save(action, dialog, file_name, nested_transition)
             except Exception as e:
                 text = f"mrph> An error occurred while processing the file: {str(e)}"
                 await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -618,13 +473,12 @@ class MorphBot(ConsoleBot):
         return transition
 
     def build_version_transition(self):
-        menu = self.build_menu([['Analyze', 'Generate', 'Patch'], ['Settings', 'Help', 'Exit'], ['Graph'], ['Version']])
+        menu = self.build_menu([['Generate', 'Patch'], ['Settings', 'Help', 'Exit'], ['Graph'], ['Version']])
 
         async def transition(action):
             version_morph = pkg_resources.get_distribution("mrph").version
-            version_authenticator = pkg_resources.get_distribution("python_claude_web_authenticator").version
 
-            text = f"GPT Morph CLI Bot: {version_morph}\nClaude Integration: {version_authenticator}"
+            text = f"GPT Morph CLI Bot: {version_morph}"
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text,
                                                      reply_markup=menu)
@@ -649,11 +503,22 @@ class MorphBot(ConsoleBot):
 
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
-            '''mrph> Welcome to the GPT Morph CLI Bot! You are currently in the main menu.
-To execute a command, type the corresponding option and press Enter.
-You can always return to the main menu by typing "/start".
-Type "/help" for more.\n''',
-            [["Analyze", "Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph", "Version"]])
+            r'''┌────────────────────────────────────────────────────────────────────────────┐
+│ GPT Morph :: GRANDPA v1.0.53          THE GRANDPA OF CLAUDE CODE           │
+├────────────────────────────────────────────────────────────────────────────┤
+│      .----------------.          > HOW CAN I HELP YOU, KIDDO?              │
+│     /   _        _     \                                                   │
+│    |   [ ]      [ ]     |         Grandpa writes clean code.               │
+│    |       ___          |         No frameworks. No fluff.                 │
+│    |      /___\         |         Memory: 64K   Wisdom: ∞                  │
+│     \    .____.        /                                                   │
+│      '---|____|-------'          > _                                       │
+│          /|  |\                                                            │
+├────────────────────────────────────────────────────────────────────────────┤
+│ "WE DEBUGGED WITH PRINT STATEMENTS."                                       │
+└────────────────────────────────────────────────────────────────────────────┘
+''',
+            [["Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph", "Version"]])
 
         return builder \
             .edge(
@@ -665,15 +530,15 @@ Type "/help" for more.\n''',
             .edge("/start", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/settings", "/settings", on_transition=self.build_settings_transition()) \
             .edge("/settings", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge(
-                "/settings",
-                "/start",
-                "/authenticate_claude",
-                on_transition=self.build_authenticate_claude_transition()) \
             .edge("/settings", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/start", "/help", on_transition=self.build_help_transition()) \
             .edge("/start", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge("/start", "/generate_file_name_input", "/generate", on_transition=self.build_generate_transition()) \
+            .edge(
+                "/start",
+                "/generate_file_name_input",
+                "/generate",
+                matcher=re.compile(r"^/generate"),
+                on_transition=self.build_generate_transition()) \
             .edge("/generate_file_name_input", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/generate_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge(
@@ -721,7 +586,12 @@ Type "/help" for more.\n''',
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_generate_statement_flow_prompt_input_transition(main_menu_transition)) \
-            .edge("/start", "/patch_file_name_input", "/patch", on_transition=self.build_patch_transition()) \
+            .edge(
+                "/start",
+                "/patch_file_name_input",
+                "/patch",
+                matcher=re.compile(r"^/patch"),
+                on_transition=self.build_patch_transition()) \
             .edge("/patch_file_name_input", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/patch_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
             .edge("/patch_file_name_input", "/settings", "/settings", on_transition=self.build_settings_transition()) \
@@ -743,29 +613,4 @@ Type "/help" for more.\n''',
                 "/start",
                 None,
                 matcher=re.compile("^.*$"),
-                on_transition=self.build_patch_prompt_input_transition(main_menu_transition)) \
-            .edge("/start", "/analyze_file_name_input", "/analyze", on_transition=self.build_analyze_transition()) \
-            .edge("/analyze_file_name_input", "/start", "/start", on_transition=main_menu_transition) \
-            .edge("/analyze_file_name_input", "/settings", "/settings") \
-            .edge("/analyze_file_name_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge(
-                "/analyze_file_name_input",
-                "/analyze_file_name_output",
-                None,
-                matcher=re.compile("^.*$"),
-                on_transition=self.build_analyze_file_name_input_transition()) \
-            .edge("/analyze_file_name_output", "/start", "/start", on_transition=main_menu_transition) \
-            .edge("/analyze_file_name_output", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge(
-                "/analyze_file_name_output",
-                "/analyze_type",
-                None,
-                matcher=re.compile("^.*$"),
-                on_transition=self.build_analyze_file_name_output_transition()) \
-            .edge("/analyze_type", "/start", "/start", on_transition=main_menu_transition) \
-            .edge("/analyze_type", "/start", "/exit", on_transition=self.build_exit_transition()) \
-            .edge(
-                "/analyze_type",
-                "/start",
-                "/crypto_audit",
-                on_transition=self.build_crypto_audit_transition(main_menu_transition))
+                on_transition=self.build_patch_prompt_input_transition(main_menu_transition))

@@ -4,16 +4,14 @@
       
       Andrew. (2023). *The Large Language Model code morphing*. Andrew's Blog. Retrieved 2023-11-12, from [https://andrewmikhailov.wordpress.com/2023/11/12/code-morphing/](https://andrewmikhailov.wordpress.com/2023/11/12/code-morphing/)
 
-The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by OpenAI's GPT-3.5 or Anthropic's Claude. It allows you to interact with the GPT model to generate text and perform various tasks through a console-based interface.
+The GPT Morph CLI Bot is a command-line interface (CLI) bot powered by a local llama.cpp endpoint, Ollama, or OpenAI. It allows you to interact with the LLM to generate text and perform various tasks through a console-based interface.
 
 ## GPT Morph Status
-✅ `ChatGPT API` active.
-
-✅ `Claude Unofficial API` active.
+✅ `Llama.cpp API` (local Tesla K80 inference) active.
 
 ✅ `Ollama API` active.
 
-✅ `Llama.cpp API` (local Tesla K80 inference) active.
+✅ `ChatGPT API` active.
 
 ## Installing the GPT Morph CLI
 ```shell
@@ -79,12 +77,47 @@ To get started with the **GPT Morph CLI Bot**, follow these steps:
 
     If you don't have an OpenAI API key yet, sign up at [OpenAI Platform](https://platform.openai.com/signup).
 
-    2.3. Or, authenticate to **Anthropic Claude API** by using the [Python Claude Web Authenticator](https://github.com/pysyun/python_claude_web_authenticator).
+    2.3. Or, point the bot at a local **llama.cpp** endpoint (for example, the Tesla K80 inference node) by adding to the ".env" file:
 
-        - Start the "mrph" shell.
-        - Type "/settings".
-        - Type "/authenticate_claude".
-        - Proceed to signing into https://claude.ai/ to get your API key automatically on successful sign-up.
+        ```
+        LLAMA_CPP_ENDPOINT_URI=<YOUR_ENDPOINT_URI>
+        LLAMA_CPP_MODEL=<YOUR_MODEL_NAME>
+        ```
+
+    2.4. Or, point the bot at an **Ollama** endpoint by adding to the ".env" file:
+
+        ```
+        OLLAMA_ENDPOINT_URI=<YOUR_ENDPOINT_URI>
+        OLLAMA_MODEL=<YOUR_MODEL_NAME>
+        ```
+
+    2.5. **Multi-agent setup (many processor instances).** You can define any number
+    of *named* processor instances and run several of them in parallel — for example
+    several local llama.cpp nodes on your network. Each instance is a block of
+    `MRPH_PROCESSOR_<ID>_*` variables in the ".env" file:
+
+        ```
+        MRPH_PROCESSORS=k80-a,k80-b,gpt4
+
+        MRPH_PROCESSOR_k80-a_TYPE=llama_cpp
+        MRPH_PROCESSOR_k80-a_ENDPOINT_URI=http://192.168.0.14:8080/v1
+        MRPH_PROCESSOR_k80-a_MODEL=k80-model
+
+        MRPH_PROCESSOR_k80-b_TYPE=llama_cpp
+        MRPH_PROCESSOR_k80-b_ENDPOINT_URI=http://192.168.0.15:8080/v1
+        MRPH_PROCESSOR_k80-b_MODEL=k80-model
+
+        MRPH_PROCESSOR_gpt4_TYPE=openai
+        MRPH_PROCESSOR_gpt4_API_KEY=<YOUR_API_KEY>
+        MRPH_PROCESSOR_gpt4_MODEL=gpt-4o
+        ```
+
+    Supported `TYPE` values are `llama_cpp`, `ollama` and `openai`. Recognised
+    per-instance keys are `TYPE`, `ENDPOINT_URI`, `MODEL`, `API_KEY` and `BASE_URL`.
+    `MRPH_PROCESSORS` is optional and only fixes the id ordering (the first id is the
+    default). The classic single-instance variables above keep working and map to the
+    default ids `llama_cpp`, `ollama` and `openai`. Run `/settings` to list everything
+    that is configured.
 
 4. Run the bot:
     ```shell
@@ -97,9 +130,8 @@ To get started with the **GPT Morph CLI Bot**, follow these steps:
 
 - **Text Generation:** You can use this bot to generate text based on your input and project requirements.
 - **Re-factoring**.
-- **Code audits**.
 - **Unit testing**.
-- **Settings Display:** Check and display your OpenAI API key settings.
+- **Settings Display:** Check and display your configured LLM settings.
 - **Graph Visualization:** View a Graphviz representation of the bot's API.
 
 ## Extending the LLM text corpus
@@ -110,11 +142,26 @@ To morph projects, which are developed using rare programming languages, rare te
 
 ## Using the "mrph" CLI
 
-- To analyze project code, choose the "**/analyze**" option and follow the prompts.
 - To generate new code artifacts, select the "**/generate**" option and follow the prompts.
 - To modify existing code artifacts, select the "**/patch**" option and follow the prompts.
-- To view your LLM key settings, select the "**/settings**" option.
+- To view your configured processor instances, select the "**/settings**" option.
 - Explore other available commands in the main menu.
+
+### Choosing processors (multi-agent morphing)
+
+Both `/generate` and `/patch` accept a processor identifier so you can pick which
+instance — or how many — perform the morph:
+
+- `/generate` — use the default processor (first configured; legacy priority is
+  llama.cpp → Ollama → OpenAI).
+- `/generate @k80-a` — use the processor with id `k80-a`.
+- `/generate @k80-a,@gpt4` — run both **in parallel**; each writes its own morph to
+  `<name>.<id>.<ext>` so you can compare the results.
+- `/generate @all` — fan the morph out across **every** configured processor at once.
+
+The same `@id` syntax works for `/patch`. When several processors are selected they
+are dispatched concurrently, letting you use many parallel local nodes on your
+network as a multi-agent system.
 
 You can find example bot sessions, showing how to do something good at: 
 [GPT Morph CLI Bot Examples](./examples.md)
@@ -133,8 +180,9 @@ This project is licensed under the LGPL License - see the [LICENSE](LICENSE) fil
 
 ## Acknowledgments
 
-- This project uses **OpenAI's GPT-3.5** for text generation.
-- This project uses **Anthropic Claude** for text generation.
+- This project uses a local **llama.cpp** endpoint for text generation.
+- This project uses **Ollama** for text generation.
+- This project uses **OpenAI's GPT** models for text generation.
 
 Enjoy using the GPT Morph CLI Bot!
 
