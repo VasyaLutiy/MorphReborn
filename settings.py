@@ -1,12 +1,15 @@
 import os
 
-import openai
-from dotenv import load_dotenv
-
 from processors.registry import ProcessorRegistry
 
 
 def load_settings():
+
+    # Imported here, not at module load, so ``import settings`` (and therefore
+    # ``import flows.morph``) costs no provider SDK -- the same lazy-import
+    # discipline processors/batch.py and processors/registry.py already follow.
+    import openai
+    from dotenv import load_dotenv
 
     current_directory = os.getcwd()
     env_path = os.path.join(current_directory, '.env')

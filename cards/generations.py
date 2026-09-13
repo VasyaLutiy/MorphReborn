@@ -270,6 +270,157 @@ def _retry_card(card: MorphCard, attempt: int, result) -> MorphCard:
     )
 
 
+def resolve_runnable(
+    generation: List[MorphCard],
+    index: int,
+    total: int,
+    outcomes: Dict[str, CardOutcome],
+    blocked: set,
+    log: Callable[[str], None] = print,
+) -> List[MorphCard]:
+    """Split one generation into the cards that can run now versus the skipped.
+
+    A card is skipped (and itself added to ``blocked``) when any of its
+    dependencies is already ``blocked`` -- failed or skipped in an earlier
+    generation. The skip is logged and recorded as a ``"skipped"``
+    :class:`CardOutcome` naming the blocking dependency. Mutates ``outcomes`` and
+    ``blocked`` in place; returns the runnable cards in deck order.
+
+    Extracted from :func:`run_deck` so the split-step CLI path
+    (:func:`cards.store.submit_generation`) resolves a generation exactly the way
+    the synchronous loop does.
+    """
+    runnable: List[MorphCard] = []
+    for card in generation:
+        blocking = next((dep for dep in card.depends_on if dep in blocked), None)
+        if blocking is not None:
+            status = outcomes[blocking].status
+            log(
+                f"mrph> [generation {index}/{total}] skipping {card.custom_id!r}: "
+                f"dependency {blocking!r} {status}"
+            )
+            outcomes[card.custom_id] = CardOutcome(
+                card.custom_id, "skipped", reason=blocking, attempts=0
+            )
+            blocked.add(card.custom_id)
+        else:
+            runnable.append(card)
+    return runnable
+
+
+def process_generation(
+    runnable: List[MorphCard],
+    results: Optional[Dict[str, Optional[str]]],
+    index: int,
+    total: int,
+    root: str,
+    backend,
+    poll_interval: float,
+    log: Callable[[str], None],
+    verify: bool,
+    acceptance_timeout: float,
+    max_regenerations: int,
+    outcomes: Dict[str, CardOutcome],
+    blocked: set,
+) -> None:
+    """Turn one generation's collected ``results`` into outcomes (with retries).
+
+    ``results`` is the ``{variant_custom_id: text|None}`` map ``backend.collect``
+    returned, or ``None`` when the whole batch failed (every runnable card fails
+    terminally, no retry). Otherwise each card is either verified best-of-N (when
+    it has an ``acceptance`` command and ``verify`` is true) or has its surviving
+    variants written (Phase 3 semantics); cards that fail acceptance with retries
+    left are regenerated inline via :func:`_run_retries`, whose retry batches are
+    submitted and collected through ``backend`` here. Mutates ``outcomes`` and
+    ``blocked`` in place.
+
+    This is the shared per-generation body of both :func:`run_deck` (which
+    submits and polls the batch itself, then hands the results here) and
+    :func:`cards.store.collect_generation` (which collects the in-flight batch
+    across a CLI restart, then hands the results here) -- so the two paths keep
+    identical best-of-N / rollback / retry / skip-cascade semantics.
+    """
+    from cards.acceptance import verify_card
+
+    if results is None:
+        log(
+            f"mrph> [generation {index}/{total}] batch failed; "
+            f"{len(runnable)} card(s) failed"
+        )
+        for card in runnable:
+            outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
+            blocked.add(card.custom_id)
+        return
+
+    # Cards that failed acceptance but have retries left, paired with the
+    # verify outcome carrying the error context for their next attempt.
+    retry_pending: List[tuple] = []
+
+    for card in runnable:
+        if verify and card.acceptance:
+            outcome = verify_card(card, results, root, acceptance_timeout, log)
+            if outcome.passed:
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id,
+                    "written",
+                    paths=outcome.paths,
+                    attempts=1,
+                    winning_variant=outcome.winning_custom_id,
+                )
+                log(
+                    f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                    f"written (variant {outcome.winning_custom_id!r} passed "
+                    f"acceptance): {', '.join(outcome.paths)}"
+                )
+            elif max_regenerations > 0:
+                retry_pending.append((card, outcome))
+            else:
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id,
+                    "failed",
+                    attempts=1,
+                    acceptance_output=_acceptance_output(outcome.result),
+                )
+                blocked.add(card.custom_id)
+                log(
+                    f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                    f"failed acceptance (no retries)"
+                )
+        else:
+            written = _write_variants(card, results, root)
+            if written:
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id, "written", paths=written
+                )
+                log(
+                    f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                    f"written: {', '.join(written)}"
+                )
+            else:
+                outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
+                blocked.add(card.custom_id)
+                log(
+                    f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                    f"failed: all variants empty"
+                )
+
+    # Retry generations for the failed acceptance cards -- these run BEFORE
+    # this generation's dependents (which live in later generations).
+    _run_retries(
+        retry_pending,
+        index,
+        total,
+        root,
+        backend,
+        poll_interval,
+        log,
+        acceptance_timeout,
+        max_regenerations,
+        outcomes,
+        blocked,
+    )
+
+
 def run_deck(
     cards: List[MorphCard],
     backend,
@@ -316,11 +467,6 @@ def run_deck(
     static generation composition (retry batches are extra submits, not extra
     generations).
     """
-    # Imported lazily to break the cycle: cards.acceptance imports the shared
-    # file helpers from this module at import time, so this module can only reach
-    # into it once its own definitions exist -- i.e. here, at call time.
-    from cards.acceptance import verify_card
-
     generations = split_into_generations(cards)
     total = len(generations)
     composition = [[card.custom_id for card in generation] for generation in generations]
@@ -330,22 +476,7 @@ def run_deck(
     blocked: set = set()
 
     for index, generation in enumerate(generations, start=1):
-        runnable: List[MorphCard] = []
-        for card in generation:
-            blocking = next((dep for dep in card.depends_on if dep in blocked), None)
-            if blocking is not None:
-                status = outcomes[blocking].status
-                log(
-                    f"mrph> [generation {index}/{total}] skipping {card.custom_id!r}: "
-                    f"dependency {blocking!r} {status}"
-                )
-                outcomes[card.custom_id] = CardOutcome(
-                    card.custom_id, "skipped", reason=blocking, attempts=0
-                )
-                blocked.add(card.custom_id)
-            else:
-                runnable.append(card)
-
+        runnable = resolve_runnable(generation, index, total, outcomes, blocked, log)
         if not runnable:
             continue
 
@@ -363,78 +494,16 @@ def run_deck(
 
         results = _submit_poll_collect(requests, backend, poll_interval)
 
-        if results is None:
-            log(
-                f"mrph> [generation {index}/{total}] batch failed; "
-                f"{len(runnable)} card(s) failed"
-            )
-            for card in runnable:
-                outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
-                blocked.add(card.custom_id)
-            continue
-
-        # Cards that failed acceptance but have retries left, paired with the
-        # verify outcome carrying the error context for their next attempt.
-        retry_pending: List[tuple] = []
-
-        for card in runnable:
-            if verify and card.acceptance:
-                outcome = verify_card(card, results, root, acceptance_timeout, log)
-                if outcome.passed:
-                    outcomes[card.custom_id] = CardOutcome(
-                        card.custom_id,
-                        "written",
-                        paths=outcome.paths,
-                        attempts=1,
-                        winning_variant=outcome.winning_custom_id,
-                    )
-                    log(
-                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                        f"written (variant {outcome.winning_custom_id!r} passed "
-                        f"acceptance): {', '.join(outcome.paths)}"
-                    )
-                elif max_regenerations > 0:
-                    retry_pending.append((card, outcome))
-                else:
-                    outcomes[card.custom_id] = CardOutcome(
-                        card.custom_id,
-                        "failed",
-                        attempts=1,
-                        acceptance_output=_acceptance_output(outcome.result),
-                    )
-                    blocked.add(card.custom_id)
-                    log(
-                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                        f"failed acceptance (no retries)"
-                    )
-            else:
-                written = _write_variants(card, results, root)
-                if written:
-                    outcomes[card.custom_id] = CardOutcome(
-                        card.custom_id, "written", paths=written
-                    )
-                    log(
-                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                        f"written: {', '.join(written)}"
-                    )
-                else:
-                    outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
-                    blocked.add(card.custom_id)
-                    log(
-                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                        f"failed: all variants empty"
-                    )
-
-        # Retry generations for the failed acceptance cards -- these run BEFORE
-        # this generation's dependents (which live in later generations).
-        _run_retries(
-            retry_pending,
+        process_generation(
+            runnable,
+            results,
             index,
             total,
             root,
             backend,
             poll_interval,
             log,
+            verify,
             acceptance_timeout,
             max_regenerations,
             outcomes,
