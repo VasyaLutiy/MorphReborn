@@ -154,8 +154,9 @@ To morph projects, which are developed using rare programming languages, rare te
 Both `/generate` and `/patch` accept a processor identifier so you can pick which
 instance — or how many — perform the morph:
 
-- `/generate` — use the default processor (first configured; legacy priority is
-  llama.cpp → Ollama → OpenAI).
+- `/generate` — ride the round-robin pool: whichever configured processor is
+  free next (spread evenly across the pool; with a single processor
+  configured this is just that one processor, as before).
 - `/generate @k80-a` — use the processor with id `k80-a`.
 - `/generate @k80-a,@gpt4` — run both **in parallel**; each writes its own morph to
   `<name>.<id>.<ext>` so you can compare the results.
@@ -166,10 +167,15 @@ are dispatched concurrently, letting you use many parallel local nodes on your
 network as a multi-agent system.
 
 That feature fans *one* file out across many processors. For the opposite
-case — queuing a *sequence* of independent `/generate` calls, each a
-different file, round-robined across your processor pool so up to as many
-files morph concurrently as you have processors — see the design spec in
-[`documentation/parallel-generate-scheduling.md`](./documentation/parallel-generate-scheduling.md).
+case, a plain `/generate` (no `@id`) rides a round-robin pool: type a
+*sequence* of independent `/generate` calls, each a different file, and
+they are picked up automatically by whichever configured processor is
+free — up to as many files morphing concurrently as you have processors —
+queuing once every slot is busy and dispatching automatically as each
+processor frees up. `/settings` shows each processor's idle/busy status and
+how many jobs are queued. See
+[`documentation/parallel-generate-scheduling.md`](./documentation/parallel-generate-scheduling.md)
+for the full behaviour.
 
 You can find example bot sessions, showing how to do something good at: 
 [GPT Morph CLI Bot Examples](./examples.md)

@@ -1,8 +1,9 @@
 # Parallel `/generate`: Round-Robin Processor Scheduling
 
-> **Status: design specification, not yet implemented.** This document
-> describes the intended behaviour so it can be built and reviewed against a
-> single spec. It intentionally does not change any code.
+> **Status: implemented** in `scheduler.py` (the pool/queue/round-robin
+> bookkeeping) and `flows/morph.py` (wiring it into `/generate` and
+> `/patch`). This document remains the behavioural spec; see
+> `tests/test_scheduler.py` for the scenarios it is checked against.
 
 ## The problem this solves
 
@@ -76,8 +77,12 @@ than running immediately.
    FIFO queue: if non-empty, it immediately dequeues and starts the next
    job on that processor and announces the hand-off in the chat.
 5. The round-robin cursor is only advanced by step 2's immediate-dispatch
-   case and by step 4's dequeue case — i.e., every time a job actually
-   *starts* on a processor, not every time one is merely requested.
+   case, where it is genuinely choosing among several free processors. A
+   step 4 dequeue does not move it: the processor that just freed is the
+   only candidate for the job at the head of its queue, so no rotation
+   choice is actually being made. This matches the worked example below,
+   where dequeuing job 4 onto `k80-a` does not change which processor the
+   *next fresh* `/generate` would land on.
 
 ## Telling the user which processor is next
 
