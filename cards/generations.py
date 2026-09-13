@@ -26,11 +26,18 @@ or ``processors``. The backend arrives as a parameter (duck-typed: only
 helper is duplicated from ``flows.morph`` rather than imported -- the same
 pattern as the source filter duplicated in :mod:`cards.compiler`.
 
-Known simplification for this phase: ``flows.morph``'s ``append_if_plain`` /
+Phase 4 adds mechanical acceptance on top of this loop (see
+:mod:`cards.acceptance`): a card with an ``acceptance`` command has its variants
+verified best-of-N, and a card that fails verification is regenerated -- its
+instruction extended with the acceptance error output -- into a retry batch that
+runs before its dependents. A card *without* an ``acceptance`` command keeps the
+exact Phase 3 semantics below (write every surviving variant, no verification,
+no retries), so ``verify=True`` is a no-op for it.
+
+Known simplification, still in force: ``flows.morph``'s ``append_if_plain`` /
 ``todo`` append semantics are *not* reproduced. A response with no fenced code
-block is written verbatim in mode ``'w'`` (never appended). Machine acceptance
-and regeneration with error context are Phase 4; per-card backend routing is
-Phase 5. Neither is built here.
+block is written verbatim in mode ``'w'`` (never appended). Per-card backend
+routing is Phase 5 and is not built here.
 """
 
 import os
@@ -93,15 +100,27 @@ class CardOutcome:
 
     ``status`` is ``"written"`` (``paths`` lists the files written -- one for a
     single-variant card, one per surviving variant otherwise), ``"failed"``
-    (every variant response was ``None``, or the whole batch failed), or
+    (every variant response was ``None``, or the whole batch failed, or -- for a
+    card with acceptance -- verification failed through the last retry), or
     ``"skipped"`` (a dependency failed or was itself skipped; ``reason`` names
     the blocking dependency).
+
+    Phase 4 adds three fields, meaningful only for a card with an ``acceptance``
+    command: ``attempts`` is the number of generation-level tries (1 = original
+    only, 2 = one retry, and so on); ``winning_variant`` is the batch custom_id
+    of the variant that passed acceptance (``None`` unless ``"written"`` via
+    verification); ``acceptance_output`` is the final failure's captured output
+    (``None`` when the card passed or has no acceptance). A card without
+    acceptance keeps ``attempts == 1`` and both others ``None``.
     """
 
     custom_id: str
     status: str
     paths: List[str] = field(default_factory=list)
     reason: Optional[str] = None
+    attempts: int = 1
+    winning_variant: Optional[str] = None
+    acceptance_output: Optional[str] = None
 
     def __str__(self) -> str:
         if self.status == "written":
@@ -138,13 +157,14 @@ class DeckResult:
 # -- response to file (mirrors flows.morph) ----------------------------------
 
 
-def _response_to_file_body(response: str) -> str:
+def response_to_file_body(response: str) -> str:
     """Extract the file body from a response text.
 
     Mirrors ``flows.morph.MorphBot.response_to_file_body``: pull the fenced code
     blocks if any are present, else use the response verbatim. Duplicated (not
     imported) to keep ``cards`` free of any dependency on ``flows``; keep the two
-    in step when either changes. Simplification for this phase: the
+    in step when either changes. Public so :mod:`cards.acceptance` reuses this
+    one copy rather than adding a third. Simplification for this phase: the
     ``append_if_plain`` / ``todo`` append mode is dropped -- callers here always
     write mode ``'w'``.
     """
@@ -177,12 +197,88 @@ def _output_path(card: MorphCard, variant_custom_id: str, root: str) -> str:
 # -- the generation cycle ----------------------------------------------------
 
 
+def _submit_poll_collect(
+    requests: List[dict], backend, poll_interval: float
+) -> Optional[Dict[str, Optional[str]]]:
+    """Submit one batch, poll to completion, and collect -- or ``None`` on failure.
+
+    Returns the ``{custom_id: text|None}`` map on a completed batch, or ``None``
+    when the backend reports the whole batch ``"failed"`` (in which case there is
+    nothing to collect). Sleeps ``poll_interval`` between polls. ``backend`` is
+    duck-typed: only ``submit`` / ``status`` / ``collect`` are called.
+    """
+    batch_id = backend.submit(requests)
+    while True:
+        status = backend.status(batch_id)
+        if status in ("completed", "failed"):
+            break
+        time.sleep(poll_interval)
+    if status == "failed":
+        return None
+    return backend.collect(batch_id)
+
+
+def _write_variants(
+    card: MorphCard, results: Dict[str, Optional[str]], root: str
+) -> List[str]:
+    """Write every surviving variant of a card (Phase 3, no-acceptance path).
+
+    A ``None`` response is a failed variant and is skipped. Returns the paths
+    written; an empty list means every variant response was ``None``.
+    """
+    written: List[str] = []
+    for variant_id in _variant_ids(card):
+        response = results.get(variant_id)
+        if response is None:
+            continue
+        body = response_to_file_body(response)
+        path = _output_path(card, variant_id, root)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        written.append(path)
+    return written
+
+
+def _retry_card(card: MorphCard, attempt: int, result) -> MorphCard:
+    """A copy of ``card`` for retry ``attempt``, its instruction carrying the error.
+
+    The batch custom_id is suffixed ``.r<attempt>`` (variants then become
+    ``.r<attempt>.v<m>`` via :func:`compile_card`). The instruction gains a
+    clearly delimited block with the failed acceptance command and the tail of
+    its output (empty when the previous attempt produced none, e.g. a timeout or
+    all-``None`` responses) so the executor can see what went wrong.
+    """
+    output = result.output if result is not None else ""
+    error_block = (
+        "\n\n---\n"
+        f"A previous attempt failed its acceptance check (`{card.acceptance}`):\n"
+        f"{output}\n"
+        "---\n"
+        "Please fix the issues and produce the complete corrected file."
+    )
+    return MorphCard(
+        custom_id=f"{card.custom_id}.r{attempt}",
+        intent=card.intent,
+        target=card.target,
+        instruction=card.instruction + error_block,
+        context_slice=list(card.context_slice),
+        acceptance=card.acceptance,
+        model=card.model,
+        variants=card.variants,
+        generation=card.generation,
+        depends_on=list(card.depends_on),
+    )
+
+
 def run_deck(
     cards: List[MorphCard],
     backend,
     root: str = ".",
     poll_interval: float = 1.0,
     log: Callable[[str], None] = print,
+    verify: bool = True,
+    acceptance_timeout: float = 300.0,
+    max_regenerations: int = 2,
 ) -> DeckResult:
     """Execute a deck generation by generation through one batch backend.
 
@@ -192,18 +288,39 @@ def run_deck(
     which reads the fresh files earlier generations wrote, the whole point of
     generations -- submit them as one batch, poll ``backend.status`` until it
     reaches ``"completed"`` or ``"failed"`` (sleeping ``poll_interval`` between
-    polls), collect, and write the morphs.
+    polls), collect, and process the morphs.
 
-    Failure semantics for this phase: a card fails when every one of its variant
-    responses is ``None``; it is still ``"written"`` if at least one variant
-    succeeded. A whole batch reported ``"failed"`` fails every card it carried. A
-    failed (or skipped) card's transitive dependents are skipped. Regeneration
-    with error context is Phase 4 and is not built here.
+    A card WITHOUT an ``acceptance`` command keeps the Phase 3 contract: it is
+    ``"written"`` if at least one variant response is non-``None`` (all surviving
+    variants written), ``"failed"`` when every variant response is ``None``, and
+    it is never retried.
+
+    A card WITH an ``acceptance`` command (only when ``verify`` is true, the
+    default) is verified best-of-N by :func:`cards.acceptance.verify_card`: the
+    first variant to pass acceptance wins and the card is ``"written"``. A card
+    that fails verification (or whose responses were all ``None``) is
+    *regenerated* -- resubmitted with the acceptance error appended to its
+    instruction -- into a retry batch that runs BEFORE this generation's
+    dependents, up to ``max_regenerations`` times (default 2, so at most 3 total
+    attempts). Its ``CardOutcome`` is recorded under the ORIGINAL custom_id with
+    the attempt count and, on success, the winning variant. Only once a card
+    exhausts its retries and finally ``"failed"`` are its dependents skipped.
+
+    A whole batch reported ``"failed"`` (a transport/provider failure, no
+    responses to judge) fails every card it carried terminally -- no retry. A
+    failed or skipped card's transitive dependents are skipped.
 
     ``backend`` is duck-typed: only ``submit(requests) -> batch_id``,
     ``status(batch_id) -> str`` and ``collect(batch_id) -> {custom_id: text|None}``
-    are called. Returns a :class:`DeckResult`.
+    are called. Returns a :class:`DeckResult` whose ``generations`` records the
+    static generation composition (retry batches are extra submits, not extra
+    generations).
     """
+    # Imported lazily to break the cycle: cards.acceptance imports the shared
+    # file helpers from this module at import time, so this module can only reach
+    # into it once its own definitions exist -- i.e. here, at call time.
+    from cards.acceptance import verify_card
+
     generations = split_into_generations(cards)
     total = len(generations)
     composition = [[card.custom_id for card in generation] for generation in generations]
@@ -223,7 +340,7 @@ def run_deck(
                     f"dependency {blocking!r} {status}"
                 )
                 outcomes[card.custom_id] = CardOutcome(
-                    card.custom_id, "skipped", reason=blocking
+                    card.custom_id, "skipped", reason=blocking, attempts=0
                 )
                 blocked.add(card.custom_id)
             else:
@@ -244,17 +361,11 @@ def run_deck(
         for card in runnable:
             requests.extend(compile_card(card, root))
 
-        batch_id = backend.submit(requests)
+        results = _submit_poll_collect(requests, backend, poll_interval)
 
-        while True:
-            status = backend.status(batch_id)
-            if status in ("completed", "failed"):
-                break
-            time.sleep(poll_interval)
-
-        if status == "failed":
+        if results is None:
             log(
-                f"mrph> [generation {index}/{total}] batch {batch_id!r} failed; "
+                f"mrph> [generation {index}/{total}] batch failed; "
                 f"{len(runnable)} card(s) failed"
             )
             for card in runnable:
@@ -262,34 +373,172 @@ def run_deck(
                 blocked.add(card.custom_id)
             continue
 
-        results = backend.collect(batch_id)
+        # Cards that failed acceptance but have retries left, paired with the
+        # verify outcome carrying the error context for their next attempt.
+        retry_pending: List[tuple] = []
 
         for card in runnable:
-            written: List[str] = []
-            for variant_id in _variant_ids(card):
-                response = results.get(variant_id)
-                if response is None:
-                    continue
-                body = _response_to_file_body(response)
-                path = _output_path(card, variant_id, root)
-                with open(path, "w", encoding="utf-8") as handle:
-                    handle.write(body)
-                written.append(path)
+            if verify and card.acceptance:
+                outcome = verify_card(card, results, root, acceptance_timeout, log)
+                if outcome.passed:
+                    outcomes[card.custom_id] = CardOutcome(
+                        card.custom_id,
+                        "written",
+                        paths=outcome.paths,
+                        attempts=1,
+                        winning_variant=outcome.winning_custom_id,
+                    )
+                    log(
+                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                        f"written (variant {outcome.winning_custom_id!r} passed "
+                        f"acceptance): {', '.join(outcome.paths)}"
+                    )
+                elif max_regenerations > 0:
+                    retry_pending.append((card, outcome))
+                else:
+                    outcomes[card.custom_id] = CardOutcome(
+                        card.custom_id,
+                        "failed",
+                        attempts=1,
+                        acceptance_output=_acceptance_output(outcome.result),
+                    )
+                    blocked.add(card.custom_id)
+                    log(
+                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                        f"failed acceptance (no retries)"
+                    )
+            else:
+                written = _write_variants(card, results, root)
+                if written:
+                    outcomes[card.custom_id] = CardOutcome(
+                        card.custom_id, "written", paths=written
+                    )
+                    log(
+                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                        f"written: {', '.join(written)}"
+                    )
+                else:
+                    outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
+                    blocked.add(card.custom_id)
+                    log(
+                        f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                        f"failed: all variants empty"
+                    )
 
-            if written:
+        # Retry generations for the failed acceptance cards -- these run BEFORE
+        # this generation's dependents (which live in later generations).
+        _run_retries(
+            retry_pending,
+            index,
+            total,
+            root,
+            backend,
+            poll_interval,
+            log,
+            acceptance_timeout,
+            max_regenerations,
+            outcomes,
+            blocked,
+        )
+
+    return DeckResult(outcomes=outcomes, generations=composition)
+
+
+def _acceptance_output(result) -> Optional[str]:
+    """The captured output of a failing acceptance result, or ``None`` if none ran."""
+    return result.output if result is not None else None
+
+
+def _run_retries(
+    pending: List[tuple],
+    index: int,
+    total: int,
+    root: str,
+    backend,
+    poll_interval: float,
+    log: Callable[[str], None],
+    acceptance_timeout: float,
+    max_regenerations: int,
+    outcomes: Dict[str, CardOutcome],
+    blocked: set,
+) -> None:
+    """Regenerate cards that failed acceptance, up to ``max_regenerations`` times.
+
+    ``pending`` is a list of ``(card, verify_outcome)``. Each retry attempt
+    builds a retry card per still-pending card (instruction carrying the previous
+    attempt's error), submits them as one retry batch, and re-verifies. A card
+    that passes is recorded ``"written"`` under its ORIGINAL custom_id with the
+    attempt count; a card that exhausts its retries is recorded ``"failed"`` and
+    blocks its dependents. Mutates ``outcomes`` and ``blocked`` in place.
+    """
+    from cards.acceptance import verify_card
+
+    attempt = 0
+    while pending and attempt < max_regenerations:
+        attempt += 1
+
+        retry_cards: List[MorphCard] = []
+        for card, prev_outcome in pending:
+            log(
+                f"mrph> [generation {index}/{total}] retry "
+                f"{attempt}/{max_regenerations} for card {card.custom_id!r} "
+                f"(acceptance failed)"
+            )
+            retry_cards.append(_retry_card(card, attempt, prev_outcome.result))
+
+        requests: List[dict] = []
+        for retry_card in retry_cards:
+            requests.extend(compile_card(retry_card, root))
+
+        results = _submit_poll_collect(requests, backend, poll_interval)
+
+        if results is None:
+            # The retry batch itself failed wholesale -- fail every pending card
+            # terminally, carrying its last real acceptance output.
+            log(
+                f"mrph> [generation {index}/{total}] retry {attempt} batch "
+                f"failed; {len(pending)} card(s) failed"
+            )
+            for card, prev_outcome in pending:
                 outcomes[card.custom_id] = CardOutcome(
-                    card.custom_id, "written", paths=written
+                    card.custom_id,
+                    "failed",
+                    attempts=1 + attempt,
+                    acceptance_output=_acceptance_output(prev_outcome.result),
+                )
+                blocked.add(card.custom_id)
+            return
+
+        next_pending: List[tuple] = []
+        for retry_card, (card, _prev) in zip(retry_cards, pending):
+            outcome = verify_card(retry_card, results, root, acceptance_timeout, log)
+            if outcome.passed:
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id,
+                    "written",
+                    paths=outcome.paths,
+                    attempts=1 + attempt,
+                    winning_variant=outcome.winning_custom_id,
                 )
                 log(
                     f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                    f"written: {', '.join(written)}"
+                    f"written after retry {attempt} (variant "
+                    f"{outcome.winning_custom_id!r} passed): "
+                    f"{', '.join(outcome.paths)}"
                 )
+            elif attempt < max_regenerations:
+                next_pending.append((card, outcome))
             else:
-                outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id,
+                    "failed",
+                    attempts=1 + attempt,
+                    acceptance_output=_acceptance_output(outcome.result),
+                )
                 blocked.add(card.custom_id)
                 log(
                     f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                    f"failed: all variants empty"
+                    f"failed acceptance after {attempt} retr"
+                    f"{'y' if attempt == 1 else 'ies'}"
                 )
-
-    return DeckResult(outcomes=outcomes, generations=composition)
+        pending = next_pending
