@@ -1,5 +1,6 @@
 .svn
 .idea
+/git
 venv
 .env
 build
