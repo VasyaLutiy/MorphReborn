@@ -38,12 +38,15 @@ Two configuration schemes are supported:
 import os
 from typing import Dict, List, Optional
 
-from processors.ollama_processor import OllamaProcessor
-from processors.llama_cpp_processor import LlamaCppProcessor
-from processors.openai_processor import OpenAIProcessor
+from processors.batch import (
+    BatchBackend,
+    OpenAIBatchBackend,
+    AnthropicBatchBackend,
+    LocalBatchBackend,
+)
 
 NAMESPACE_PREFIX = "MRPH_PROCESSOR_"
-KNOWN_TYPES = ("llama_cpp", "ollama", "openai")
+KNOWN_TYPES = ("llama_cpp", "ollama", "openai", "anthropic")
 
 
 class ProcessorConfig:
@@ -65,6 +68,10 @@ class ProcessorConfig:
             target = self.params.get("base_url") or "OpenAI / Azure OpenAI"
             return f"[{self.identifier}] OpenAI @ {target} " \
                    f"(model \"{self.params.get('model') or os.environ.get('OPENAI_MODEL_NAME')}\")"
+        if self.kind == "anthropic":
+            model = self.params.get("model") or os.environ.get("ANTHROPIC_MODEL_NAME") \
+                or "claude-sonnet-5"
+            return f"[{self.identifier}] Anthropic (model \"{model}\")"
         return f"[{self.identifier}] {self.kind}"
 
 
@@ -92,17 +99,33 @@ class ProcessorRegistry:
         return [config.describe() for config in self._configs.values()]
 
     def create(self, identifier: str):
-        """Instantiate the concrete processor object for ``identifier``."""
+        """Instantiate the concrete processor object for ``identifier``.
+
+        The concrete processor classes are imported lazily here, not at module
+        import time, so each backend's SDK (``openai``, ``ollama``,
+        ``anthropic``) is required only when an instance of that backend is
+        actually created -- constructing the registry, listing/describing
+        configs and choosing a batch backend all work with no SDK installed.
+        """
         config = self._configs[identifier]
         if config.kind == "llama_cpp":
+            from processors.llama_cpp_processor import LlamaCppProcessor
             return LlamaCppProcessor(config.params["endpoint_uri"], config.params["model"])
         if config.kind == "ollama":
+            from processors.ollama_processor import OllamaProcessor
             return OllamaProcessor(config.params["endpoint_uri"], config.params["model"])
         if config.kind == "openai":
+            from processors.openai_processor import OpenAIProcessor
             return OpenAIProcessor(
                 model=config.params.get("model"),
                 api_key=config.params.get("api_key"),
                 base_url=config.params.get("base_url"),
+            )
+        if config.kind == "anthropic":
+            from processors.anthropic_processor import AnthropicProcessor
+            return AnthropicProcessor(
+                model=config.params.get("model"),
+                api_key=config.params.get("api_key"),
             )
         raise ValueError(f"Unknown processor type \"{config.kind}\" for id \"{identifier}\".")
 
@@ -112,6 +135,38 @@ class ProcessorRegistry:
         if stream:
             return stream[0]["value"]
         return ''
+
+    def batch(self, identifier: str) -> "BatchBackend":
+        """The batch backend for ``identifier`` (submit / status / collect).
+
+        Cloud providers expose real batch endpoints; a local llama.cpp/Ollama
+        node has none, so it is wrapped in :class:`~processors.batch.LocalBatchBackend`
+        which drains the deck through the pool. See ``documentation/batch-orchestrator.md``.
+        """
+        config = self._configs[identifier]
+        if config.kind == "openai":
+            return OpenAIBatchBackend(
+                model=config.params.get("model") or os.environ.get("OPENAI_MODEL_NAME"),
+                api_key=config.params.get("api_key"),
+                base_url=config.params.get("base_url"),
+            )
+        if config.kind == "anthropic":
+            return AnthropicBatchBackend(
+                model=config.params.get("model") or os.environ.get("ANTHROPIC_MODEL_NAME")
+                or "claude-sonnet-5",
+                api_key=config.params.get("api_key"),
+            )
+        if config.kind in ("llama_cpp", "ollama"):
+            return LocalBatchBackend(self, [identifier])
+        raise ValueError(f"Unknown processor type \"{config.kind}\" for id \"{identifier}\".")
+
+    def batch_pool(self, identifiers: List[str]) -> LocalBatchBackend:
+        """A single local batch endpoint spanning several local nodes.
+
+        Drains one deck across all of ``identifiers`` through one shared
+        scheduler pool -- the K80 farm running an overnight deck as one machine.
+        """
+        return LocalBatchBackend(self, list(identifiers))
 
     # -- construction ------------------------------------------------------
 
@@ -170,6 +225,12 @@ class ProcessorRegistry:
                 or os.environ.get("OPENAI_API_KEY")
                 or os.environ.get("AZURE_OPENAI_API_KEY")
             )
+        if kind == "anthropic":
+            # Usable with an explicit key or the process-wide Anthropic key.
+            return bool(
+                params.get("api_key")
+                or os.environ.get("ANTHROPIC_API_KEY")
+            )
         return False
 
     @staticmethod
@@ -200,3 +261,10 @@ class ProcessorRegistry:
                 "openai", "openai",
                 {"model": os.environ.get("OPENAI_MODEL_NAME"),
                  "api_key": openai_api_key})
+
+        anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if anthropic_api_key and "anthropic" not in configs:
+            configs["anthropic"] = ProcessorConfig(
+                "anthropic", "anthropic",
+                {"model": os.environ.get("ANTHROPIC_MODEL_NAME") or "claude-sonnet-5",
+                 "api_key": anthropic_api_key})
