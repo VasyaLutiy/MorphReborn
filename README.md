@@ -182,6 +182,39 @@ for the full behaviour.
 You can find example bot sessions, showing how to do something good at: 
 [GPT Morph CLI Bot Examples](./examples.md)
 
+## Morph 2.0: batch orchestrator (preview)
+
+Morph 2.0 turns the CLI into a PDP-11-style **batch orchestrator**: instead of
+morphing one file at a time, you build a *deck* of **morph cards** (each a
+self-contained job — target, context slice, and a machine-checkable acceptance
+criterion) and run the whole backlog through half-price, massively parallel
+batch executors, generation by generation. Five commands drive it:
+
+- `/deck` — show the backlog, its generation ordering, and each card's status
+  (`pending` / `in_flight` / `written` / `failed` / `skipped`).
+- `/card` — add a card. `/card` alone prompts you to paste one morph card as
+  JSON; `/card <goal text>` runs **decomposition mode**, asking the orchestrator
+  to unfold a goal into a reviewed set of cards.
+- `/submit` — compile and submit the current generation. `@<id>` pins a
+  processor, `@all` fans out across the local (llama.cpp/Ollama) pool, and a
+  bare `/submit` uses the default processor.
+- `/collect` — poll the in-flight batch; when it is ready, verify each card's
+  acceptance (best-of-N, with failed cards regenerated before their dependents),
+  write the morphs, and advance to the next generation.
+- `/nightly` — run the entire deck in one blocking pass (submit → poll →
+  collect, generation after generation) and print the run summary.
+
+The natural rhythm is the **nightly morph**: spend the day appending
+well-specified cards to the backlog with `/card`, `/submit` the deck in the
+evening, and review the integrated morphs plus a failure report in the morning.
+The backlog lives in `.morph/deck.json` and the run state in `.morph/state.json`,
+so `/submit` and `/collect` survive quitting and restarting the CLI.
+
+See [`documentation/batch-orchestrator.md`](./documentation/batch-orchestrator.md)
+for the design, [`documentation/NEW_PARADIGN.md`](./documentation/NEW_PARADIGN.md)
+for the narrative, and [`documentation/DEVELOPMENT_PLAN.md`](./documentation/DEVELOPMENT_PLAN.md)
+for the phased delivery plan.
+
 ## BASH Bot API graph
 ![GPT Morph CLI Bot API graph](./flows/morph.png)
 [morph.dot](./flows/morph.dot)

@@ -2,7 +2,9 @@ import os
 import re
 import sys
 import copy
+import json
 import asyncio
+import functools
 import pkg_resources
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
@@ -11,6 +13,57 @@ from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
 from scheduler import JobScheduler
 from settings import load_settings, load_registry
+
+from cards.schema import CardError
+from cards.deck import DeckError
+from cards.generations import run_deck
+from cards.store import (
+    DeckStore,
+    StoreError,
+    build_deck_status,
+    collect_generation,
+    submit_generation,
+)
+
+
+# The orchestrator prompt for /card decomposition mode: turn one goal into a
+# deck of morph cards. Kept verbatim here (not in cards/, which must stay free of
+# prompt/presentation concerns) so a reviewer can read exactly what the model is
+# asked. See documentation/batch-orchestrator.md, "Where cards come from".
+DECOMPOSE_INSTRUCTION = '''You are the ORCHESTRATOR of a batch code-morphing system. \
+Decompose the following goal into a deck of morph cards. You write NO code \
+yourself -- each card is a self-contained job a separate executor will run.
+
+GOAL:
+{goal}
+
+A morph card is a JSON object with these fields:
+  custom_id      - unique id, characters [A-Za-z0-9._-]; names the job and its output file
+  intent         - one of "generate", "patch", "todo"
+  target         - the single file this card writes
+  context_slice  - list of files the executor must see; use paths that EXIST in the
+                   project OR are the "target" of an EARLIER card in this deck;
+                   [] means "the whole project"
+  acceptance     - a runnable shell command that exits 0 when the morph is correct
+                   (e.g. "pytest tests/test_foo.py -q"); optional but strongly preferred
+  variants       - integer >= 1: how many samples to try (best-of-N)
+  depends_on     - list of custom_ids that must complete first; a card may only read
+                   another card's target if it depends_on that card
+  instruction    - the natural-language instruction for the executor
+
+RULES:
+  - Output ONLY a JSON array of card objects -- no commentary. A single fenced
+    ```json code block wrapping the array is acceptable.
+  - Every "acceptance" value must be a real, runnable shell command.
+  - Every "context_slice" path must already exist in the project OR be the target
+    of another card in this array.
+  - Use depends_on so no card reads a file another card in the same generation is
+    still writing (dependent changes serialize into later generations).
+  - Use the flat card shape, e.g.:
+    {{"custom_id":"gen-foo","intent":"generate","target":"foo.py",
+      "context_slice":["bar.py"],"acceptance":"pytest tests/test_foo.py -q",
+      "variants":1,"depends_on":[],"instruction":"..."}}
+'''
 
 
 def filter_source_code_file_names(file_path):
@@ -82,6 +135,13 @@ class MorphBot(ConsoleBot):
         # The welcome banner is only shown once, on the very first /start;
         # later returns to the main menu show just the menu.
         self.shown_welcome = False
+
+        # The batch backend a /submit is in flight on, held so the matching
+        # /collect in the same session reuses it. A LocalBatchBackend keeps its
+        # in-flight batch in memory (worker threads), so /collect MUST use the
+        # very instance that /submit fired; a cloud backend is reconstructable
+        # from state after a restart (see build_collect_transition).
+        self._active_backend = None
 
     # -- processor selection ----------------------------------------------
 
@@ -349,6 +409,13 @@ class MorphBot(ConsoleBot):
 /help - Show this help message with the list of available commands.
 /exit - Exit the application gracefully.
 
+Morph 2.0 batch orchestrator (see documentation/batch-orchestrator.md):
+/deck - Show the backlog, its generations and each card's status.
+/card - Add a card: "/card" pastes one as JSON; "/card <goal>" decomposes a goal into cards.
+/submit - Compile and submit the current generation ("@id" pins a processor, "@all" the local pool).
+/collect - Fetch, verify and integrate the submitted generation, then advance.
+/nightly - Run the whole deck generation by generation in one blocking pass.
+
 Choosing processors (multi-agent):
     /generate            - ride the round-robin pool (whichever processor is free next).
     /generate @gpt4      - use the processor with id "gpt4".
@@ -550,6 +617,363 @@ every slot is busy. /settings shows what is idle, busy or queued.
 
         return transition
 
+    # -- Morph 2.0: batch orchestrator ------------------------------------
+
+    def resolve_batch_backend(self, text):
+        """Resolve a ``/submit``/``/nightly`` spec to a batch backend + label.
+
+        ``None`` spec (bare command) -> the default processor's batch backend.
+        ``@<id>`` -> that processor's backend (``registry.batch``). ``@all`` ->
+        one local pool over every llama_cpp/ollama id (``registry.batch_pool``).
+        Returns ``(backend, label)`` on success, or ``(None, error_message)``.
+        """
+        if not self.registry.ids:
+            return None, "mrph> No matching processor. Configure one (see \"/settings\")."
+
+        spec = self.parse_processor_spec(text)
+        if not spec:
+            default = self.registry.default_id()
+            return self.registry.batch(default), default
+
+        for token in spec:
+            if token.lower() in ("all", "*"):
+                local_ids = [
+                    identifier for identifier in self.registry.ids
+                    if self.registry.get(identifier).kind in ("llama_cpp", "ollama")
+                ]
+                if not local_ids:
+                    return None, "mrph> \"@all\" needs at least one local " \
+                                 "(llama_cpp/ollama) processor; none is configured."
+                return self.registry.batch_pool(local_ids), "+".join(local_ids)
+
+        resolved = self.resolve_processor_ids(self.registry, spec)
+        if not resolved:
+            return None, "mrph> No matching processor. Please, configure one as " \
+                         "stated in \"/settings\"."
+        chosen = resolved[0]
+        return self.registry.batch(chosen), chosen
+
+    @staticmethod
+    def extract_json_array(response):
+        """Parse a JSON array out of a model response (fenced or bare).
+
+        Reuses the fenced-code-block convention of :meth:`response_to_file_body`:
+        if the response carries a ```` ``` ```` block, its body is parsed, else
+        the whole response is. Raises ``ValueError``/``json.JSONDecodeError`` on
+        anything that is not a JSON array.
+        """
+        blocks = re.findall(r"```[a-zA-Z0-9]*\n(.*?)\n```", response, re.DOTALL)
+        candidate = blocks[0] if blocks else response
+        data = json.loads(candidate)
+        if not isinstance(data, list):
+            raise ValueError("expected a JSON array of morph cards")
+        return data
+
+    def _deck_text(self):
+        """Render the ``/deck`` view from :func:`cards.store.build_deck_status`."""
+        store = DeckStore(".")
+        view = build_deck_status(store)
+        if view.empty:
+            return (
+                "mrph> The deck is empty -- this is the planning phase, not an error.\n"
+                "  Add cards two ways:\n"
+                "    /card                 -- paste one morph card as JSON (nested or flat)\n"
+                "    /card <goal text>     -- let the orchestrator decompose a goal into cards\n"
+                "  A brand-new project starts from a genesis deck (a first card that writes\n"
+                "  a spec, later cards sliced on it). See documentation/batch-orchestrator.md,\n"
+                "  \"Where cards come from\"."
+            )
+
+        outcomes = store.load_outcomes()
+        total = len(view.generations)
+        lines = [f"mrph> Deck: {len(view.card_status)} card(s), phase: {view.phase}"]
+        lines.append("  generations:")
+        for number, generation in enumerate(view.generations, start=1):
+            marker = ""
+            if view.phase != "done" and number - 1 == view.current_generation:
+                marker = "   <- current"
+            lines.append(f"    [{number}/{total}] {', '.join(generation)}{marker}")
+        lines.append("  cards:")
+        for custom_id, status in view.card_status:
+            detail = ""
+            outcome = outcomes.get(custom_id)
+            if outcome is not None:
+                if outcome.status == "written" and outcome.paths:
+                    detail = " -> " + ", ".join(outcome.paths)
+                elif outcome.status == "failed":
+                    detail = f" (after {outcome.attempts} attempt(s))"
+                elif outcome.status == "skipped" and outcome.reason:
+                    detail = f" (dependency {outcome.reason})"
+            lines.append(f"    {custom_id:24} {status}{detail}")
+        return "\n".join(lines)
+
+    def build_deck_transition(self):
+        async def transition(action):
+            chat_id = action["update"]["effective_chat"]["id"]
+            await action["context"].bot.send_message(chat_id=chat_id, text=self._deck_text())
+
+        return transition
+
+    def build_card_prompt_transition(self):
+        async def transition(action):
+            chat_id = action["update"]["effective_chat"]["id"]
+            text = (
+                "mrph> Paste ONE morph card as JSON (a single line), nested or flat form:\n"
+                "    {\"custom_id\":\"gen-foo\",\"meta\":{\"intent\":\"generate\","
+                "\"target\":\"foo.py\",\"context_slice\":[\"bar.py\"],"
+                "\"acceptance\":\"pytest tests/test_foo.py -q\"},"
+                "\"instruction\":\"...\"}\n"
+                "mrph> (or /start to cancel)"
+            )
+            await action["context"].bot.send_message(chat_id=chat_id, text=text)
+
+        return transition
+
+    def build_card_manual_input_transition(self, nested_transition):
+        async def transition(action):
+            chat_id = action["update"]["effective_chat"]["id"]
+            store = DeckStore(".")
+            try:
+                data = json.loads(action["text"])
+            except json.JSONDecodeError as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> Not valid JSON: {error}")
+                await nested_transition(action)
+                return
+            try:
+                card = store.add_card(data)
+            except (CardError, DeckError) as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> {error}")
+                await nested_transition(action)
+                return
+            await action["context"].bot.send_message(
+                chat_id=chat_id,
+                text=f"mrph> Added card \"{card.custom_id}\" -> {card.target} "
+                     f"({card.intent}).")
+            await action["context"].bot.send_message(chat_id=chat_id, text=self._deck_text())
+            await nested_transition(action)
+
+        return transition
+
+    def build_card_decompose_transition(self, nested_transition):
+        async def transition(action):
+            chat_id = action["update"]["effective_chat"]["id"]
+            parts = action["text"].split(maxsplit=1)
+            goal = parts[1].strip() if len(parts) > 1 else ""
+
+            default = self.registry.default_id()
+            if not default:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text="mrph> No matching processor. Configure one (see \"/settings\").")
+                await nested_transition(action)
+                return
+
+            dialog = LLMDialog()
+            dialog += build_current_project_context()
+            dialog.assign("user", DECOMPOSE_INSTRUCTION.format(goal=goal))
+            conversation = self.clean_conversation(dialog)
+
+            await action["context"].bot.send_message(
+                chat_id=chat_id,
+                text=f"mrph> Decomposing the goal into morph cards via \"{default}\"...")
+
+            loop = asyncio.get_event_loop()
+            try:
+                response = await loop.run_in_executor(
+                    None, self.registry.run, default, conversation)
+            except Exception as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> Processor failed: {error}")
+                await nested_transition(action)
+                return
+
+            store = DeckStore(".")
+            try:
+                fragment = self.extract_json_array(response)
+                added = store.add_cards(fragment)
+            except (ValueError, CardError, DeckError, json.JSONDecodeError) as error:
+                os.makedirs(".morph", exist_ok=True)
+                raw_path = os.path.join(".morph", "last_decompose.txt")
+                with open(raw_path, "w", encoding="utf-8") as handle:
+                    handle.write(response)
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text=f"mrph> Could not add the proposed cards: {error}\n"
+                         f"mrph> The model's raw output was saved to \"{raw_path}\" "
+                         f"for inspection. Nothing was added.")
+                await nested_transition(action)
+                return
+
+            lines = [f"mrph> Added {len(added)} card(s) from the decomposition:"]
+            for card in added:
+                lines.append(f"    {card.custom_id} -> {card.target} ({card.intent})")
+            await action["context"].bot.send_message(chat_id=chat_id, text="\n".join(lines))
+            await action["context"].bot.send_message(chat_id=chat_id, text=self._deck_text())
+            await nested_transition(action)
+
+        return transition
+
+    def build_submit_transition(self, nested_transition):
+        async def transition(action):
+            chat_id = action["update"]["effective_chat"]["id"]
+            backend, label = self.resolve_batch_backend(action.get("text"))
+            if backend is None:
+                await action["context"].bot.send_message(chat_id=chat_id, text=label)
+                await nested_transition(action)
+                return
+
+            store = DeckStore(".")
+            loop = asyncio.get_event_loop()
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    functools.partial(submit_generation, store, backend,
+                                      root=".", backend_label=label,
+                                      log=lambda line: None))
+            except StoreError as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> {error}")
+                await nested_transition(action)
+                return
+            except (CardError, DeckError) as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> Backlog is invalid: {error}")
+                await nested_transition(action)
+                return
+
+            if result.submitted:
+                self._active_backend = backend
+                lines = [
+                    f"mrph> Submitted generation {result.generation_number}/"
+                    f"{result.total_generations} on \"{label}\" (batch {result.batch_id}):",
+                    f"    cards: {', '.join(result.card_ids)}",
+                ]
+                for custom_id, dependency in result.skipped:
+                    lines.append(f"    skipped {custom_id} (dependency {dependency})")
+                lines.append("mrph> Run /collect to fetch the results.")
+                text = "\n".join(lines)
+            else:
+                self._active_backend = None
+                lines = ["mrph> Nothing to submit -- the deck run is complete."]
+                for custom_id, dependency in result.skipped:
+                    lines.append(f"    skipped {custom_id} (dependency {dependency})")
+                text = "\n".join(lines)
+
+            await action["context"].bot.send_message(chat_id=chat_id, text=text)
+            await nested_transition(action)
+
+        return transition
+
+    def build_collect_transition(self, nested_transition):
+        async def transition(action):
+            chat_id = action["update"]["effective_chat"]["id"]
+            store = DeckStore(".")
+
+            backend = self._active_backend
+            if backend is None:
+                # No live backend (e.g. a fresh session after a restart): rebuild
+                # it from the stored label. Works for a cloud batch (server-side,
+                # retrievable by id); a local batch cannot survive a restart.
+                label = store.load_state().get("backend_label")
+                if label and label in self.registry.ids:
+                    backend = self.registry.batch(label)
+                else:
+                    await action["context"].bot.send_message(
+                        chat_id=chat_id,
+                        text="mrph> No in-flight batch to collect in this session. "
+                             "Run /submit first (a local batch cannot be collected "
+                             "after restarting the CLI).")
+                    await nested_transition(action)
+                    return
+
+            loop = asyncio.get_event_loop()
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    functools.partial(collect_generation, store, backend,
+                                      root=".", log=lambda line: None))
+            except StoreError as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> {error}")
+                await nested_transition(action)
+                return
+
+            if result.in_progress:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text=f"mrph> Generation {result.generation_number}/"
+                         f"{result.total_generations} is still in progress -- "
+                         f"try /collect again in a moment.")
+                await nested_transition(action)
+                return
+
+            self._active_backend = None
+            lines = [
+                f"mrph> Collected generation {result.generation_number}/"
+                f"{result.total_generations}:"
+            ]
+            for custom_id, outcome in result.outcomes.items():
+                if outcome.status == "written":
+                    lines.append(f"    {custom_id}: written -> {', '.join(outcome.paths)}")
+                elif outcome.status == "failed":
+                    lines.append(f"    {custom_id}: failed after {outcome.attempts} attempt(s)")
+                elif outcome.status == "skipped":
+                    lines.append(f"    {custom_id}: skipped (dependency {outcome.reason})")
+                else:
+                    lines.append(f"    {custom_id}: {outcome.status}")
+            if result.phase == "done":
+                lines.append("mrph> The deck run is complete.")
+            else:
+                lines.append("mrph> Run /submit to send the next generation.")
+            await action["context"].bot.send_message(chat_id=chat_id, text="\n".join(lines))
+            await nested_transition(action)
+
+        return transition
+
+    def build_nightly_transition(self, nested_transition):
+        async def transition(action):
+            chat_id = action["update"]["effective_chat"]["id"]
+            backend, label = self.resolve_batch_backend(action.get("text"))
+            if backend is None:
+                await action["context"].bot.send_message(chat_id=chat_id, text=label)
+                await nested_transition(action)
+                return
+
+            store = DeckStore(".")
+            cards = store.load_cards()
+            if not cards:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text="mrph> The deck is empty. Add cards with /card first.")
+                await nested_transition(action)
+                return
+
+            await action["context"].bot.send_message(
+                chat_id=chat_id,
+                text=f"mrph> Nightly run of {len(cards)} card(s) on \"{label}\" -- "
+                     f"submitting and polling each generation to completion...")
+
+            loop = asyncio.get_event_loop()
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    functools.partial(run_deck, cards, backend, root=".",
+                                      log=lambda line: None))
+            except (CardError, DeckError) as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> Backlog is invalid: {error}")
+                await nested_transition(action)
+                return
+
+            store.reset_state()
+            self._active_backend = None
+            await action["context"].bot.send_message(chat_id=chat_id, text="mrph> " + str(result))
+            await nested_transition(action)
+
+        return transition
+
     def build_version_transition(self):
         menu = self.build_menu([['Generate', 'Patch'], ['Settings', 'Help', 'Exit'], ['Graph'], ['Version']])
 
@@ -580,7 +1004,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
         return label
 
     def build_state_machine(self, builder):
-        menu_items = [["Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph", "Version"]]
+        menu_items = [["Generate", "Patch"], ["Deck"], ["Settings", "Help", "Exit"], ["Graph", "Version"]]
 
         welcome_transition = self.build_menu_response_transition(
             r'''┌────────────────────────────────────────────────────────────────────────────┐
@@ -621,6 +1045,50 @@ every slot is busy. /settings shows what is idle, busy or queued.
             .edge("/settings", "/start", "/start", on_transition=main_menu_transition) \
             .edge("/start", "/start", "/help", on_transition=self.build_help_transition()) \
             .edge("/start", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/start",
+                "/start",
+                "/deck",
+                matcher=re.compile(r"^/deck"),
+                on_transition=self.build_deck_transition()) \
+            .edge(
+                "/start",
+                "/start",
+                None,
+                matcher=re.compile(r"^/card\s+\S"),
+                on_transition=self.build_card_decompose_transition(main_menu_transition)) \
+            .edge(
+                "/start",
+                "/card_input",
+                None,
+                matcher=re.compile(r"^/card\s*$"),
+                on_transition=self.build_card_prompt_transition()) \
+            .edge(
+                "/start",
+                "/start",
+                None,
+                matcher=re.compile(r"^/submit"),
+                on_transition=self.build_submit_transition(main_menu_transition)) \
+            .edge(
+                "/start",
+                "/start",
+                None,
+                matcher=re.compile(r"^/collect"),
+                on_transition=self.build_collect_transition(main_menu_transition)) \
+            .edge(
+                "/start",
+                "/start",
+                None,
+                matcher=re.compile(r"^/nightly"),
+                on_transition=self.build_nightly_transition(main_menu_transition)) \
+            .edge("/card_input", "/start", "/start", on_transition=main_menu_transition) \
+            .edge("/card_input", "/start", "/exit", on_transition=self.build_exit_transition()) \
+            .edge(
+                "/card_input",
+                "/start",
+                None,
+                matcher=re.compile("^.*$"),
+                on_transition=self.build_card_manual_input_transition(main_menu_transition)) \
             .edge(
                 "/start",
                 "/generate_file_name_input",
