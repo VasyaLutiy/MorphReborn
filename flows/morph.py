@@ -578,7 +578,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
             r'''┌────────────────────────────────────────────────────────────────────────────┐
-│ GPT Morph :: GRANDPA v1.0.53          THE GRANDPA OF CLAUDE CODE           │
+│ GPT Morph :: GRANDPA v1.0.54          THE GRANDPA OF CLAUDE CODE           │
 ├────────────────────────────────────────────────────────────────────────────┤
 │      .----------------.          > HOW CAN I HELP YOU, KIDDO?              │
 │     /   _        _     \                                                   │
