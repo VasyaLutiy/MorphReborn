@@ -21,6 +21,10 @@ Two things live here:
   (:func:`cards.generations.resolve_runnable` / ``process_generation`` /
   ``compile_card`` / ``verify_card``), so the best-of-N, rollback, retry and
   skip-cascade semantics are byte-for-byte those of ``run_deck``.
+* :func:`record_run` / :func:`recover_orphaned_local_batch` -- the two state
+  transitions the split-step pair cannot express: persisting a whole run that
+  ``run_deck`` executed in memory (``/nightly``), and letting a run out of a
+  phase ``"submitted"`` whose batch died with the CLI process.
 
 DESIGN NOTE (flagged for review): the split-step functions live in this module
 rather than a separate one -- they are the store's reason to exist, and they need
@@ -63,6 +67,13 @@ STATUS_SKIPPED = "skipped"
 PHASE_IDLE = "idle"            # ready to /submit the current generation
 PHASE_SUBMITTED = "submitted"  # a batch is in flight for the current generation
 PHASE_DONE = "done"            # every generation has been processed
+
+# ``LocalBatchBackend`` mints its batch ids as "local-<hex>" (see
+# processors/batch.py). Duplicated here as a prefix rather than imported: this
+# module must not depend on ``processors``, and the shape is part of the state
+# file's contract anyway -- it is what tells a batch that died with the CLI
+# process apart from a cloud batch that is still sitting on a provider's server.
+LOCAL_BATCH_PREFIX = "local-"
 
 
 class StoreError(RuntimeError):
@@ -343,6 +354,70 @@ def build_deck_status(store: DeckStore) -> DeckStatusView:
     )
 
 
+# -- whole-run persistence and recovery --------------------------------------
+
+
+def record_run(store: DeckStore, result, backend_label: Optional[str] = None) -> None:
+    """Persist a deck run that :func:`cards.generations.run_deck` held in memory.
+
+    ``/nightly`` runs the whole deck in one blocking pass, writing every morph to
+    disk -- but the run itself lived only in the returned ``DeckResult``, so the
+    next ``/deck`` reported ``idle`` and every card ``pending`` for work that was
+    finished. This records that run in ``state.json`` in exactly the shape the
+    split-step path leaves behind, so the ``/deck`` view cannot tell the two
+    routes apart: phase ``"done"``, the composition as executed
+    (``DeckResult.generations`` is already a list of custom_id lists, the shape
+    ``state["generations"]`` wants), and every :class:`CardOutcome`.
+
+    The run state is REPLACED, not merged: a nightly pass computes its own
+    generations from the whole backlog, so whatever an earlier split-step run
+    left is history. ``backend_label`` is recorded for symmetry with
+    :func:`submit_generation`; nothing is in flight, so it is informational.
+    """
+    state = DeckStore._default_state()
+    state["phase"] = PHASE_DONE
+    state["generations"] = [list(generation) for generation in result.generations]
+    state["generation_index"] = len(result.generations)
+    state["backend_label"] = backend_label
+    _store_outcomes(state, result.outcomes)
+    store.save_state(state)
+
+
+def recover_orphaned_local_batch(store: DeckStore) -> bool:
+    """Put a local batch that died with the CLI process back to ``pending``.
+
+    A :class:`processors.batch.LocalBatchBackend` batch is worker threads and an
+    in-memory result dict; its id (``"local-<hex>"``) means nothing to a new
+    process. So a CLI restarted between ``/submit`` and ``/collect`` used to be
+    wedged forever: ``/submit`` refused (a generation is already submitted) and
+    ``/collect`` had nothing to collect from. The honest repair is to admit the
+    batch is gone and return its cards to the queue.
+
+    Only a LOCAL batch is recoverable this way. A cloud batch id (OpenAI /
+    Anthropic) names work that is genuinely still running on a provider's server
+    and collectable later, so it is never touched here.
+
+    Returns ``True`` when something was recovered. The generation composition and
+    every recorded outcome survive -- only the in-flight bookkeeping (phase,
+    batch id, backend label, submitted ids) is cleared, so the run resumes at the
+    same generation on the next ``/submit``. Callers must only invoke this when
+    the session holds no live backend for the batch.
+    """
+    state = store.load_state()
+    if state.get("phase") != PHASE_SUBMITTED:
+        return False
+    batch_id = state.get("batch_id")
+    if not isinstance(batch_id, str) or not batch_id.startswith(LOCAL_BATCH_PREFIX):
+        return False
+
+    state["phase"] = PHASE_IDLE
+    state["batch_id"] = None
+    state["backend_label"] = None
+    state["submitted_ids"] = []
+    store.save_state(state)
+    return True
+
+
 # -- split-step execution ----------------------------------------------------
 
 
@@ -430,7 +505,7 @@ def submit_generation(
             "a generation is already submitted; run /collect before /submit")
     if phase == PHASE_DONE:
         raise StoreError(
-            "the deck run is complete; reset it before submitting again")
+            "the deck run is complete; run /deck reset before submitting again")
 
     cards = store.load_cards()
     _ensure_run_started(store, state, cards)
@@ -522,7 +597,9 @@ def collect_generation(
     """
     state = store.load_state()
     if state.get("phase") != PHASE_SUBMITTED:
-        raise StoreError("nothing is in flight; run /submit before /collect")
+        raise StoreError(
+            "nothing is in flight; run /submit before /collect "
+            "(or /deck reset to discard the run state)")
 
     batch_id = state["batch_id"]
     total = len(state["generations"])

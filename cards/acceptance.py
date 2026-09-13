@@ -29,6 +29,7 @@ than duplicated a third time; :mod:`cards.generations` in turn imports
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
@@ -47,6 +48,46 @@ def _tail(output: str) -> str:
     if len(output) > _OUTPUT_TAIL_CAP:
         return output[-_OUTPUT_TAIL_CAP:]
     return output
+
+
+# -- the stale-bytecode guard ------------------------------------------------
+#
+# WHY this exists at all. CPython validates a cached ``.pyc`` against a pair
+# taken from the source file: its mtime truncated to WHOLE SECONDS, and its
+# size in bytes. :func:`verify_card` writes every variant of a card to the SAME
+# real target path, milliseconds apart -- so two variants that happen to be the
+# same byte size are, to the import system, the same file, and the second
+# variant's acceptance run silently executes the FIRST variant's bytecode.
+# Best-of-N then rejects a correct morph, the card burns its retries and fails.
+# It bites the most typical acceptance command there is, ``pytest``, and it is
+# invisible on macOS system python (``sys.pycache_prefix`` puts the cache in
+# ``~/Library/Caches``, so no ``__pycache__`` appears next to the file to hint
+# at it). Two cheap independent guards below: acceptance never writes bytecode,
+# and every write gets an mtime no other write has used.
+
+# The last whole-second stamp handed out by :func:`_stamp_distinct_mtime`, so
+# stamps are unique across the WHOLE process, not merely within one card: a
+# single-variant card is rewritten at the same variant index on every retry, and
+# the clock does not necessarily move between the two.
+_last_mtime_stamp = None
+
+
+def _stamp_distinct_mtime(path: str) -> int:
+    """Give ``path`` a whole-second mtime no earlier write has used.
+
+    Now, or one second before the previous stamp when the clock has not moved --
+    strictly decreasing, so a stamp is never in the future (a future mtime upsets
+    ordinary build tooling) and never repeats. A cached ``.pyc`` keyed on an
+    earlier variant therefore cannot validate against this file, whatever its
+    size. Not thread-safe, and need not be: variants of a card are verified in
+    sequence (concurrent writes to one target would be the larger problem).
+    """
+    global _last_mtime_stamp
+    now = int(time.time())
+    stamp = now if _last_mtime_stamp is None else min(now, _last_mtime_stamp - 1)
+    _last_mtime_stamp = stamp
+    os.utime(path, (stamp, stamp))
+    return stamp
 
 
 # -- the mechanical check ----------------------------------------------------
@@ -77,7 +118,14 @@ def run_acceptance(command: str, root: str, timeout: float = 300.0) -> Acceptanc
     command that exceeds ``timeout`` fails with ``timed_out`` set and whatever
     output was produced before the kill preserved. The output is always
     tail-truncated to :data:`_OUTPUT_TAIL_CAP` characters.
+
+    The command inherits a COPY of the environment with
+    ``PYTHONDONTWRITEBYTECODE=1`` added (the parent's own environment is never
+    mutated), so an acceptance run leaves no ``.pyc`` behind for the next variant
+    to be judged by -- see the stale-bytecode note above.
     """
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         completed = subprocess.run(
             command,
@@ -87,6 +135,7 @@ def run_acceptance(command: str, root: str, timeout: float = 300.0) -> Acceptanc
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         # exc.output holds the bytes/str captured before the timeout kill; it
@@ -169,6 +218,11 @@ def verify_card(
     file (naming as in :mod:`cards.generations`) while every losing variant's
     suffixed file is removed, and a passed :class:`VerifyOutcome` is returned.
 
+    Each write is also stamped with an mtime no other write has used, so an
+    acceptance command that imports the target cannot be answered by bytecode
+    cached for an earlier variant of the same byte size -- the stale-``.pyc``
+    trap documented above :func:`_stamp_distinct_mtime`.
+
     A failing variant is rolled back to the captured original before the next is
     tried. If every variant fails (or every response was ``None``), the original
     state is restored and a failed :class:`VerifyOutcome` is returned carrying
@@ -193,6 +247,9 @@ def verify_card(
         body = response_to_file_body(response)
         with open(target_path, "w", encoding="utf-8") as handle:
             handle.write(body)
+        # Distinct mtime per variant: belt to run_acceptance's braces against a
+        # .pyc cached for an earlier, same-sized variant (see the note above).
+        _stamp_distinct_mtime(target_path)
 
         result = run_acceptance(card.acceptance, root, timeout)
         last_result = result

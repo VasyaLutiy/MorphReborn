@@ -22,6 +22,8 @@ from cards.store import (
     StoreError,
     build_deck_status,
     collect_generation,
+    record_run,
+    recover_orphaned_local_batch,
     submit_generation,
 )
 
@@ -410,7 +412,7 @@ class MorphBot(ConsoleBot):
 /exit - Exit the application gracefully.
 
 Morph 2.0 batch orchestrator (see documentation/batch-orchestrator.md):
-/deck - Show the backlog, its generations and each card's status.
+/deck - Show the backlog, its generations and each card's status ("/deck reset" discards the run state, keeping the backlog).
 /card - Add a card: "/card" pastes one as JSON; "/card <goal>" decomposes a goal into cards.
 /submit - Compile and submit the current generation ("@id" pins a processor, "@all" the local pool).
 /collect - Fetch, verify and integrate the submitted generation, then advance.
@@ -708,8 +710,25 @@ every slot is busy. /settings shows what is idle, busy or queued.
         return "\n".join(lines)
 
     def build_deck_transition(self):
+        """``/deck`` shows the backlog; ``/deck reset`` discards the run state.
+
+        The reset is the only way out of a run the user wants to abandon (a deck
+        already ``done``, or a batch that cannot be collected any more): the
+        backlog stays, every card goes back to ``pending``. An argument to
+        ``/deck`` other than ``reset`` is ignored -- bare ``/deck`` is a status
+        view and stays one.
+        """
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
+            arguments = (action.get("text") or "").split()
+            if len(arguments) > 1 and arguments[1].lower() == "reset":
+                store = DeckStore(".")
+                store.reset_state()
+                self._active_backend = None
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text="mrph> Run state discarded (.morph/state.json). The backlog "
+                         "is kept; every card is pending again.")
             await action["context"].bot.send_message(chat_id=chat_id, text=self._deck_text())
 
         return transition
@@ -825,6 +844,16 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 return
 
             store = DeckStore(".")
+            # No live backend means this session did not fire what state.json
+            # calls in flight; a LOCAL batch died with the process that fired it,
+            # so its cards go back to pending rather than blocking /submit
+            # forever. A cloud batch is left alone -- it is still collectable.
+            if self._active_backend is None and recover_orphaned_local_batch(store):
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text="mrph> The previous local batch was lost with the CLI "
+                         "restart; its cards are pending again.")
+
             loop = asyncio.get_event_loop()
             try:
                 result = await loop.run_in_executor(
@@ -873,9 +902,19 @@ every slot is busy. /settings shows what is idle, busy or queued.
 
             backend = self._active_backend
             if backend is None:
-                # No live backend (e.g. a fresh session after a restart): rebuild
-                # it from the stored label. Works for a cloud batch (server-side,
-                # retrievable by id); a local batch cannot survive a restart.
+                # No live backend (e.g. a fresh session after a restart). A local
+                # batch cannot survive a restart at all, so recover it: its cards
+                # go back to pending and the user re-submits. A cloud batch is
+                # server-side and retrievable by id, so rebuild its backend from
+                # the stored label instead.
+                if recover_orphaned_local_batch(store):
+                    await action["context"].bot.send_message(
+                        chat_id=chat_id,
+                        text="mrph> The previous local batch was lost with the CLI "
+                             "restart; its cards are pending again. Run /submit to "
+                             "send that generation once more.")
+                    await nested_transition(action)
+                    return
                 label = store.load_state().get("backend_label")
                 if label and label in self.registry.ids:
                     backend = self.registry.batch(label)
@@ -883,8 +922,8 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     await action["context"].bot.send_message(
                         chat_id=chat_id,
                         text="mrph> No in-flight batch to collect in this session. "
-                             "Run /submit first (a local batch cannot be collected "
-                             "after restarting the CLI).")
+                             "Run /submit first, or /deck reset to discard the run "
+                             "state.")
                     await nested_transition(action)
                     return
 
@@ -967,7 +1006,10 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 await nested_transition(action)
                 return
 
-            store.reset_state()
+            # Persist what just happened: /nightly writes every morph to disk,
+            # so the run state must say so too -- otherwise the next /deck reads
+            # "idle, everything pending" for work that is finished.
+            record_run(store, result, backend_label=label)
             self._active_backend = None
             await action["context"].bot.send_message(chat_id=chat_id, text="mrph> " + str(result))
             await nested_transition(action)

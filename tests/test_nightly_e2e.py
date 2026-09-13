@@ -27,10 +27,14 @@ import tempfile
 import time
 import unittest
 
+from cards.generations import run_deck
 from cards.store import (
     DeckStore,
+    StoreError,
     build_deck_status,
     collect_generation,
+    record_run,
+    recover_orphaned_local_batch,
     submit_generation,
 )
 from processors.batch import LocalBatchBackend
@@ -118,7 +122,7 @@ class _E2EBase(unittest.TestCase):
             "instruction": instruction,
         })
 
-    def _collect_until_done(self, backend, **kwargs):
+    def _collect_until_done(self, backend, store=None, **kwargs):
         """Re-run /collect until the batch finishes (models the CLI's re-poll).
 
         ``LocalBatchBackend`` drains on worker threads, so an early status poll
@@ -126,7 +130,7 @@ class _E2EBase(unittest.TestCase):
         /collect. State is untouched while in progress, so this is safe.
         """
         for _ in range(200):
-            result = collect_generation(self.store, backend, root=self.root,
+            result = collect_generation(store or self.store, backend, root=self.root,
                                         poll_interval=0, **kwargs)
             if not result.in_progress:
                 return result
@@ -308,6 +312,65 @@ class AcceptanceRetryTests(_E2EBase):
         # original + 2 retries = 3 attempts, 3 batches.
         self.assertEqual(result.outcomes["card-c"].attempts, 3)
         self.assertEqual(len(backend.submissions), 3)
+
+
+class NightlyPersistenceTests(_E2EBase):
+    """``/nightly`` must leave the run behind, exactly as ``/collect`` does."""
+
+    def test_a_nightly_run_is_visible_to_the_next_deck_view(self):
+        self._add("card-a", "gen_a.py", context_slice=["util.py"], instruction="make a")
+        self._add("card-b", "gen_b.py", depends_on=["card-a"],
+                  context_slice=["util.py"], instruction="make b")
+
+        backend = LocalBatchBackend(_FakeRegistry(), ["node-a"])
+        result = run_deck(self.store.load_cards(), backend, root=self.root,
+                          poll_interval=0, log=lambda _l: None)
+        record_run(self.store, result, backend_label="node-a")
+
+        self.assertTrue(self._exists("gen_a.py"))
+        self.assertTrue(self._exists("gen_b.py"))
+
+        # The next /deck -- through a fresh store, as a later CLI session sees it.
+        view = build_deck_status(DeckStore(project_root=self.root))
+        self.assertEqual(view.phase, "done")
+        self.assertEqual(dict(view.card_status),
+                         {"card-a": "written", "card-b": "written"})
+        self.assertEqual(view.generations, [["card-a"], ["card-b"]])
+        outcomes = DeckStore(project_root=self.root).load_outcomes()
+        self.assertIn(os.path.join(self.root, "gen_a.py"), outcomes["card-a"].paths)
+
+
+class LocalBatchRestartTests(_E2EBase):
+    """The escape from a local batch that died with the CLI process."""
+
+    def test_orphaned_local_batch_is_recovered_and_the_deck_runs_again(self):
+        self._add("card-a", "gen_a.py", context_slice=["util.py"], instruction="make a")
+
+        fired = LocalBatchBackend(_FakeRegistry(), ["node-a"])
+        submitted = submit_generation(self.store, fired, root=self.root,
+                                      backend_label="node-a", log=lambda _l: None)
+        self.assertTrue(submitted.batch_id.startswith("local-"))
+
+        # The CLI restarts: a fresh store, and the backend instance is gone.
+        resumed = DeckStore(project_root=self.root)
+        with self.assertRaises(StoreError):
+            submit_generation(resumed, LocalBatchBackend(_FakeRegistry(), ["node-a"]),
+                              root=self.root, log=lambda _l: None)
+
+        self.assertTrue(recover_orphaned_local_batch(resumed))
+        self.assertEqual(dict(build_deck_status(resumed).card_status),
+                         {"card-a": "pending"})
+
+        # And the generation can simply be sent again.
+        backend = LocalBatchBackend(_FakeRegistry(), ["node-a"])
+        again = submit_generation(resumed, backend, root=self.root,
+                                  backend_label="node-a", log=lambda _l: None)
+        self.assertTrue(again.submitted)
+        self.assertEqual(again.card_ids, ["card-a"])
+        collected = self._collect_until_done(backend, store=resumed)
+        self.assertEqual(collected.outcomes["card-a"].status, "written")
+        self.assertTrue(self._exists("gen_a.py"))
+
 
 
 if __name__ == "__main__":
