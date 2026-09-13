@@ -9,6 +9,7 @@ from pysyun.conversation.flow.console_bot import ConsoleBot
 
 from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
+from scheduler import JobScheduler
 from settings import load_settings, load_registry
 
 
@@ -72,6 +73,11 @@ class MorphBot(ConsoleBot):
         # This is the backbone of the multi-agent behaviour: a single command can
         # fan a morph out across many of these instances at once.
         self.registry = load_registry()
+
+        # One slot per configured processor; queues/round-robins a sequence of
+        # independent /generate or /patch jobs across the pool. See
+        # documentation/parallel-generate-scheduling.md.
+        self.scheduler = JobScheduler(self.registry.ids)
 
     # -- processor selection ----------------------------------------------
 
@@ -162,44 +168,61 @@ class MorphBot(ConsoleBot):
 
     async def morph_and_save(self, action, dialog, file_name, nested_transition,
                              append_if_plain=False):
-        """Shared finisher: fan the dialog out across the selected processors,
-        write one morph per processor, then return to the nested transition."""
-        spec = self.context_get(action, "processor_spec")
-        processor_ids = self.resolve_processor_ids(self.registry, spec)
+        """Shared finisher: hand the dialog off to whichever processor(s) the
+        scheduler already assigned (or is about to, once they free up), then
+        return to the nested transition immediately -- the actual morph runs
+        in the background so the user can start another /generate right away.
+        See documentation/parallel-generate-scheduling.md."""
+        job = self.context_get(action, "job")
+        chat_id = action["update"]["effective_chat"]["id"]
 
-        if not processor_ids:
+        if job is None:
             text = "mrph> No matching processor. Configure one (see \"/settings\") " \
                    "or pick a valid id, e.g. \"/generate @all\"."
-            await action["context"].bot.send_message(
-                chat_id=action["update"]["effective_chat"]["id"], text=text)
+            await action["context"].bot.send_message(chat_id=chat_id, text=text)
             await nested_transition(action)
             return
 
-        results = await self.run_morphers(self.registry, processor_ids, dialog)
-        multi = 1 < len(processor_ids)
+        async def run():
+            processor_ids = job.assigned
+            multi = 1 < len(processor_ids)
+            tag = f"[job {job.id} · {'+'.join(processor_ids)}]"
+            try:
+                results = await self.run_morphers(self.registry, processor_ids, dialog)
 
-        saved = []
-        for processor_id in processor_ids:
-            response = results.get(processor_id)
-            print(f"llm[{processor_id}]> {response}")
-            if response is None:
-                continue
-            out_name = self.output_file_name(file_name, processor_id, multi)
-            body, mode = self.response_to_file_body(response, append_if_plain)
-            with open(out_name, mode, encoding='utf-8') as file:
-                file.write(body)
-            saved.append(out_name)
+                saved = []
+                for processor_id in processor_ids:
+                    response = results.get(processor_id)
+                    print(f"llm[{processor_id}]> {response}")
+                    if response is None:
+                        continue
+                    out_name = self.output_file_name(file_name, processor_id, multi)
+                    body, mode = self.response_to_file_body(response, append_if_plain)
+                    with open(out_name, mode, encoding='utf-8') as file:
+                        file.write(body)
+                    saved.append(out_name)
 
-        if saved:
-            if multi:
-                text = "mrph> Saved (parallel):\n  " + "\n  ".join(saved)
-            else:
-                text = f"mrph> Your \"{saved[0]}\" file was saved."
-        else:
-            text = "mrph> No morph was produced (all selected processors failed)."
+                if saved:
+                    if multi:
+                        text = f"mrph> {tag} Saved (parallel):\n  " + "\n  ".join(saved)
+                    else:
+                        text = f"mrph> {tag} Your \"{saved[0]}\" file was saved."
+                else:
+                    text = f"mrph> {tag} No morph was produced (all selected processors failed)."
+            except Exception as error:
+                text = f"mrph> {tag} Processor failed: {error}"
 
-        await action["context"].bot.send_message(
-            chat_id=action["update"]["effective_chat"]["id"], text=text)
+            await self.send_message(chat_id=chat_id, text=text)
+            self.scheduler.release(processor_ids)
+
+        def launch():
+            if job.was_queued:
+                pids = ", ".join(job.assigned)
+                print(f"mrph> [job {job.id}] Processor(s) {pids} now free -- "
+                      f"starting your queued generate for \"{file_name}\".")
+            asyncio.ensure_future(run())
+
+        self.scheduler.attach_launch(job, launch)
         await nested_transition(action)
 
     @staticmethod
@@ -208,6 +231,52 @@ class MorphBot(ConsoleBot):
             return action["context"].get(name)
         except KeyError:
             return default
+
+    def intake_job(self, action):
+        """Parse the processor spec for a `/generate` or `/patch` command,
+        reserve its slot or queue position on the scheduler right away, and
+        return the status line to show the user. The processor(s) this job
+        will actually run on are decided here -- before the file name or
+        prompt are even collected. See
+        documentation/parallel-generate-scheduling.md."""
+        spec = self.parse_processor_spec(action.get("text"))
+
+        if spec:
+            pinned_ids = self.resolve_processor_ids(self.registry, spec)
+            if not pinned_ids:
+                action["context"].add("job", None)
+                return "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
+        else:
+            pinned_ids = None
+            if not self.registry.ids:
+                action["context"].add("job", None)
+                return "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
+
+        job = self.scheduler.submit(pinned_ids)
+        action["context"].add("job", job)
+        return self.describe_assignment(job)
+
+    def describe_assignment(self, job):
+        """Render the "[job N] Assigned to ..." / "Queued at position ..."
+        status line for a just-submitted job."""
+        pool_size = len(self.scheduler)
+
+        if job.assigned:
+            ids = job.assigned
+            if 1 < len(ids):
+                return f"mrph> [job {job.id}] Assigned to processors {', '.join(ids)} " \
+                       f"(slot {self.scheduler.busy_count()}/{pool_size} now busy)."
+            return f"mrph> [job {job.id}] Assigned to processor \"{ids[0]}\" " \
+                   f"(slot {self.scheduler.busy_count()}/{pool_size} now busy)."
+
+        position = self.scheduler.queue_position(job)
+        if job.is_pinned:
+            pins = ", ".join(job.pinned_ids)
+            return f"mrph> [job {job.id}] Processor(s) \"{pins}\" busy. " \
+                   f"Queued at position {position} for {pins}."
+        pool_desc = ", ".join(self.scheduler.pool)
+        return f"mrph> [job {job.id}] All {pool_size} processors busy ({pool_desc}). " \
+               f"Queued at position {position} -- will run on whichever processor frees first."
 
     def build_settings_transition(self):
 
@@ -219,12 +288,19 @@ class MorphBot(ConsoleBot):
                 default_id = self.registry.default_id()
                 text += f"Configured processors ({len(self.registry)}), " \
                         f"default is \"{default_id}\":\n\n"
-                for description in self.registry.describe_all():
-                    text += f"    {description}\n"
+                for identifier, description in zip(self.registry.ids, self.registry.describe_all()):
+                    status = self.scheduler.describe_status(identifier)
+                    text += f"    {description} -- {status}\n"
+                queued = self.scheduler.queue_length()
+                if queued:
+                    text += f"\n{queued} job(s) waiting for a free processor.\n"
                 text += "\n"
                 text += "Address them by id: \"/generate @<id>\" or \"/patch @<id>\".\n"
                 text += "Run several in parallel (multi-agent): " \
-                        "\"/generate @a,@b\" or \"/generate @all\".\n\n"
+                        "\"/generate @a,@b\" or \"/generate @all\".\n" \
+                        "A plain \"/generate\" (no @id) rides the round-robin pool: " \
+                        "back-to-back calls fan out one file per processor, queuing once " \
+                        "all slots are busy.\n\n"
             else:
                 text += '''No processors are configured yet.
 --------------------------------------------------
@@ -270,11 +346,15 @@ class MorphBot(ConsoleBot):
 /exit - Exit the application gracefully.
 
 Choosing processors (multi-agent):
-    /generate            - use the default processor.
+    /generate            - ride the round-robin pool (whichever processor is free next).
     /generate @gpt4      - use the processor with id "gpt4".
     /generate @k80,@gpt4 - run both in parallel; each writes its own file (foo.<id>.ext).
     /generate @all       - fan out across every configured processor.
     (The same @id syntax works for /patch.)
+
+Queuing: fire off several /generate calls back to back -- one per file -- and
+each is picked up by whichever processor is free, queuing automatically once
+every slot is busy. /settings shows what is idle, busy or queued.
             '''
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -285,17 +365,13 @@ Choosing processors (multi-agent):
 
         async def transition(action):
 
-            # Parse and remember which processor(s) this command targets.
-            spec = self.parse_processor_spec(action.get("text"))
-            action["context"].add("processor_spec", spec)
+            # Decides this job's processor(s)/queue position right away.
+            status = self.intake_job(action)
+            job = self.context_get(action, "job")
 
-            processor_ids = self.resolve_processor_ids(self.registry, spec)
-
-            if not processor_ids:
-                text = "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
-            else:
-                text = f"mrph> Will generate using: {', '.join(processor_ids)}.\n" \
-                       f"mrph> Enter the file name for saving the generated file:"
+            text = status
+            if job is not None:
+                text += "\nmrph> Enter the file name for saving the generated file:"
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
@@ -305,16 +381,12 @@ Choosing processors (multi-agent):
 
         async def transition(action):
 
-            spec = self.parse_processor_spec(action.get("text"))
-            action["context"].add("processor_spec", spec)
+            status = self.intake_job(action)
+            job = self.context_get(action, "job")
 
-            processor_ids = self.resolve_processor_ids(self.registry, spec)
-
-            if not processor_ids:
-                text = "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
-            else:
-                text = f"mrph> Will patch using: {', '.join(processor_ids)}.\n" \
-                       f"mrph> Enter the file name to be patched:"
+            text = status
+            if job is not None:
+                text += "\nmrph> Enter the file name to be patched:"
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
 
@@ -506,7 +578,7 @@ Choosing processors (multi-agent):
     def build_state_machine(self, builder):
         main_menu_transition = self.build_menu_response_transition(
             r'''┌────────────────────────────────────────────────────────────────────────────┐
-│ GPT Morph :: GRANDPA v1.0.53          THE GRANDPA OF CLAUDE CODE           │
+│ GPT Morph :: GRANDPA v1.0.54          THE GRANDPA OF CLAUDE CODE           │
 ├────────────────────────────────────────────────────────────────────────────┤
 │      .----------------.          > HOW CAN I HELP YOU, KIDDO?              │
 │     /   _        _     \                                                   │
