@@ -79,6 +79,10 @@ class MorphBot(ConsoleBot):
         # documentation/parallel-generate-scheduling.md.
         self.scheduler = JobScheduler(self.registry.ids)
 
+        # The welcome banner is only shown once, on the very first /start;
+        # later returns to the main menu show just the menu.
+        self.shown_welcome = False
+
     # -- processor selection ----------------------------------------------
 
     @staticmethod
@@ -576,7 +580,9 @@ every slot is busy. /settings shows what is idle, busy or queued.
         return label
 
     def build_state_machine(self, builder):
-        main_menu_transition = self.build_menu_response_transition(
+        menu_items = [["Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph", "Version"]]
+
+        welcome_transition = self.build_menu_response_transition(
             r'''┌────────────────────────────────────────────────────────────────────────────┐
 │ GPT Morph :: GRANDPA v1.0.54          THE GRANDPA OF CLAUDE CODE           │
 ├────────────────────────────────────────────────────────────────────────────┤
@@ -592,7 +598,15 @@ every slot is busy. /settings shows what is idle, busy or queued.
 │ "WE DEBUGGED WITH PRINT STATEMENTS."                                       │
 └────────────────────────────────────────────────────────────────────────────┘
 ''',
-            [["Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph", "Version"]])
+            menu_items)
+        short_menu_transition = self.build_menu_response_transition("mrph> Main menu:", menu_items)
+
+        async def main_menu_transition(action):
+            if self.shown_welcome:
+                await short_menu_transition(action)
+            else:
+                self.shown_welcome = True
+                await welcome_transition(action)
 
         return builder \
             .edge(
