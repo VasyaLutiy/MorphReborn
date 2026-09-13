@@ -15,12 +15,15 @@ import tempfile
 import unittest
 
 from cards.deck import DeckError
+from cards.generations import CardOutcome, DeckResult
 from cards.schema import CardError, MorphCard
 from cards.store import (
     DeckStore,
     StoreError,
     build_deck_status,
     card_to_dict,
+    record_run,
+    recover_orphaned_local_batch,
 )
 
 
@@ -239,6 +242,156 @@ class DeckStatusDerivationTests(unittest.TestCase):
         outcomes = self.store.load_outcomes()
         self.assertEqual(outcomes["b"].attempts, 3)
         self.assertEqual(outcomes["b"].acceptance_output, "boom")
+
+
+class RecordRunTests(unittest.TestCase):
+    """``/nightly`` ran the deck in memory; the run must end up in state.json.
+
+    The nightly path used to throw its :class:`DeckResult` away, so the very next
+    ``/deck`` reported ``idle`` with every card ``pending`` for morphs that were
+    already on disk. :func:`record_run` leaves exactly what the split-step
+    ``/collect`` path leaves.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-record-")
+        self.store = DeckStore(project_root=self.tmp)
+        self.store.add_card(_card_dict("a", "a.py"))
+        self.store.add_card(_card_dict("b", "b.py", depends_on=["a"]))
+        self.store.add_card(_card_dict("c", "c.py", depends_on=["b"]))
+        self.result = DeckResult(
+            outcomes={
+                "a": CardOutcome("a", "written", paths=["a.py"]),
+                "b": CardOutcome("b", "failed", attempts=3,
+                                 acceptance_output="boom"),
+                "c": CardOutcome("c", "skipped", reason="b"),
+            },
+            generations=[["a"], ["b"], ["c"]],
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_deck_status_reports_the_recorded_outcomes(self):
+        record_run(self.store, self.result)
+        # Read back through a fresh store: the run really is on disk.
+        view = build_deck_status(DeckStore(project_root=self.tmp))
+        self.assertEqual(dict(view.card_status),
+                         {"a": "written", "b": "failed", "c": "skipped"})
+        self.assertEqual(view.phase, "done")
+        self.assertEqual(view.generations, [["a"], ["b"], ["c"]])
+
+    def test_outcome_detail_survives(self):
+        record_run(self.store, self.result)
+        outcomes = DeckStore(project_root=self.tmp).load_outcomes()
+        self.assertEqual(outcomes["a"].paths, ["a.py"])
+        self.assertEqual(outcomes["b"].attempts, 3)
+        self.assertEqual(outcomes["b"].acceptance_output, "boom")
+        self.assertEqual(outcomes["c"].reason, "b")
+
+    def test_nothing_is_left_in_flight(self):
+        record_run(self.store, self.result, backend_label="node-a")
+        state = self.store.load_state()
+        self.assertEqual(state["phase"], "done")
+        self.assertEqual(state["generation_index"], 3)
+        self.assertIsNone(state["batch_id"])
+        self.assertEqual(state["submitted_ids"], [])
+        self.assertEqual(state["backend_label"], "node-a")
+
+    def test_a_nightly_run_replaces_an_earlier_split_step_run(self):
+        # A stale in-flight state from an abandoned /submit must not survive a
+        # nightly pass, which computes its own composition from the backlog.
+        state = self.store.load_state()
+        state["phase"] = "submitted"
+        state["batch_id"] = "local-deadbeef"
+        state["submitted_ids"] = ["a"]
+        state["generations"] = [["a", "b", "c"]]
+        self.store.save_state(state)
+
+        record_run(self.store, self.result)
+
+        state = self.store.load_state()
+        self.assertEqual(state["phase"], "done")
+        self.assertIsNone(state["batch_id"])
+        self.assertEqual(state["generations"], [["a"], ["b"], ["c"]])
+
+
+class OrphanedLocalBatchTests(unittest.TestCase):
+    """A local batch dies with the process that fired it; the run must not.
+
+    Restarting the CLI between ``/submit`` and ``/collect`` on a local backend
+    left the deck wedged in phase ``"submitted"`` with no way out. Recovery is
+    strictly for LOCAL batch ids -- a cloud batch is still running on a
+    provider's server and is genuinely collectable later.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-orphan-")
+        self.store = DeckStore(project_root=self.tmp)
+        self.store.add_card(_card_dict("a", "a.py"))
+        self.store.add_card(_card_dict("b", "b.py"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _submitted(self, batch_id, **extra):
+        state = self.store.load_state()
+        state["phase"] = "submitted"
+        state["generations"] = [["a", "b"]]
+        state["batch_id"] = batch_id
+        state["backend_label"] = "node-a"
+        state["submitted_ids"] = ["a", "b"]
+        state.update(extra)
+        self.store.save_state(state)
+
+    def test_local_batch_is_recovered_to_idle_with_cards_pending(self):
+        self._submitted("local-0123456789abcdef")
+        self.assertTrue(recover_orphaned_local_batch(self.store))
+
+        state = self.store.load_state()
+        self.assertEqual(state["phase"], "idle")
+        self.assertIsNone(state["batch_id"])
+        self.assertIsNone(state["backend_label"])
+        self.assertEqual(state["submitted_ids"], [])
+
+        view = build_deck_status(self.store)
+        self.assertEqual(dict(view.card_status), {"a": "pending", "b": "pending"})
+
+    def test_cloud_batch_is_never_touched(self):
+        self._submitted("batch_abc123")
+        self.assertFalse(recover_orphaned_local_batch(self.store))
+
+        state = self.store.load_state()
+        self.assertEqual(state["phase"], "submitted")
+        self.assertEqual(state["batch_id"], "batch_abc123")
+        self.assertEqual(state["submitted_ids"], ["a", "b"])
+        view = build_deck_status(self.store)
+        self.assertEqual(dict(view.card_status), {"a": "in_flight", "b": "in_flight"})
+
+    def test_recovery_keeps_composition_and_earlier_outcomes(self):
+        # A second-generation batch orphaned: generation 1's morphs stay written.
+        self._submitted(
+            "local-cafe",
+            generations=[["a"], ["b"]],
+            generation_index=1,
+            submitted_ids=["b"],
+            outcomes={"a": {"custom_id": "a", "status": "written",
+                            "paths": ["a.py"], "reason": None, "attempts": 1,
+                            "winning_variant": None, "acceptance_output": None}},
+        )
+        self.assertTrue(recover_orphaned_local_batch(self.store))
+
+        state = self.store.load_state()
+        self.assertEqual(state["generations"], [["a"], ["b"]])
+        self.assertEqual(state["generation_index"], 1)
+        view = build_deck_status(self.store)
+        self.assertEqual(dict(view.card_status), {"a": "written", "b": "pending"})
+
+    def test_nothing_to_recover_when_no_batch_is_in_flight(self):
+        self.assertFalse(recover_orphaned_local_batch(self.store))   # fresh state
+        self.store.save_state(dict(self.store.load_state(), phase="done"))
+        self.assertFalse(recover_orphaned_local_batch(self.store))
+
 
 
 if __name__ == "__main__":

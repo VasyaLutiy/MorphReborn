@@ -16,7 +16,7 @@ import tempfile
 import unittest
 
 from cards.acceptance import AcceptanceResult, run_acceptance, verify_card
-from cards.generations import run_deck
+from cards.generations import response_to_file_body, run_deck
 from cards.schema import MorphCard
 
 
@@ -349,6 +349,68 @@ class VerifyCardDeckTests(unittest.TestCase):
         self.assertEqual(outcome.attempts, 0)          # nothing ran
         self.assertIsNone(outcome.result)
         self.assertFalse(self._exists("z.py"))
+
+
+# -- the stale-bytecode trap -------------------------------------------------
+
+
+# Three variant bodies of IDENTICAL byte size: only the second computes a sum.
+# Equal size is the point -- see BytecodeCacheTrapTests.
+_ADD_MINUS = _code_block("def add(a, b):\n    return a - b")
+_ADD_PLUS = _code_block("def add(a, b):\n    return a + b")
+_ADD_TIMES = _code_block("def add(a, b):\n    return a * b")
+
+
+class BytecodeCacheTrapTests(unittest.TestCase):
+    """Acceptance must judge the variant it just wrote, not a cached ancestor.
+
+    CPython validates a cached ``.pyc`` against (source mtime truncated to WHOLE
+    SECONDS, source size). ``verify_card`` writes its variants to the real target
+    milliseconds apart, so two variants of the SAME byte size are
+    indistinguishable to the import system: without a guard, variant 2's
+    acceptance run silently imports variant 1's bytecode, best-of-N rejects a
+    correct morph and the card burns its retries. The guards are in
+    :func:`run_acceptance` (never write bytecode during acceptance) and in
+    :func:`verify_card` (a distinct whole-second mtime per write).
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="morph-acc-pyc-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_acceptance_runs_with_bytecode_writing_disabled(self):
+        result = run_acceptance(
+            "python3 -c \"import sys; print(sys.dont_write_bytecode)\"", self.root)
+        self.assertTrue(result.passed)
+        self.assertIn("True", result.output)
+
+    def test_acceptance_does_not_leak_into_the_parent_environment(self):
+        before = os.environ.get("PYTHONDONTWRITEBYTECODE")
+        run_acceptance("python3 -c \"pass\"", self.root)
+        self.assertEqual(os.environ.get("PYTHONDONTWRITEBYTECODE"), before)
+
+    def test_same_size_variants_are_judged_individually(self):
+        # The acceptance command imports the target, so a stale .pyc from the
+        # previous variant would answer instead of the file on disk.
+        card = _card(
+            "add", "stand_add.py", variants=3,
+            acceptance="python3 -c \"import stand_add; "
+                       "assert stand_add.add(2, 3) == 5\"",
+        )
+        bodies = {"add.v1": _ADD_MINUS, "add.v2": _ADD_PLUS, "add.v3": _ADD_TIMES}
+        sizes = {len(response_to_file_body(body)) for body in bodies.values()}
+        self.assertEqual(len(sizes), 1)   # the trap only springs on equal sizes
+
+        outcome = verify_card(card, bodies, self.root, 30.0, log=lambda _msg: None)
+
+        self.assertTrue(outcome.passed)
+        self.assertEqual(outcome.winning_custom_id, "add.v2")
+        self.assertEqual(outcome.attempts, 2)
+        with open(os.path.join(self.root, "stand_add.py"), encoding="utf-8") as handle:
+            self.assertIn("a + b", handle.read())
 
 
 if __name__ == "__main__":

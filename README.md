@@ -191,7 +191,9 @@ criterion) and run the whole backlog through half-price, massively parallel
 batch executors, generation by generation. Five commands drive it:
 
 - `/deck` — show the backlog, its generation ordering, and each card's status
-  (`pending` / `in_flight` / `written` / `failed` / `skipped`).
+  (`pending` / `in_flight` / `written` / `failed` / `skipped`). `/deck reset`
+  discards the run state and keeps the backlog: the way out of a finished run,
+  or of a batch that can no longer be collected.
 - `/card` — add a card. `/card` alone prompts you to paste one morph card as
   JSON; `/card <goal text>` runs **decomposition mode**, asking the orchestrator
   to unfold a goal into a reviewed set of cards.
@@ -208,7 +210,11 @@ The natural rhythm is the **nightly morph**: spend the day appending
 well-specified cards to the backlog with `/card`, `/submit` the deck in the
 evening, and review the integrated morphs plus a failure report in the morning.
 The backlog lives in `.morph/deck.json` and the run state in `.morph/state.json`,
-so `/submit` and `/collect` survive quitting and restarting the CLI.
+so `/submit` and `/collect` survive quitting and restarting the CLI — and so does
+a `/nightly` run, whose outcomes `/deck` reports afterwards. A *local* batch is
+the exception: it lives in the worker threads of the process that fired it, so if
+the CLI is restarted between `/submit` and `/collect` its cards are quietly
+returned to `pending` for the next `/submit`.
 
 See [`documentation/batch-orchestrator.md`](./documentation/batch-orchestrator.md)
 for the design, [`documentation/NEW_PARADIGN.md`](./documentation/NEW_PARADIGN.md)
