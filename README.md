@@ -36,6 +36,8 @@ By leveraging the understanding and generative abilities of LLMs, code morphing 
 
 GPT Morph's distinguishing trait is that it loads the **whole project** as the LLM context for every morph, rather than retrieving snippets or compressing history like other coding assistants. See [`documentation/modeling-approach.md`](./documentation/modeling-approach.md) for the full explanation.
 
+Where this is heading: [`documentation/batch-orchestrator.md`](./documentation/batch-orchestrator.md) — the **Morph 2.0** design proposal, turning Morph into a PDP-11-style batch orchestrator over LLM batch APIs (morph cards, generations, half-price executors). A serious machine for serious programmers — not a vibe-coding agent.
+
 ## Glossary
 
 Here's a brief explanation of the terms "**morphs**", "**morpher**", and "**morphing**" in the context of **code morphing**:
