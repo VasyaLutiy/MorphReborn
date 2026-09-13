@@ -148,6 +148,59 @@ evening, and reviews integrated morphs plus a failure report in the morning.
 Failed cards carry their test output into the next generation automatically —
 an agentic repair loop, but batched and asynchronous instead of interactive.
 
+## Where cards come from: the cold start
+
+The deck describes how cards are *executed*; this section describes where they
+come from when a session starts with zero cards. An empty deck is not a
+degenerate state — it is the planning phase, the way an empty sprint backlog
+precedes refinement. Cards enter the deck from three sources:
+
+1. **Dialogue.** The primary path. The engineer states an intent to the
+   orchestrator ("add priorities to the scheduler", "migrate the storage
+   layer"); the orchestrator *decomposes* it into cards — proposing targets,
+   context slices, and acceptance criteria — and the engineer reviews the deck
+   before submitting. One intent may unfold into one card or twenty.
+2. **A deck file.** A hand-written or generated `deck.json`, for repeatable
+   runs and CI. The power-user path, not the default.
+3. **The machine itself.** The generation cycle already breeds cards: a card
+   that fails its acceptance is recompiled into the next generation with the
+   error context attached. The deck is partially self-reproducing.
+
+### Existing projects
+
+There is no true cold start here: the context already exists — it is the
+project. The orchestrator builds its lightweight representation (repository
+map, signatures — the research question above), the engineer states a goal,
+and the first cards appear through dialogue. An empty deck over a live project
+simply means "the backlog has not been articulated yet."
+
+### New projects: the genesis deck
+
+A brand-new project has neither code nor anything to slice. The machinery
+already handles this: a `generate` card with an empty `context_slice` gets the
+whole-project context of an empty directory — which is *nothing* (or only
+`.corpora`) — and that is correct for a project's first file. The pattern is
+that **the first generation generates context, not code**:
+
+- Generation 0: one card → `ARCHITECTURE.md` (a spec, a manifest), distilled
+  from the engineer's interview with the orchestrator.
+- Generation 1: skeleton-module cards, each slicing on
+  `["ARCHITECTURE.md"]` and depending on the genesis card.
+- Generation 2+: code and tests, slicing on the files already born.
+
+The project **grows its own context generation by generation**. No special
+mode is needed: `depends_on` ordering plus the compile-after-write rule (a
+generation is compiled only after the previous generation's morphs are on
+disk) carry the whole pattern.
+
+This is not hypothetical — it is how Morph 2.0 itself is being built. The
+session that produced this repository started with zero cards: generation 0
+wrote the manifests (context, not code), generation 1 the development plan
+sliced on them, and every implementation phase since has been a card carrying
+a `context_slice` of the documentation plus prior phases' code, with a pytest
+acceptance criterion — executed by a separate coding agent. The cold-start
+protocol described here is the protocol Morph 2.0 is using to build itself.
+
 ## What survives from the current codebase
 
 The migration is an evolution of existing components, not a rewrite:
