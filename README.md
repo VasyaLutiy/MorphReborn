@@ -165,6 +165,12 @@ The same `@id` syntax works for `/patch`. When several processors are selected t
 are dispatched concurrently, letting you use many parallel local nodes on your
 network as a multi-agent system.
 
+That feature fans *one* file out across many processors. For the opposite
+case — queuing a *sequence* of independent `/generate` calls, each a
+different file, round-robined across your processor pool so up to as many
+files morph concurrently as you have processors — see the design spec in
+[`documentation/parallel-generate-scheduling.md`](./documentation/parallel-generate-scheduling.md).
+
 You can find example bot sessions, showing how to do something good at: 
 [GPT Morph CLI Bot Examples](./examples.md)
 
