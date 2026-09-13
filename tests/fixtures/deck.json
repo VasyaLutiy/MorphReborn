@@ -1,0 +1,31 @@
+[
+  {
+    "custom_id": "gen-app-slice",
+    "meta": {
+      "intent": "generate",
+      "target": "app_v2.py",
+      "context_slice": ["app.py"]
+    },
+    "instruction": "Rewrite app.py to accept the two numbers as command-line arguments."
+  },
+  {
+    "custom_id": "patch-util-whole",
+    "meta": {
+      "intent": "patch",
+      "target": "util.py",
+      "context_slice": []
+    },
+    "instruction": "Add a subtract(a, b) function next to add."
+  },
+  {
+    "custom_id": "gen-variants",
+    "meta": {
+      "intent": "generate",
+      "target": "cli.py",
+      "context_slice": ["app.py", "util.py"],
+      "model": "claude-opus-4",
+      "variants": 3
+    },
+    "instruction": "Generate a small CLI wrapper around add."
+  }
+]
