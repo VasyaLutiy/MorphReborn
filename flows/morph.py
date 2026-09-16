@@ -5,6 +5,7 @@ import copy
 import json
 import asyncio
 import functools
+import traceback
 import pkg_resources
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
@@ -16,7 +17,7 @@ from settings import load_settings, load_registry
 
 from cards.schema import CardError
 from cards.deck import DeckError
-from cards.generations import run_deck
+from cards.generations import ensure_parent_dir, run_deck
 from cards.store import (
     DeckStore,
     StoreError,
@@ -264,6 +265,9 @@ class MorphBot(ConsoleBot):
                         continue
                     out_name = self.output_file_name(file_name, processor_id, multi)
                     body, mode = self.response_to_file_body(response, append_if_plain)
+                    # A target may name a directory that does not exist yet
+                    # ("morph_mcp/jsonrpc.py"); open() alone would fail on it.
+                    ensure_parent_dir(out_name)
                     with open(out_name, mode, encoding='utf-8') as file:
                         file.write(body)
                     saved.append(out_name)
@@ -834,6 +838,32 @@ every slot is busy. /settings shows what is idle, busy or queued.
 
         return transition
 
+    @staticmethod
+    def report_unexpected(error, doing, aftermath=""):
+        """Log an unanticipated exception and return its ``mrph>`` chat line.
+
+        WHY this exists. ``/submit``, ``/collect`` and ``/nightly`` used to catch
+        only ``CardError`` / ``DeckError`` / ``StoreError``. Anything else -- a
+        ``FileNotFoundError`` from a card targeting a directory that did not
+        exist yet, a provider transport error, a bug inside a morph body --
+        propagated out of the transition, through the state machine, and
+        terminated the whole ``mrph`` process with a traceback: an operator
+        collecting an overnight deck lost the session to one bad card.
+
+        The chat gets a compact line naming the exception CLASS and message
+        (``FileNotFoundError: no such file...`` tells an operator what to fix;
+        "something went wrong" does not) followed by ``aftermath`` -- what is now
+        true of the run state, so the user knows whether to retry. The traceback
+        itself goes to stderr, where the console log lives: available for the bug
+        report, out of the conversation.
+        """
+        traceback.print_exc()
+        text = (f"mrph> Unexpected failure while {doing}: "
+                f"{type(error).__name__}: {error}")
+        if aftermath:
+            text += f"\n{aftermath}"
+        return text
+
     def build_submit_transition(self, nested_transition):
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
@@ -869,6 +899,18 @@ every slot is busy. /settings shows what is idle, busy or queued.
             except (CardError, DeckError) as error:
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=f"mrph> Backlog is invalid: {error}")
+                await nested_transition(action)
+                return
+            except Exception as error:
+                # Anything the store did not classify. The run state is only
+                # advanced to "submitted" by a successful submit, so failing
+                # here leaves the generation pending and the session alive.
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text=self.report_unexpected(
+                        error, "submitting the generation",
+                        "mrph> The run state was not advanced -- nothing is marked "
+                        "in flight, so /submit can be retried."))
                 await nested_transition(action)
                 return
 
@@ -938,6 +980,23 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     chat_id=chat_id, text=f"mrph> {error}")
                 await nested_transition(action)
                 return
+            except Exception as error:
+                # One bad card must not kill the CLI. ``collect_generation``
+                # saves the advanced state only after every card is processed,
+                # so a failure here leaves the generation marked in flight:
+                # nothing is silently written off, and the batch (cloud batches
+                # live on the provider's side, local ones in this process) is
+                # still there to be collected again. ``self._active_backend`` is
+                # deliberately left set so the retry needs no re-resolution.
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text=self.report_unexpected(
+                        error, "collecting the generation",
+                        "mrph> The generation is still in flight and nothing was "
+                        "marked done -- the results are not lost, so run /collect "
+                        "again (fix the card first if the error names one)."))
+                await nested_transition(action)
+                return
 
             if result.in_progress:
                 await action["context"].bot.send_message(
@@ -1003,6 +1062,19 @@ every slot is busy. /settings shows what is idle, busy or queued.
             except (CardError, DeckError) as error:
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=f"mrph> Backlog is invalid: {error}")
+                await nested_transition(action)
+                return
+            except Exception as error:
+                # An overnight run is exactly where a crash costs the most. The
+                # run state is left untouched (``record_run`` below never ran),
+                # so /deck still shows the deck as it was and the user can fix
+                # the offending card and start again.
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text=self.report_unexpected(
+                        error, "running the deck",
+                        "mrph> The run state was not recorded -- the deck is "
+                        "unchanged and /nightly (or /submit) can be run again."))
                 await nested_transition(action)
                 return
 

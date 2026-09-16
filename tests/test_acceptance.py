@@ -350,6 +350,55 @@ class VerifyCardDeckTests(unittest.TestCase):
         self.assertIsNone(outcome.result)
         self.assertFalse(self._exists("z.py"))
 
+    # -- a target in a directory that does not exist yet ----------------------
+
+    def test_verify_card_creates_the_targets_missing_directories(self):
+        # Creating a new package is the most ordinary thing a card can ask for,
+        # and no card had ever done it: every target so far lived in the project
+        # root, so the writers' bare open() never met a missing directory.
+        card = _card("n", "pkg/sub/mod.py", context_slice=["util.py"],
+                     acceptance=_accept("pkg/sub/mod.py"))
+
+        outcome = verify_card(card, {"n": PASS_BODY}, self.root, 30.0,
+                              log=lambda _msg: None)
+
+        self.assertTrue(outcome.passed)
+        self.assertEqual(outcome.winning_custom_id, "n")
+        self.assertTrue(self._exists(os.path.join("pkg", "sub", "mod.py")))
+        self.assertEqual(self._read(os.path.join("pkg", "sub", "mod.py")),
+                         "PASS = 1\n")
+
+    def test_multi_variant_winner_keeps_its_suffixed_file_in_the_new_directory(self):
+        card = _card("n", "pkg/mod.py", context_slice=["util.py"], variants=2,
+                     acceptance=_accept("pkg/mod.py"))
+
+        outcome = verify_card(card, {"n.v1": FAIL_BODY, "n.v2": PASS_BODY},
+                              self.root, 30.0, log=lambda _msg: None)
+
+        self.assertTrue(outcome.passed)
+        self.assertEqual(outcome.winning_custom_id, "n.v2")
+        # Target and the winner's suffixed file, both inside the created package.
+        self.assertTrue(self._exists(os.path.join("pkg", "mod.py")))
+        self.assertTrue(self._exists(os.path.join("pkg", "mod.n.v2.py")))
+        self.assertFalse(self._exists(os.path.join("pkg", "mod.n.v1.py")))
+        self.assertEqual(sorted(outcome.paths), sorted([
+            os.path.join(self.root, "pkg", "mod.py"),
+            os.path.join(self.root, "pkg", "mod.n.v2.py"),
+        ]))
+
+    def test_failing_card_in_a_new_directory_rolls_the_file_back(self):
+        # Rollback deletes the file the rejected variant created; the directory
+        # created for it is deliberately left behind (see ensure_parent_dir).
+        card = _card("n", "pkg/mod.py", context_slice=["util.py"],
+                     acceptance=_accept("pkg/mod.py"))
+
+        outcome = verify_card(card, {"n": FAIL_BODY}, self.root, 30.0,
+                              log=lambda _msg: None)
+
+        self.assertFalse(outcome.passed)
+        self.assertFalse(self._exists(os.path.join("pkg", "mod.py")))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "pkg")))
+
 
 # -- the stale-bytecode trap -------------------------------------------------
 

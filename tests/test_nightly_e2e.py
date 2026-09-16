@@ -340,6 +340,49 @@ class NightlyPersistenceTests(_E2EBase):
         self.assertIn(os.path.join(self.root, "gen_a.py"), outcomes["card-a"].paths)
 
 
+class NewPackageTargetTests(_E2EBase):
+    """A card may create the package it targets -- and used to kill the run.
+
+    Every card this project had ever run wrote into the project root, so the
+    writers' bare ``open(path, "w")`` never met a missing directory. The first
+    card targeting ``<new package>/<module>.py`` raised ``FileNotFoundError``
+    inside ``collect_generation``, out of the transition, and took the CLI with
+    it. These two drive the store-level path the ``/collect`` transition wraps.
+    """
+
+    def test_nested_target_is_written_not_raised(self):
+        self._add("card-n", "pkg/sub/mod.py", context_slice=["util.py"],
+                  instruction="make the module")
+
+        backend = _FakeBatchBackend(scripts={"card-n": _code_block("N_OK = 1")})
+
+        submit_generation(self.store, backend, root=self.root, log=lambda _l: None)
+        result = collect_generation(self.store, backend, root=self.root,
+                                    poll_interval=0)
+
+        self.assertEqual(result.phase, "done")
+        self.assertEqual(result.outcomes["card-n"].status, "written")
+        self.assertTrue(self._exists(os.path.join("pkg", "sub", "mod.py")))
+        self.assertEqual(self._read(os.path.join("pkg", "sub", "mod.py")), "N_OK = 1\n")
+
+    def test_verified_nested_target_is_written_through_the_acceptance_path(self):
+        # The same target with an acceptance command, so verify_card (not
+        # _write_variants) is the writer that meets the missing directory.
+        self._add("card-n", "pkg/mod.py", context_slice=["util.py"],
+                  acceptance="grep -q PASS pkg/mod.py", instruction="make it")
+
+        backend = _FakeBatchBackend(scripts={"card-n": _code_block("PASS = 1")})
+
+        submit_generation(self.store, backend, root=self.root, log=lambda _l: None)
+        result = collect_generation(self.store, backend, root=self.root,
+                                    poll_interval=0, acceptance_timeout=30)
+
+        self.assertEqual(result.outcomes["card-n"].status, "written")
+        self.assertTrue(self._exists(os.path.join("pkg", "mod.py")))
+        self.assertEqual(build_deck_status(self.store).card_status[0],
+                         ("card-n", "written"))
+
+
 class LocalBatchRestartTests(_E2EBase):
     """The escape from a local batch that died with the CLI process."""
 

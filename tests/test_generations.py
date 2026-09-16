@@ -274,6 +274,33 @@ class RunDeckTests(unittest.TestCase):
              os.path.join(self.root, "multi.m.v3.py")],
         )
 
+    def test_card_targeting_a_new_package_creates_its_directories(self):
+        # The no-acceptance path (_write_variants). A card may target a module in
+        # a package that does not exist yet -- the plainest way to grow a project
+        # -- and the writer must create the tree rather than die on open().
+        cards = [_card("n", "pkg/sub/mod.py", context_slice=["util.py"])]
+        backend = FakeBatchBackend(scripts={"n": _code_block("N = 1")})
+
+        result = run_deck(cards, backend, root=self.root, poll_interval=0)
+
+        self.assertEqual(result.outcomes["n"].status, "written")
+        self.assertEqual(self._read(os.path.join("pkg", "sub", "mod.py")), "N = 1\n")
+        self.assertEqual(result.outcomes["n"].paths,
+                         [os.path.join(self.root, "pkg", "sub", "mod.py")])
+
+    def test_variants_of_a_new_package_card_land_in_that_package(self):
+        cards = [_card("n", "pkg/mod.py", context_slice=["util.py"], variants=2)]
+        backend = FakeBatchBackend(scripts={
+            "n.v1": _code_block("V1 = 1"),
+            "n.v2": _code_block("V2 = 2"),
+        })
+
+        result = run_deck(cards, backend, root=self.root, poll_interval=0)
+
+        self.assertEqual(result.outcomes["n"].status, "written")
+        self.assertTrue(self._exists(os.path.join("pkg", "mod.n.v1.py")))
+        self.assertTrue(self._exists(os.path.join("pkg", "mod.n.v2.py")))
+
     def test_card_fails_when_all_variants_none(self):
         cards = [_card("m", "multi.py", context_slice=["util.py"], variants=2)]
         backend = FakeBatchBackend(scripts={"m.v1": None, "m.v2": None})

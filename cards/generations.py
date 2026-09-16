@@ -194,6 +194,33 @@ def _output_path(card: MorphCard, variant_custom_id: str, root: str) -> str:
     return os.path.join(root, f"{stem}.{variant_custom_id}{ext}")
 
 
+def ensure_parent_dir(path: str) -> None:
+    """Create ``path``'s parent directory tree if it is missing.
+
+    WHY every writer needs this. A card's ``target`` is an arbitrary project
+    path, and creating a NEW package (``morph_mcp/jsonrpc.py``) is the most
+    ordinary thing a card can ask for -- but ``open(path, "w")`` does not make
+    directories, so such a card used to die with ``FileNotFoundError`` the
+    moment its generation was collected, taking the whole run with it. Public so
+    :mod:`cards.acceptance` and ``flows.morph`` reuse this one copy: every place
+    a morph body reaches disk must call it first. Idempotent (``exist_ok``), so
+    calling it next to each write costs a syscall and keeps the guard where a
+    later reader cannot separate it from the write it protects.
+
+    ``os.path.dirname`` is empty for a bare file name inside ``root`` -- every
+    card this project had run until now, which is why 156 green tests never saw
+    the bug -- and ``makedirs("")`` would raise, so that case is skipped.
+
+    Rollback note: :func:`cards.acceptance._restore_original` deletes a file a
+    rejected variant created, but a directory created here is deliberately left
+    behind -- that is not an oversight. An empty directory is harmless, whereas
+    removing it would race with whatever else may already have written into it.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 # -- the generation cycle ----------------------------------------------------
 
 
@@ -233,6 +260,7 @@ def _write_variants(
             continue
         body = response_to_file_body(response)
         path = _output_path(card, variant_id, root)
+        ensure_parent_dir(path)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(body)
         written.append(path)

@@ -33,7 +33,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-from cards.generations import _output_path, _variant_ids, response_to_file_body
+from cards.generations import (
+    _output_path,
+    _variant_ids,
+    ensure_parent_dir,
+    response_to_file_body,
+)
 from cards.schema import MorphCard
 
 
@@ -191,7 +196,10 @@ def _restore_original(path: str, original: Optional[bytes]) -> None:
     """Put the target back the way :func:`_capture_original` found it.
 
     Bytes are rewritten; an originally absent file (``original is None``) is
-    deleted if a rejected variant left one behind.
+    deleted if a rejected variant left one behind. A DIRECTORY created for that
+    write (see :func:`cards.generations.ensure_parent_dir`) is left in place on
+    purpose -- an empty directory is harmless, and removing it is not ours to
+    do; only the file is rolled back.
     """
     if original is None:
         if os.path.exists(path):
@@ -245,6 +253,9 @@ def verify_card(
 
         attempts += 1
         body = response_to_file_body(response)
+        # The target may name a package that does not exist yet; create it
+        # before the first variant lands (idempotent for the ones after it).
+        ensure_parent_dir(target_path)
         with open(target_path, "w", encoding="utf-8") as handle:
             handle.write(body)
         # Distinct mtime per variant: belt to run_acceptance's braces against a
@@ -266,6 +277,7 @@ def verify_card(
                 # suffixed files (from this or an earlier attempt) so only the
                 # winner survives alongside the real target.
                 winning_path = _output_path(card, variant_id, root)
+                ensure_parent_dir(winning_path)
                 with open(winning_path, "w", encoding="utf-8") as handle:
                     handle.write(body)
                 paths.append(winning_path)
