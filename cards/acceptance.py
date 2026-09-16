@@ -12,8 +12,9 @@ Two responsibilities live here:
 
 * :func:`run_acceptance` -- run one acceptance command and report the outcome
   (:class:`AcceptanceResult`): exit 0 passes, a non-zero exit or a timeout
-  fails, and the combined stdout+stderr is preserved (tail-truncated) as the
-  error context a retry generation feeds back to the executor.
+  fails, and the combined stdout+stderr is preserved -- clipped to the budget
+  by :func:`clip_output`, head and tail both kept -- as the error context a
+  retry generation feeds back to the executor.
 * :func:`verify_card` -- the best-of-N + rollback protocol
   (:class:`VerifyOutcome`): capture the target's original state, try each
   variant in order at the *real* target path, keep the first that passes (plus
@@ -44,15 +45,62 @@ from cards.schema import MorphCard
 
 # The combined stdout+stderr of an acceptance run is kept only as failure
 # context for a retry; a runaway test log would otherwise bloat the next
-# prompt, so we keep the tail (where the actual failure usually is).
+# prompt. The budget is spent head-and-tail (:func:`clip_output`): for the
+# most typical acceptance command of all, ``pytest``, the cause of the
+# failure -- the first failing traceback -- sits near the TOP of the log
+# while the bottom holds only the summary line, so the tail-only cut this
+# constant once paid for threw away exactly the part a regenerating executor
+# needed. The middle is noise.
 _OUTPUT_TAIL_CAP = 4000
 
 
-def _tail(output: str) -> str:
-    """The last :data:`_OUTPUT_TAIL_CAP` characters of ``output``."""
-    if len(output) > _OUTPUT_TAIL_CAP:
-        return output[-_OUTPUT_TAIL_CAP:]
-    return output
+# The marker :func:`clip_output` puts where the elided middle was; its one
+# placeholder is the number of characters dropped.
+_ELISION_TEMPLATE = "\n... [{} characters elided] ...\n"
+
+
+def _elision_line(dropped: int) -> str:
+    """The elision marker for ``dropped`` characters, as clip_output prints it."""
+    return _ELISION_TEMPLATE.format(dropped)
+
+
+def clip_output(text: str) -> str:
+    """Clip ``text`` to the :data:`_OUTPUT_TAIL_CAP` budget, head AND tail kept.
+
+    Text at or under the budget is returned unchanged. Longer text keeps its
+    first quarter -- where a failing suite puts its first, and most causal,
+    traceback -- and its last three quarters (the summary, the final errors),
+    with the noisy middle replaced by a line naming how many characters were
+    dropped. The marker is paid for out of the tail's three-quarter share, so
+    the result never exceeds the budget.
+
+    The dropped count in that marker is exact: the number of characters of
+    ``text`` absent from the result. The marker's length depends on that
+    count's width, and the count on the marker's length, so the two are
+    settled together -- each pass moves the count only by the marker's own
+    length, which converges in two or three passes for any output a command
+    can produce, and the loop below is bounded regardless.
+    """
+    if len(text) <= _OUTPUT_TAIL_CAP:
+        return text
+    head_len = _OUTPUT_TAIL_CAP // 4           # the first-quarter share
+    tail_budget = _OUTPUT_TAIL_CAP - head_len  # the last-three-quarters share
+    # Start as if the marker were free, then settle marker length against tail
+    # length: settled means head_len + len(line) + tail_len == the cap exactly,
+    # with the count the marker prints equal to the characters it replaces.
+    tail_len = tail_budget
+    line = _elision_line(len(text) - head_len - tail_len)
+    for _ in range(8):
+        settled = tail_budget - len(line)
+        if settled == tail_len:
+            break
+        tail_len = settled
+        line = _elision_line(len(text) - head_len - tail_len)
+    # Pure insurance (the loop above always settles): whatever the pair agreed
+    # on, the marker may never push the result past the budget.
+    tail_len = min(tail_len, _OUTPUT_TAIL_CAP - head_len - len(line))
+    tail_text = text[-tail_len:] if tail_len > 0 else ""
+    return text[:head_len] + line + tail_text
 
 
 # -- the stale-bytecode guard ------------------------------------------------
@@ -104,9 +152,10 @@ class AcceptanceResult:
 
     ``passed`` is true only on a clean exit 0. ``exit_code`` is the process
     return code, or ``None`` when the command timed out (``timed_out`` true).
-    ``output`` is the combined stdout+stderr, tail-truncated to
-    :data:`_OUTPUT_TAIL_CAP` characters -- it is the error context a failed
-    card carries into its retry generation.
+    ``output`` is the combined stdout+stderr, clipped by :func:`clip_output`
+    to at most :data:`_OUTPUT_TAIL_CAP` characters (head and tail kept, the
+    elided middle named) -- it is the error context a failed card carries into
+    its retry generation.
     """
 
     passed: bool
@@ -122,7 +171,8 @@ def run_acceptance(command: str, root: str, timeout: float = 300.0) -> Acceptanc
     combined stdout+stderr captured. Exit 0 passes; any non-zero exit fails; a
     command that exceeds ``timeout`` fails with ``timed_out`` set and whatever
     output was produced before the kill preserved. The output is always
-    tail-truncated to :data:`_OUTPUT_TAIL_CAP` characters.
+    clipped to the :data:`_OUTPUT_TAIL_CAP` budget by :func:`clip_output`
+    (head and tail kept, the elided middle named).
 
     The command inherits a COPY of the environment with
     ``PYTHONDONTWRITEBYTECODE=1`` added (the parent's own environment is never
@@ -149,13 +199,16 @@ def run_acceptance(command: str, root: str, timeout: float = 300.0) -> Acceptanc
         if isinstance(output, bytes):
             output = output.decode("utf-8", errors="replace")
         return AcceptanceResult(
-            passed=False, exit_code=None, output=_tail(output), timed_out=True
+            passed=False,
+            exit_code=None,
+            output=clip_output(output),
+            timed_out=True,
         )
 
     return AcceptanceResult(
         passed=(completed.returncode == 0),
         exit_code=completed.returncode,
-        output=_tail(completed.stdout or ""),
+        output=clip_output(completed.stdout or ""),
         timed_out=False,
     )
 

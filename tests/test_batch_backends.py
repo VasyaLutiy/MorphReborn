@@ -20,6 +20,7 @@ from cards.compiler import compile_deck, serialize_openai
 from cards.schema import MorphCard
 from cards.store import DeckStore, recover_orphaned_local_batch
 from processors.batch import (
+    OPENROUTER_SUBMIT_GRACE_SECONDS,
     AnthropicBatchBackend,
     BatchNotReady,
     LocalBatchBackend,
@@ -291,6 +292,25 @@ def _batch_object(status, results=None):
     }
 
 
+# Verbatim from the live service, the response that killed a real deck run.
+def _not_found_body(batch_id=None):
+    return {"error": {"message": f"Batch job {batch_id or OPENROUTER_BATCH_ID} "
+                                 "not found.", "code": 404}}
+
+
+class _FakeClock:
+    """A hand-cranked monotonic clock, so a grace period costs no wall time."""
+
+    def __init__(self, start=1000.0):
+        self.value = start
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
 def _ok_result(custom_id, text):
     return {
         "id": f"gen-{custom_id}",
@@ -469,6 +489,96 @@ class OpenRouterBatchBackendTests(unittest.TestCase):
         self.assertIn(OPENROUTER_BATCH_ID, str(ctx.exception))
         self.assertIn("in_progress", str(ctx.exception))
         self.assertEqual(len(transport.calls), 1)
+
+    # -- the read-after-write window (measured: +0s 404, +5s in_progress) -----
+
+    def test_status_reads_a_404_right_after_submit_as_in_progress(self):
+        # The exact production sequence: submit, poll immediately (404), poll
+        # again seconds later (the write has landed).
+        transport = _FakeTransport([
+            (202, _batch_object("validating")),
+            (404, _not_found_body()),
+            (200, _batch_object("in_progress")),
+        ])
+        clock = _FakeClock()
+        backend = OpenRouterBatchBackend(
+            model="z-ai/glm-5.3-flash:batch", api_key="sk-or-xxx",
+            transport=transport, now=clock)
+
+        batch_id = backend.submit(_requests_for_one_model())
+
+        self.assertEqual(backend.status(batch_id), "in_progress")
+        clock.advance(5)
+        self.assertEqual(backend.status(batch_id), "in_progress")
+        self.assertEqual(len(transport.calls), 3)
+
+    def test_collect_on_a_404_right_after_submit_raises_batch_not_ready(self):
+        # BatchNotReady, not RuntimeError: "come back later" is what
+        # flows/morph.py renders as "still in progress".
+        transport = _FakeTransport([
+            (202, _batch_object("validating")),
+            (404, _not_found_body()),
+        ])
+        backend = OpenRouterBatchBackend(
+            model="z-ai/glm-5.3-flash:batch", api_key="sk-or-xxx",
+            transport=transport, now=_FakeClock())
+
+        batch_id = backend.submit(_requests_for_one_model())
+
+        with self.assertRaises(BatchNotReady) as ctx:
+            backend.collect(batch_id)
+        self.assertIn(batch_id, str(ctx.exception))
+
+    def test_a_404_for_an_unknown_id_is_still_fatal(self):
+        # Nothing was submitted through this backend, so a 404 is a genuine
+        # one -- a wrong or deleted id -- and must not poll forever.
+        transport = _FakeTransport([(404, _not_found_body("batch-nope"))])
+        backend = self._backend(transport)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            backend.status("batch-nope")
+
+        self.assertNotIsInstance(ctx.exception, BatchNotReady)
+        message = str(ctx.exception)
+        self.assertIn("404", message)
+        self.assertIn("batch-nope", message)
+
+    def test_a_404_after_the_grace_period_is_fatal_again(self):
+        transport = _FakeTransport([
+            (202, _batch_object("validating")),
+            (404, _not_found_body()),
+        ])
+        clock = _FakeClock()
+        backend = OpenRouterBatchBackend(
+            model="z-ai/glm-5.3-flash:batch", api_key="sk-or-xxx",
+            transport=transport, now=clock)
+
+        batch_id = backend.submit(_requests_for_one_model())
+        clock.advance(OPENROUTER_SUBMIT_GRACE_SECONDS + 1)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            backend.status(batch_id)
+        self.assertNotIsInstance(ctx.exception, BatchNotReady)
+        self.assertIn("404", str(ctx.exception))
+
+    def test_a_non_404_inside_the_window_is_still_fatal(self):
+        # The window forgives one status code, not every failure: an operator
+        # must still see a 500 (or a 401, or a 429) with its body.
+        transport = _FakeTransport([
+            (202, _batch_object("validating")),
+            (500, {"error": {"message": "internal error"}}),
+        ])
+        backend = OpenRouterBatchBackend(
+            model="z-ai/glm-5.3-flash:batch", api_key="sk-or-xxx",
+            transport=transport, now=_FakeClock())
+
+        batch_id = backend.submit(_requests_for_one_model())
+
+        with self.assertRaises(RuntimeError) as ctx:
+            backend.status(batch_id)
+        self.assertNotIsInstance(ctx.exception, BatchNotReady)
+        self.assertIn("500", str(ctx.exception))
+        self.assertIn("internal error", str(ctx.exception))
 
 
 class OpenRouterOrphanRecoveryTests(unittest.TestCase):

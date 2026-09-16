@@ -35,6 +35,7 @@ import io
 import json
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -302,6 +303,31 @@ OPENROUTER_BATCH_BASE_URL = "https://openrouter.ai/api/beta"
 # operator to see WHY a deck did not go out, short enough to stay readable.
 _ERROR_BODY_LIMIT = 500
 
+# OpenRouter's batch API is read-after-write inconsistent: a submission answers
+# 202 with a batch id, but a GET of that id issued immediately after can answer
+# 404 {"error": {"message": "Batch job <id> not found.", "code": 404}} before the
+# write has propagated. Measured against the live service on one id:
+# ``+0s -> HTTP 404``, ``+5s -> in_progress``, ``+20s -> in_progress``. Inside
+# this grace period a 404 for the id WE just submitted therefore means "not
+# visible yet", not "gone"; outside it, or for any other id, a 404 is a real
+# error and stays fatal. Do not delete this as defensive noise -- it cost a real
+# deck run: ``cards/generations.py::_submit_poll_collect`` polls the instant it
+# submits, so a regenerated card killed the whole /collect after two of three
+# cards had already passed.
+OPENROUTER_SUBMIT_GRACE_SECONDS = 60.0
+
+
+class _BatchNotVisibleYet(RuntimeError):
+    """Internal: a 404 for a just-submitted id, inside the grace period above.
+
+    Never escapes :class:`OpenRouterBatchBackend` -- ``status`` turns it into
+    ``"in_progress"`` (the word the polling loop understands as "keep going")
+    and ``collect`` into :class:`BatchNotReady` (the "come back later" signal
+    ``flows/morph.py`` renders as "still in progress"). It exists so the one
+    404-is-not-fatal decision lives in ``_retrieve``, in one place, while the
+    two callers each answer it in their own vocabulary.
+    """
+
 
 def _default_openrouter_transport(api_key: Optional[str]) -> Callable[[str, str, Optional[str]], Tuple[int, dict]]:
     """Build the real HTTP transport for one backend instance.
@@ -368,13 +394,24 @@ class OpenRouterBatchBackend(BatchBackend):
     ``transport`` is the test seam, mirroring the other backends'
     ``client_factory``: a callable ``(method, url, payload) -> (status_code,
     parsed_json)``. The default one does real HTTP over ``urllib.request``.
+    ``now`` is the second seam: a zero-arg clock, so the read-after-write grace
+    period (see :data:`OPENROUTER_SUBMIT_GRACE_SECONDS`) can be tested without
+    sleeping.
     """
 
     def __init__(self, model: str, api_key: str = None, base_url: str = None,
-                 transport: Callable[[str, str, Optional[str]], Tuple[int, dict]] = None):
+                 transport: Callable[[str, str, Optional[str]], Tuple[int, dict]] = None,
+                 now: Callable[[], float] = None):
         self.model = model
         self.base_url = (base_url or OPENROUTER_BATCH_BASE_URL).rstrip("/")
         self._transport = transport or _default_openrouter_transport(api_key)
+        # ``monotonic``, not ``time()``: the grace period measures an elapsed
+        # few seconds and must not be moved by an NTP step or a DST change.
+        self._now = now or time.monotonic
+        # The id this instance submitted most recently, and when -- the only
+        # id whose 404 we are willing to read as "not propagated yet".
+        self._submitted_id: Optional[str] = None
+        self._submitted_at: Optional[float] = None
 
     def submit(self, requests: List[dict]) -> str:
         payload = serialize_openrouter(requests, default_model=self.model)
@@ -386,12 +423,27 @@ class OpenRouterBatchBackend(BatchBackend):
             raise RuntimeError(
                 f"OpenRouter batch submission failed with HTTP {status_code}: "
                 f"{self._trim(body)}")
-        return body["id"]
+        batch_id = body["id"]
+        self._submitted_id = batch_id
+        self._submitted_at = self._now()
+        return batch_id
 
     def _retrieve(self, batch_id: str) -> dict:
-        """GET one batch object, raising on anything but a 200."""
+        """GET one batch object, raising on anything but a 200.
+
+        The single exception is a 404 within the read-after-write window of our
+        own submission, which raises :class:`_BatchNotVisibleYet` instead: the
+        batch exists, the service just cannot see its own write yet. Every other
+        status code -- a 401, a 429, a 500, and a 404 for an id we did not
+        submit or one whose grace period has run out -- stays the RuntimeError
+        it has always been, body included, because an operator must read it.
+        """
         status_code, body = self._transport(
             "GET", f"{self.base_url}/batches/{batch_id}", None)
+        if status_code == 404 and self._inside_submit_grace(batch_id):
+            raise _BatchNotVisibleYet(
+                f"OpenRouter batch {batch_id!r} is not readable yet: HTTP 404 "
+                f"within {OPENROUTER_SUBMIT_GRACE_SECONDS:g}s of its submission")
         if status_code != 200:
             raise RuntimeError(
                 f"OpenRouter batch {batch_id!r} could not be read: HTTP "
@@ -406,8 +458,24 @@ class OpenRouterBatchBackend(BatchBackend):
             return f"{text[:_ERROR_BODY_LIMIT]}..."
         return text
 
+    def _inside_submit_grace(self, batch_id: str) -> bool:
+        """Did THIS instance submit ``batch_id`` within the grace period?
+
+        Deliberately narrow: an id we never submitted (a typo, a batch from a
+        previous process, a deleted one) is never covered, so a genuine 404
+        still fails loudly instead of polling forever.
+        """
+        if batch_id != self._submitted_id or self._submitted_at is None:
+            return False
+        return (self._now() - self._submitted_at) < OPENROUTER_SUBMIT_GRACE_SECONDS
+
     def status(self, batch_id: str) -> str:
-        return self._normalize(self._retrieve(batch_id).get("status"))
+        try:
+            batch = self._retrieve(batch_id)
+        except _BatchNotVisibleYet:
+            # "Keep polling" -- the next poll, seconds later, reads the real one.
+            return "in_progress"
+        return self._normalize(batch.get("status"))
 
     @staticmethod
     def _normalize(status: str) -> str:
@@ -425,7 +493,11 @@ class OpenRouterBatchBackend(BatchBackend):
         # ONE request: the batch object carries both the status and, once it is
         # completed, the full results array. Polling again to fetch results
         # would be a second round trip for data already in hand.
-        batch = self._retrieve(batch_id)
+        try:
+            batch = self._retrieve(batch_id)
+        except _BatchNotVisibleYet as error:
+            # Same window, the caller's vocabulary: collect's "come back later".
+            raise BatchNotReady(str(error)) from error
         current = self._normalize(batch.get("status"))
         if current != "completed":
             raise BatchNotReady(

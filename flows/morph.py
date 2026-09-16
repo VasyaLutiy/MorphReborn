@@ -693,6 +693,18 @@ every slot is busy. /settings shows what is idle, busy or queued.
         outcomes = store.load_outcomes()
         total = len(view.generations)
         lines = [f"mrph> Deck: {len(view.card_status)} card(s), phase: {view.phase}"]
+        # A "submitted" generation is a batch sitting in a provider's queue right
+        # now -- possibly for twenty minutes or more. Name the batch and the
+        # processor it was submitted on, so the operator can check it on the
+        # provider's side or report it: both ids are already in
+        # .morph/state.json, this only renders them.
+        if view.phase == "submitted":
+            state = store.load_state()
+            batch_id = state.get("batch_id")
+            backend_label = state.get("backend_label")
+            if batch_id or backend_label:
+                lines.append(f"  in flight: batch \"{batch_id}\" on \"{backend_label}\" "
+                             f"-- fetch it with /collect")
         lines.append("  generations:")
         for number, generation in enumerate(view.generations, start=1):
             marker = ""
