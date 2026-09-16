@@ -26,8 +26,8 @@ Two configuration schemes are supported:
        MRPH_PROCESSOR_gpt4_MODEL=gpt-4o
 
    Recognised per-instance keys (all prefixed ``MRPH_PROCESSOR_<ID>_``):
-   ``TYPE`` (``llama_cpp`` | ``ollama`` | ``openai``), ``ENDPOINT_URI``,
-   ``MODEL``, ``API_KEY``, ``BASE_URL``.
+   ``TYPE`` (``llama_cpp`` | ``ollama`` | ``openai`` | ``anthropic`` |
+   ``openrouter``), ``ENDPOINT_URI``, ``MODEL``, ``API_KEY``, ``BASE_URL``.
 
 2. Legacy scheme (kept for backward compatibility). If the namespaced scheme
    defines nothing, the classic single-instance variables are mapped to the
@@ -42,11 +42,18 @@ from processors.batch import (
     BatchBackend,
     OpenAIBatchBackend,
     AnthropicBatchBackend,
+    OpenRouterBatchBackend,
     LocalBatchBackend,
 )
 
 NAMESPACE_PREFIX = "MRPH_PROCESSOR_"
-KNOWN_TYPES = ("llama_cpp", "ollama", "openai", "anthropic")
+KNOWN_TYPES = ("llama_cpp", "ollama", "openai", "anthropic", "openrouter")
+
+# OpenRouter's *synchronous* API is OpenAI-compatible, so one openrouter
+# processor id serves both worlds: interactive /generate and /patch go through
+# an OpenAIProcessor pointed here, while decks go through the batch API on the
+# separate /api/beta path (``processors.batch.OPENROUTER_BATCH_BASE_URL``).
+OPENROUTER_SYNC_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 class ProcessorConfig:
@@ -72,6 +79,8 @@ class ProcessorConfig:
             model = self.params.get("model") or os.environ.get("ANTHROPIC_MODEL_NAME") \
                 or "claude-sonnet-5"
             return f"[{self.identifier}] Anthropic (model \"{model}\")"
+        if self.kind == "openrouter":
+            return f"[{self.identifier}] OpenRouter (model \"{self.params.get('model')}\")"
         return f"[{self.identifier}] {self.kind}"
 
 
@@ -127,6 +136,17 @@ class ProcessorRegistry:
                 model=config.params.get("model"),
                 api_key=config.params.get("api_key"),
             )
+        if config.kind == "openrouter":
+            # The synchronous side of OpenRouter is OpenAI-compatible, so the
+            # existing processor drives it verbatim -- only the base URL differs.
+            # ``BASE_URL`` overrides the *batch* path only (see ``batch()``), so
+            # the interactive path always uses the documented /api/v1 endpoint.
+            from processors.openai_processor import OpenAIProcessor
+            return OpenAIProcessor(
+                model=config.params.get("model"),
+                api_key=config.params.get("api_key"),
+                base_url=OPENROUTER_SYNC_BASE_URL,
+            )
         raise ValueError(f"Unknown processor type \"{config.kind}\" for id \"{identifier}\".")
 
     def run(self, identifier: str, messages: List[Dict[str, str]]) -> str:
@@ -155,6 +175,12 @@ class ProcessorRegistry:
                 model=config.params.get("model") or os.environ.get("ANTHROPIC_MODEL_NAME")
                 or "claude-sonnet-5",
                 api_key=config.params.get("api_key"),
+            )
+        if config.kind == "openrouter":
+            return OpenRouterBatchBackend(
+                model=config.params.get("model"),
+                api_key=config.params.get("api_key"),
+                base_url=config.params.get("base_url"),
             )
         if config.kind in ("llama_cpp", "ollama"):
             return LocalBatchBackend(self, [identifier])
@@ -231,6 +257,11 @@ class ProcessorRegistry:
                 params.get("api_key")
                 or os.environ.get("ANTHROPIC_API_KEY")
             )
+        if kind == "openrouter":
+            # There is no process-wide OpenRouter fallback and no default model:
+            # the model slug chooses both the vendor and the price tier (a
+            # ":batch" suffix is the half-price variant), so it must be explicit.
+            return bool(params.get("api_key") and params.get("model"))
         return False
 
     @staticmethod

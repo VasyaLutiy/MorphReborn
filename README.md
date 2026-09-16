@@ -114,10 +114,23 @@ To get started with the **GPT Morph CLI Bot**, follow these steps:
         MRPH_PROCESSOR_gpt4_TYPE=openai
         MRPH_PROCESSOR_gpt4_API_KEY=<YOUR_API_KEY>
         MRPH_PROCESSOR_gpt4_MODEL=gpt-4o
+
+        MRPH_PROCESSOR_claude_TYPE=anthropic
+        MRPH_PROCESSOR_claude_API_KEY=<YOUR_API_KEY>
+        MRPH_PROCESSOR_claude_MODEL=claude-sonnet-5
+
+        # OpenRouter: one id serves both the interactive API and the batch API.
+        # A ":batch" model slug is the half-price, 24h-window batch variant.
+        MRPH_PROCESSOR_glm_TYPE=openrouter
+        MRPH_PROCESSOR_glm_API_KEY=<YOUR_API_KEY>
+        MRPH_PROCESSOR_glm_MODEL=z-ai/glm-5.3-flash:batch
         ```
 
-    Supported `TYPE` values are `llama_cpp`, `ollama` and `openai`. Recognised
-    per-instance keys are `TYPE`, `ENDPOINT_URI`, `MODEL`, `API_KEY` and `BASE_URL`.
+    Supported `TYPE` values are `llama_cpp`, `ollama`, `openai`, `anthropic` and
+    `openrouter`. Recognised per-instance keys are `TYPE`, `ENDPOINT_URI`, `MODEL`,
+    `API_KEY` and `BASE_URL`. An `openrouter` instance requires `API_KEY` and
+    `MODEL` (the slug picks both the vendor and the price tier, so there is no
+    default); its optional `BASE_URL` overrides the *batch* endpoint only.
     `MRPH_PROCESSORS` is optional and only fixes the id ordering (the first id is the
     default). The classic single-instance variables above keep working and map to the
     default ids `llama_cpp`, `ollama` and `openai`. Run `/settings` to list everything
@@ -199,12 +212,31 @@ batch executors, generation by generation. Five commands drive it:
   to unfold a goal into a reviewed set of cards.
 - `/submit` — compile and submit the current generation. `@<id>` pins a
   processor, `@all` fans out across the local (llama.cpp/Ollama) pool, and a
-  bare `/submit` uses the default processor.
+  bare `/submit` uses the default processor. `@all` is **local-only**: a cloud
+  deck goes out with a bare `/submit` or with `@<id>` naming the cloud
+  processor.
 - `/collect` — poll the in-flight batch; when it is ready, verify each card's
   acceptance (best-of-N, with failed cards regenerated before their dependents),
   write the morphs, and advance to the next generation.
 - `/nightly` — run the entire deck in one blocking pass (submit → poll →
   collect, generation after generation) and print the run summary.
+
+### Cloud executors
+
+Three cloud batch providers are wired in, each addressed by a processor id:
+`openai` (OpenAI Batch), `anthropic` (Message Batches) and `openrouter`
+(OpenRouter Batch). OpenRouter is the cheapest door to a wide model catalogue:
+declare a processor with `TYPE=openrouter` (see the multi-agent `.env` block
+above) and give it a model slug. A slug carrying the **`:batch` suffix** — for
+example `z-ai/glm-5.3-flash:batch` — runs at **half price with a 24h completion
+window**, which is exactly the trade the nightly morph is built around: latency
+for cost. The same processor id also serves `/generate` and `/patch`, because
+OpenRouter's synchronous API is OpenAI-compatible; drop the `:batch` suffix from
+`MODEL` when you want the interactive price instead.
+
+One caveat, inherited from the provider: **an OpenRouter batch runs one model
+for the whole deck**. A card pinning a different `model` is rejected at compile
+time, naming the card — split such a backlog into one deck per model.
 
 The natural rhythm is the **nightly morph**: spend the day appending
 well-specified cards to the backlog with `/card`, `/submit` the deck in the

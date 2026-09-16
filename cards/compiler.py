@@ -1,11 +1,11 @@
 """
-The deck compiler: morph card + context slice -> provider-specific batch JSONL.
+The deck compiler: morph card + context slice -> a provider-specific batch payload.
 
 Phase 1 of ``documentation/DEVELOPMENT_PLAN.md``. A morph card
 (:class:`cards.schema.MorphCard`) is compiled into one *self-contained*
 conversation -- exactly the shape Morph 1.0 builds interactively in
 ``flows/morph.py`` -- and then serialized into the on-the-wire batch format of
-a provider (Anthropic Message Batches or OpenAI Batch). See
+a provider (Anthropic Message Batches, OpenAI Batch, OpenRouter Batch). See
 ``documentation/batch-orchestrator.md`` ("What batch APIs offer") for why a
 Morph request is already a batch request: a fresh, complete conversation from
 disk, one instruction, one response, no session state.
@@ -273,3 +273,52 @@ def serialize_openai(requests: List[dict], default_model: str) -> str:
         })
         lines.append(line)
     return "".join(f"{line}\n" for line in lines)
+
+
+def serialize_openrouter(requests: List[dict], default_model: str) -> str:
+    """Serialize requests as an OpenRouter Batch API submit payload.
+
+    OpenRouter's batch API is *not* the OpenAI shape: there is no file upload
+    and no JSONL. The whole deck goes out inline as one JSON document with
+    exactly three top-level fields::
+
+        {"endpoint": "/v1/chat/completions", "model": ..., "requests": [...]}
+
+    Two consequences shape this function:
+
+    * **Key order is load-bearing.** The service stream-parses the body and
+      rejects it with a 400 if ``requests`` arrives before ``endpoint`` and
+      ``model``. Returning a *string* (rather than a dict for the caller to
+      dump) is what makes that ordering a guarantee of this module: ``_dumps``
+      never re-sorts keys, so the construction order below is the wire order.
+    * **One model per batch.** ``model`` applies to the entire batch, so each
+      request's ``body`` deliberately omits it and inherits the batch-level
+      one. A request body that names a *different* model is rejected by the
+      service, so a card pinned to another model is caught here instead --
+      such a deck must be split into one batch per model.
+
+    Unlike the JSONL serializers this returns a single JSON document with no
+    trailing newline: it is a request body, not a file.
+    """
+    items = []
+    for request in requests:
+        model = request["model"]
+        if model is not None and model != default_model:
+            raise ValueError(
+                f"request {request['custom_id']!r} pins model {model!r}, but the "
+                f"OpenRouter batch runs on {default_model!r}: OpenRouter applies "
+                f"one model to the whole batch, so a deck mixing models must be "
+                f"split into one batch per model")
+        items.append({
+            "custom_id": request["custom_id"],
+            # No "model" key: every request inherits the batch-level model.
+            "body": {
+                "messages": request["messages"],
+            },
+        })
+
+    return _dumps({
+        "endpoint": "/v1/chat/completions",
+        "model": default_model,
+        "requests": items,
+    })

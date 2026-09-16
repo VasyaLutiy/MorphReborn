@@ -5,13 +5,16 @@ Phase 2 of ``documentation/DEVELOPMENT_PLAN.md``. Where ``processors/registry.py
 runs one morph interactively, a *batch backend* runs a whole compiled deck
 asynchronously -- the half-price, massively parallel execution path described in
 ``documentation/batch-orchestrator.md`` ("What batch APIs offer" and "What
-survives from the current codebase"). Three backends implement one small
+survives from the current codebase"). Four backends implement one small
 interface:
 
 * :class:`OpenAIBatchBackend` -- the OpenAI Batch API (upload JSONL file,
   create a batch over ``/v1/chat/completions``, poll, download the output file).
 * :class:`AnthropicBatchBackend` -- Anthropic Message Batches
   (``client.messages.batches``), the first Anthropic code path in the project.
+* :class:`OpenRouterBatchBackend` -- the OpenRouter Batch API. No SDK and no
+  file upload: the deck is POSTed inline as one JSON document and the results
+  come back inline in the poll response, over ``urllib.request``.
 * :class:`LocalBatchBackend` -- the "department minicomputer": no provider batch
   endpoint exists for a llama.cpp/Ollama node, so this emulates one by draining
   the deck through the existing :class:`scheduler.JobScheduler` pool, exactly the
@@ -23,7 +26,8 @@ reuse the compiler's serializers so the wire format has a single source of
 truth. No provider SDK is imported at module load time -- the ``openai`` and
 ``anthropic`` packages are imported lazily inside the default client factories,
 so the test suite runs (and this module imports) in an environment where
-``anthropic`` is not installed at all.
+``anthropic`` is not installed at all; OpenRouter needs no SDK whatsoever, only
+``urllib`` from the stdlib.
 """
 
 import abc
@@ -31,10 +35,12 @@ import io
 import json
 import os
 import threading
+import urllib.error
+import urllib.request
 import uuid
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
-from cards.compiler import serialize_openai
+from cards.compiler import serialize_openai, serialize_openrouter
 from scheduler import JobScheduler
 
 
@@ -282,6 +288,177 @@ class AnthropicBatchBackend(BatchBackend):
         if not content:
             return None
         return getattr(content[0], "text", None)
+
+
+# -- OpenRouter Batch API ----------------------------------------------------
+
+
+# OpenRouter's batch API lives under /api/beta, NOT under the /api/v1 path their
+# OpenAI-compatible synchronous API uses. One processor id therefore talks to two
+# base paths: this one for decks, ``.../api/v1`` for interactive /generate.
+OPENROUTER_BATCH_BASE_URL = "https://openrouter.ai/api/beta"
+
+# How much of a failing response body an error message carries. Enough for an
+# operator to see WHY a deck did not go out, short enough to stay readable.
+_ERROR_BODY_LIMIT = 500
+
+
+def _default_openrouter_transport(api_key: Optional[str]) -> Callable[[str, str, Optional[str]], Tuple[int, dict]]:
+    """Build the real HTTP transport for one backend instance.
+
+    OpenRouter ships no SDK for the batch API and the endpoints are two plain
+    JSON calls, so this uses ``urllib.request`` from the stdlib rather than
+    adding a dependency (the development plan's "no new heavy dependencies"
+    rule). The returned callable is the whole network surface of
+    :class:`OpenRouterBatchBackend`, which is what makes the backend testable
+    offline: a fake with the same signature replaces it wholesale.
+
+    A 4xx/5xx is returned as ``(status, body)`` rather than raised -- the
+    backend turns it into an error message naming the status code, and an error
+    body is exactly the part an operator needs to read.
+    """
+
+    def transport(method: str, url: str, payload: Optional[str]) -> Tuple[int, dict]:
+        data = payload.encode("utf-8") if payload is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("Authorization", f"Bearer {api_key}")
+        request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, _parse_json(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, _parse_json(error.read())
+
+    return transport
+
+
+def _parse_json(raw: bytes) -> dict:
+    """Decode a response body, degrading to ``{"raw": ...}`` when it is not JSON.
+
+    An error page (a gateway timeout, an HTML 502) must not crash the caller
+    before it can report the status code it came with.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return {"raw": text}
+    if not isinstance(parsed, dict):
+        return {"raw": parsed}
+    return parsed
+
+
+class OpenRouterBatchBackend(BatchBackend):
+    """Execute a deck through the OpenRouter Batch API (half price, 24h window).
+
+    OpenRouter's batch API is its own shape, not an OpenAI-compatible one, so
+    none of :class:`OpenAIBatchBackend` is reusable here:
+
+    * **Submit is inline.** There is no file upload and no JSONL -- the whole
+      deck is POSTed as one JSON document to ``<base>/batches`` and OpenRouter
+      persists it internally. :func:`cards.compiler.serialize_openrouter` builds
+      that body, including the ``endpoint`` -> ``model`` -> ``requests`` key
+      order the stream-parsing service requires.
+    * **One model per batch.** ``model`` is a batch-level field; the serializer
+      rejects a deck that pins a different one per card.
+    * **Results are inline too.** A completed batch carries its ``results``
+      array in the very same poll response, so ``collect`` makes exactly one
+      request and never downloads an output file.
+
+    ``transport`` is the test seam, mirroring the other backends'
+    ``client_factory``: a callable ``(method, url, payload) -> (status_code,
+    parsed_json)``. The default one does real HTTP over ``urllib.request``.
+    """
+
+    def __init__(self, model: str, api_key: str = None, base_url: str = None,
+                 transport: Callable[[str, str, Optional[str]], Tuple[int, dict]] = None):
+        self.model = model
+        self.base_url = (base_url or OPENROUTER_BATCH_BASE_URL).rstrip("/")
+        self._transport = transport or _default_openrouter_transport(api_key)
+
+    def submit(self, requests: List[dict]) -> str:
+        payload = serialize_openrouter(requests, default_model=self.model)
+        status_code, body = self._transport("POST", f"{self.base_url}/batches", payload)
+        # The service answers a successful submission with 202 Accepted (the
+        # deck is queued, not run); 200 is accepted too, so a future change of
+        # heart about the code does not wedge every deck.
+        if status_code not in (200, 202):
+            raise RuntimeError(
+                f"OpenRouter batch submission failed with HTTP {status_code}: "
+                f"{self._trim(body)}")
+        return body["id"]
+
+    def _retrieve(self, batch_id: str) -> dict:
+        """GET one batch object, raising on anything but a 200."""
+        status_code, body = self._transport(
+            "GET", f"{self.base_url}/batches/{batch_id}", None)
+        if status_code != 200:
+            raise RuntimeError(
+                f"OpenRouter batch {batch_id!r} could not be read: HTTP "
+                f"{status_code}: {self._trim(body)}")
+        return body
+
+    @staticmethod
+    def _trim(body: dict) -> str:
+        """A response body, shortened to something an operator can read."""
+        text = json.dumps(body, ensure_ascii=False)
+        if len(text) > _ERROR_BODY_LIMIT:
+            return f"{text[:_ERROR_BODY_LIMIT]}..."
+        return text
+
+    def status(self, batch_id: str) -> str:
+        return self._normalize(self._retrieve(batch_id).get("status"))
+
+    @staticmethod
+    def _normalize(status: str) -> str:
+        # OpenRouter batch states: validating, in_progress, finalizing,
+        # completed, failed, expired, cancelling, cancelled -- the same
+        # vocabulary OpenAI uses, mapped onto the same three words
+        # ``cards/generations.py`` and ``cards/store.py`` depend on.
+        if status == "completed":
+            return "completed"
+        if status in ("failed", "expired", "cancelled", "canceled", "cancelling"):
+            return "failed"
+        return "in_progress"
+
+    def collect(self, batch_id: str) -> Dict[str, Optional[str]]:
+        # ONE request: the batch object carries both the status and, once it is
+        # completed, the full results array. Polling again to fetch results
+        # would be a second round trip for data already in hand.
+        batch = self._retrieve(batch_id)
+        current = self._normalize(batch.get("status"))
+        if current != "completed":
+            raise BatchNotReady(
+                f"OpenRouter batch {batch_id!r} is {current!r}, not yet completed")
+
+        results: Dict[str, Optional[str]] = {}
+        for entry in batch.get("results") or []:
+            results[entry.get("custom_id")] = self._parse_result(entry)
+        return results
+
+    @staticmethod
+    def _parse_result(entry: dict) -> Optional[str]:
+        """One inline result item -> response text, or ``None`` if it failed.
+
+        Exactly one of ``response``/``error`` is populated per item, so an
+        errored item -- and a response that did not come back 200, or came back
+        without a choice -- degrades to ``None``, the same way the other
+        backends report a per-request failure.
+        """
+        if entry.get("error"):
+            return None
+        response = entry.get("response")
+        if not response:
+            return None
+        status_code = response.get("status_code")
+        if status_code is not None and status_code != 200:
+            return None
+        body = response.get("body") or {}
+        choices = body.get("choices") or []
+        if not choices:
+            return None
+        message = choices[0].get("message") or {}
+        return message.get("content")
 
 
 # -- Local emulation over the JobScheduler pool ------------------------------

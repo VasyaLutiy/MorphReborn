@@ -9,6 +9,7 @@ from cards.compiler import (
     compile_deck,
     serialize_anthropic,
     serialize_openai,
+    serialize_openrouter,
 )
 from context_folder_dialog import ContextFolderDialog
 
@@ -29,6 +30,14 @@ MINIPROJECT = os.path.join("tests", "fixtures", "miniproject")
 ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-5"
 OPENAI_DEFAULT_MODEL = "gpt-4o"
 
+# OpenRouter applies ONE model to the whole batch, and the reference deck pins
+# "claude-opus-4" on its variants card. So the golden batch model is that same
+# slug -- which is also the only configuration in which this deck is a legal
+# OpenRouter submission at all, and it exercises the "a request may name the
+# batch model" case. A deck pinning anything else must be split (see
+# OpenRouterMixedModelTests).
+OPENROUTER_DEFAULT_MODEL = "claude-opus-4"
+
 
 def _read(path):
     with open(path, "r", encoding="utf-8") as handle:
@@ -37,7 +46,7 @@ def _read(path):
 
 class GoldenFileTests(unittest.TestCase):
     """The reference deck compiled against the fixture project must match the
-    committed golden JSONL byte-for-byte, for both providers."""
+    committed golden payload byte-for-byte, for every provider."""
 
     def setUp(self):
         self.cards = load_deck(os.path.join(FIXTURES, "deck.json"))
@@ -51,12 +60,69 @@ class GoldenFileTests(unittest.TestCase):
         produced = serialize_openai(self.requests, default_model=OPENAI_DEFAULT_MODEL)
         self.assertEqual(produced, _read(os.path.join(GOLDEN, "openai.jsonl")))
 
+    def test_openrouter_matches_golden(self):
+        produced = serialize_openrouter(self.requests, default_model=OPENROUTER_DEFAULT_MODEL)
+        self.assertEqual(produced, _read(os.path.join(GOLDEN, "openrouter.json")))
+
+    def test_openrouter_payload_key_order_is_endpoint_model_requests(self):
+        # The service stream-parses the body and answers 400 if "requests"
+        # arrives first, so the order is part of the golden contract.
+        produced = serialize_openrouter(self.requests, default_model=OPENROUTER_DEFAULT_MODEL)
+        payload = json.loads(produced, object_pairs_hook=list)
+        self.assertEqual([key for key, _ in payload], ["endpoint", "model", "requests"])
+
+    def test_openrouter_request_bodies_carry_no_model(self):
+        produced = serialize_openrouter(self.requests, default_model=OPENROUTER_DEFAULT_MODEL)
+        payload = json.loads(produced)
+        self.assertEqual(payload["endpoint"], "/v1/chat/completions")
+        self.assertEqual(len(payload["requests"]), len(self.requests))
+        for item in payload["requests"]:
+            self.assertEqual(set(item), {"custom_id", "body"})
+            self.assertEqual(set(item["body"]), {"messages"})
+
     def test_both_serializers_end_with_single_newline(self):
         anthropic = serialize_anthropic(self.requests, default_model=ANTHROPIC_DEFAULT_MODEL)
         openai = serialize_openai(self.requests, default_model=OPENAI_DEFAULT_MODEL)
         for text in (anthropic, openai):
             self.assertTrue(text.endswith("\n"))
             self.assertFalse(text.endswith("\n\n"))
+
+
+class OpenRouterMixedModelTests(unittest.TestCase):
+    """OpenRouter takes one model per batch, so a deck mixing models is a
+    compile-time error naming the offending card, not a 400 from the service."""
+
+    def test_mixed_models_raise_naming_the_custom_id(self):
+        card = MorphCard(
+            custom_id="pinned-elsewhere",
+            intent="generate",
+            target="out.py",
+            instruction="do it",
+            context_slice=["app.py"],
+            model="claude-opus-4",
+        )
+        requests = compile_card(card, root=MINIPROJECT)
+        with self.assertRaises(ValueError) as ctx:
+            serialize_openrouter(requests, default_model="z-ai/glm-5.3-flash:batch")
+        message = str(ctx.exception)
+        self.assertIn("pinned-elsewhere", message)
+        self.assertIn("claude-opus-4", message)
+        self.assertIn("z-ai/glm-5.3-flash:batch", message)
+
+    def test_a_request_pinning_the_batch_model_is_accepted(self):
+        card = MorphCard(
+            custom_id="pinned-same",
+            intent="generate",
+            target="out.py",
+            instruction="do it",
+            context_slice=["app.py"],
+            model="z-ai/glm-5.3-flash:batch",
+        )
+        requests = compile_card(card, root=MINIPROJECT)
+        payload = json.loads(
+            serialize_openrouter(requests, default_model="z-ai/glm-5.3-flash:batch"))
+        self.assertEqual(payload["model"], "z-ai/glm-5.3-flash:batch")
+        self.assertNotIn("model", payload["requests"][0]["body"])
 
 
 class DeterminismTests(unittest.TestCase):

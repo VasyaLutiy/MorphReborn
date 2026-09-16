@@ -8,18 +8,23 @@ fake registry of fake processors. The suite must pass in an environment where
 ``processors/batch.py``).
 """
 
+import json
 import os
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from cards.compiler import compile_deck, serialize_openai
 from cards.schema import MorphCard
+from cards.store import DeckStore, recover_orphaned_local_batch
 from processors.batch import (
     AnthropicBatchBackend,
     BatchNotReady,
     LocalBatchBackend,
     OpenAIBatchBackend,
+    OpenRouterBatchBackend,
 )
 from processors.registry import ProcessorRegistry
 
@@ -35,6 +40,21 @@ def _requests():
         {"custom_id": "c1", "model": None,
          "messages": [{"role": "user", "content": "first"}]},
         {"custom_id": "c2", "model": "claude-opus-4",
+         "messages": [{"role": "user", "content": "second"}]},
+    ]
+
+
+def _requests_for_one_model():
+    """The same two requests, neither pinning a model.
+
+    OpenRouter applies one model to the whole batch, so a deck bound for it
+    leaves the per-request model unset (the serializer rejects a conflicting
+    one; see ``tests/test_compiler.py``).
+    """
+    return [
+        {"custom_id": "c1", "model": None,
+         "messages": [{"role": "user", "content": "first"}]},
+        {"custom_id": "c2", "model": None,
          "messages": [{"role": "user", "content": "second"}]},
     ]
 
@@ -229,6 +249,265 @@ class AnthropicBatchBackendTests(unittest.TestCase):
             backend.collect("msgbatch-1")
 
 
+# -- OpenRouter fake transport -----------------------------------------------
+
+
+# A real id, as the live service hands them out -- deliberately NOT prefixed
+# "local-", which is what keeps it out of the orphan recovery path.
+OPENROUTER_BATCH_ID = "batch-1789576284-Ejahe4wq9AgVdp5xGdNm"
+
+
+class _FakeTransport:
+    """Stand-in for :func:`processors.batch._default_openrouter_transport`.
+
+    Records every call as ``(method, url, payload)`` and replays a queue of
+    canned ``(status_code, body)`` responses -- the last one repeats, so a test
+    that polls twice need only declare the answer once.
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, method, url, payload):
+        self.calls.append((method, url, payload))
+        if len(self.responses) > 1:
+            return self.responses.pop(0)
+        return self.responses[0]
+
+
+def _batch_object(status, results=None):
+    """The batch object shape the service returns from both POST and GET."""
+    return {
+        "id": OPENROUTER_BATCH_ID,
+        "object": "batch",
+        "endpoint": "/v1/chat/completions",
+        "model": "z-ai/glm-5.3-flash-20260826",
+        "completion_window": "24h",
+        "status": status,
+        "request_counts": {"total": 2, "completed": 0, "failed": 0},
+        "results": results,
+        "error": None,
+    }
+
+
+def _ok_result(custom_id, text):
+    return {
+        "id": f"gen-{custom_id}",
+        "custom_id": custom_id,
+        "response": {
+            "status_code": 200,
+            "request_id": "req-1",
+            "body": {"choices": [{"message": {"content": text}}]},
+        },
+        "error": None,
+    }
+
+
+class OpenRouterBatchBackendTests(unittest.TestCase):
+    def _backend(self, transport, model="z-ai/glm-5.3-flash:batch"):
+        return OpenRouterBatchBackend(
+            model=model, api_key="sk-or-xxx", transport=transport)
+
+    def test_submit_posts_once_with_the_documented_key_order(self):
+        transport = _FakeTransport([(202, _batch_object("validating"))])
+        backend = self._backend(transport)
+
+        batch_id = backend.submit(_requests_for_one_model())
+
+        self.assertEqual(batch_id, OPENROUTER_BATCH_ID)
+        self.assertEqual(len(transport.calls), 1)
+        method, url, payload = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, "https://openrouter.ai/api/beta/batches")
+
+        # The service stream-parses the body and returns 400 if "requests"
+        # arrives before "endpoint" and "model". This is that trap, asserted.
+        keys = [key for key, _ in json.loads(payload, object_pairs_hook=list)]
+        self.assertEqual(keys, ["endpoint", "model", "requests"])
+
+        body = json.loads(payload)
+        self.assertEqual(body["endpoint"], "/v1/chat/completions")
+        self.assertEqual(body["model"], "z-ai/glm-5.3-flash:batch")
+        self.assertEqual([item["custom_id"] for item in body["requests"]], ["c1", "c2"])
+        # Every request inherits the batch-level model; naming it per request
+        # is at best redundant and at worst a rejected submission.
+        for item in body["requests"]:
+            self.assertNotIn("model", item["body"])
+
+    def test_submit_sends_the_bearer_header(self):
+        # The header lives in the real transport, so this exercises the default
+        # one through a stubbed urlopen rather than the fake.
+        captured = {}
+
+        class _Response:
+            status = 202
+
+            def read(self):
+                return json.dumps(_batch_object("validating")).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request):
+            captured["headers"] = dict(request.header_items())
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["data"] = request.data
+            return _Response()
+
+        backend = OpenRouterBatchBackend(
+            model="z-ai/glm-5.3-flash:batch", api_key="sk-or-xxx")
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            batch_id = backend.submit(_requests_for_one_model())
+
+        self.assertEqual(batch_id, OPENROUTER_BATCH_ID)
+        headers = {key.lower(): value for key, value in captured["headers"].items()}
+        self.assertEqual(headers["authorization"], "Bearer sk-or-xxx")
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["url"], "https://openrouter.ai/api/beta/batches")
+
+    def test_submit_accepts_200_as_well_as_202(self):
+        transport = _FakeTransport([(200, _batch_object("validating"))])
+        backend = self._backend(transport)
+        self.assertEqual(backend.submit(_requests_for_one_model()), OPENROUTER_BATCH_ID)
+
+    def test_submit_failure_names_the_status_code_and_body(self):
+        transport = _FakeTransport([
+            (400, {"error": {"message": "requests must not precede model"}})])
+        backend = self._backend(transport)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            backend.submit(_requests_for_one_model())
+
+        message = str(ctx.exception)
+        self.assertIn("400", message)
+        self.assertIn("requests must not precede model", message)
+
+    def test_submit_honours_a_custom_base_url(self):
+        transport = _FakeTransport([(202, _batch_object("validating"))])
+        backend = OpenRouterBatchBackend(
+            model="z-ai/glm-5.3-flash:batch", api_key="sk-or-xxx",
+            base_url="https://proxy.internal/api/beta/", transport=transport)
+
+        backend.submit(_requests_for_one_model())
+
+        self.assertEqual(transport.calls[0][1], "https://proxy.internal/api/beta/batches")
+
+    def test_status_is_normalized_for_every_documented_state(self):
+        cases = {
+            "validating": "in_progress",
+            "in_progress": "in_progress",
+            "finalizing": "in_progress",
+            "completed": "completed",
+            "failed": "failed",
+            "expired": "failed",
+            "cancelling": "failed",
+            "cancelled": "failed",
+        }
+        for raw, expected in cases.items():
+            transport = _FakeTransport([(200, _batch_object(raw))])
+            backend = self._backend(transport)
+            self.assertEqual(backend.status(OPENROUTER_BATCH_ID), expected, raw)
+            self.assertEqual(
+                transport.calls[0],
+                ("GET", f"https://openrouter.ai/api/beta/batches/{OPENROUTER_BATCH_ID}", None))
+
+    def test_collect_maps_inline_results_in_one_request(self):
+        transport = _FakeTransport([(200, _batch_object("completed", results=[
+            _ok_result("c1", "first answer"),
+            _ok_result("c2", "second answer"),
+        ]))])
+        backend = self._backend(transport)
+
+        results = backend.collect(OPENROUTER_BATCH_ID)
+
+        self.assertEqual(results, {"c1": "first answer", "c2": "second answer"})
+        # Results ride along with the status in one GET; a second call would be
+        # a round trip for data already in hand.
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_collect_maps_failed_items_to_none(self):
+        errored = {
+            "id": "gen-c2", "custom_id": "c2", "response": None,
+            "error": {"message": "context length exceeded"},
+        }
+        server_error = {
+            "id": "gen-c3", "custom_id": "c3",
+            "response": {"status_code": 500, "request_id": "req-3", "body": {}},
+            "error": None,
+        }
+        no_choices = {
+            "id": "gen-c4", "custom_id": "c4",
+            "response": {"status_code": 200, "request_id": "req-4",
+                         "body": {"choices": []}},
+            "error": None,
+        }
+        transport = _FakeTransport([(200, _batch_object("completed", results=[
+            _ok_result("c1", "fine"), errored, server_error, no_choices,
+        ]))])
+        backend = self._backend(transport)
+
+        results = backend.collect(OPENROUTER_BATCH_ID)
+
+        self.assertEqual(
+            results, {"c1": "fine", "c2": None, "c3": None, "c4": None})
+
+    def test_collect_before_completed_raises(self):
+        # results is null while the batch runs, which is exactly why collect
+        # must refuse rather than return an empty mapping.
+        transport = _FakeTransport([(200, _batch_object("in_progress"))])
+        backend = self._backend(transport)
+
+        with self.assertRaises(BatchNotReady) as ctx:
+            backend.collect(OPENROUTER_BATCH_ID)
+
+        self.assertIn(OPENROUTER_BATCH_ID, str(ctx.exception))
+        self.assertIn("in_progress", str(ctx.exception))
+        self.assertEqual(len(transport.calls), 1)
+
+
+class OpenRouterOrphanRecoveryTests(unittest.TestCase):
+    """An OpenRouter batch id must never be swept up by the local-batch repair.
+
+    A cloud batch survives the CLI process: it is running on OpenRouter's
+    servers for up to 24h and is genuinely collectable later, so returning its
+    cards to ``pending`` would silently duplicate the work (and the spend).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-openrouter-")
+        self.store = DeckStore(project_root=self.tmp)
+        self.store.add_card({
+            "custom_id": "a",
+            "meta": {"intent": "generate", "target": "a.py", "context_slice": []},
+            "instruction": "do a",
+        })
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_openrouter_batch_id_is_not_recovered(self):
+        state = self.store.load_state()
+        state["phase"] = "submitted"
+        state["generations"] = [["a"]]
+        state["batch_id"] = OPENROUTER_BATCH_ID
+        state["backend_label"] = "glm"
+        state["submitted_ids"] = ["a"]
+        self.store.save_state(state)
+
+        self.assertFalse(recover_orphaned_local_batch(self.store))
+
+        state = self.store.load_state()
+        self.assertEqual(state["phase"], "submitted")
+        self.assertEqual(state["batch_id"], OPENROUTER_BATCH_ID)
+        self.assertEqual(state["submitted_ids"], ["a"])
+
+
 # -- Local emulation ---------------------------------------------------------
 
 
@@ -334,6 +613,49 @@ class RegistryBatchTests(unittest.TestCase):
             self.assertIsInstance(registry.batch("gpt"), OpenAIBatchBackend)
             self.assertIsInstance(registry.batch("claude"), AnthropicBatchBackend)
             self.assertIsInstance(registry.batch("local"), LocalBatchBackend)
+
+    def test_openrouter_is_configured_and_batched(self):
+        env = {
+            "MRPH_PROCESSOR_glm_TYPE": "openrouter",
+            "MRPH_PROCESSOR_glm_API_KEY": "sk-or-xxx",
+            "MRPH_PROCESSOR_glm_MODEL": "z-ai/glm-5.3-flash:batch",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            registry = ProcessorRegistry.from_env()
+            self.assertIn("glm", registry.ids)
+            self.assertEqual(
+                registry.get("glm").describe(),
+                '[glm] OpenRouter (model "z-ai/glm-5.3-flash:batch")')
+
+            backend = registry.batch("glm")
+            self.assertIsInstance(backend, OpenRouterBatchBackend)
+            self.assertEqual(backend.model, "z-ai/glm-5.3-flash:batch")
+            self.assertEqual(backend.base_url, "https://openrouter.ai/api/beta")
+
+    def test_openrouter_base_url_overrides_the_batch_path(self):
+        env = {
+            "MRPH_PROCESSOR_glm_TYPE": "openrouter",
+            "MRPH_PROCESSOR_glm_API_KEY": "sk-or-xxx",
+            "MRPH_PROCESSOR_glm_MODEL": "z-ai/glm-5.3-flash:batch",
+            "MRPH_PROCESSOR_glm_BASE_URL": "https://proxy.internal/api/beta",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            registry = ProcessorRegistry.from_env()
+            self.assertEqual(
+                registry.batch("glm").base_url, "https://proxy.internal/api/beta")
+
+    def test_openrouter_needs_both_a_key_and_a_model(self):
+        # The model slug picks the vendor AND the price tier, so there is no
+        # sensible default to fall back to: an incomplete block is skipped.
+        for missing in ("MRPH_PROCESSOR_glm_API_KEY", "MRPH_PROCESSOR_glm_MODEL"):
+            env = {
+                "MRPH_PROCESSOR_glm_TYPE": "openrouter",
+                "MRPH_PROCESSOR_glm_API_KEY": "sk-or-xxx",
+                "MRPH_PROCESSOR_glm_MODEL": "z-ai/glm-5.3-flash:batch",
+            }
+            del env[missing]
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(ProcessorRegistry.from_env().ids, [], missing)
 
     def test_batch_pool_spans_several_local_nodes(self):
         env = {
