@@ -25,6 +25,7 @@ from cards.hazards import (
     format_hazards,
 )
 from cards.generations import ensure_parent_dir, is_truncated_response, run_deck
+from cards.runs_view import format_run_report
 from cards.store import (
     DeckStore,
     StoreError,
@@ -577,7 +578,7 @@ class MorphBot(ConsoleBot):
 /exit - Exit the application gracefully.
 
 Morph 2.0 batch orchestrator (see documentation/batch-orchestrator.md):
-/deck - Show the backlog, its generations and each card's status ("/deck check" reports file ownership -- which cards of one generation contend for one file; "/deck reset" discards the run state, keeping the backlog; "/deck clear" empties the backlog, keeping the run state; "/deck runs" lists the archived runs).
+/deck - Show the backlog, its generations and each card's status ("/deck check" reports file ownership -- which cards of one generation contend for one file; "/deck reset" discards the run state, keeping the backlog; "/deck clear" empties the backlog, keeping the run state; "/deck runs" lists the archived runs; "/deck runs <deck-id>" prints one archived run card by card).
 /card - Add a card: "/card" pastes one as JSON; "/card <goal>" decomposes a goal into cards.
 /submit - Compile and submit the current generation ("@id" pins a processor, "@all" the local pool).
 /collect - Fetch, verify and integrate the submitted generation, then advance ("/collect wait" polls until it lands, printing progress).
@@ -998,6 +999,36 @@ every slot is busy. /settings shows what is idle, busy or queued.
         lines.append("  Each run's deck and report: .morph/runs/<deck-id>/")
         return "\n".join(lines)
 
+    @staticmethod
+    def _run_report_text(deck_id):
+        """Render ``/deck runs <deck-id>``: one archived run, card by card.
+
+        The sibling of :meth:`_runs_text`: the listing answers "what has this
+        project run", this answers "what happened in THAT run". Every per-card
+        line comes from :func:`cards.runs_view.format_run_report` -- this only
+        reads ``.morph/runs/<deck-id>/report.json`` and prints what it returns,
+        indented under a heading, adding no formatting of its own. An identifier
+        with no archive is answered with one line naming the id and the way to
+        list the ones that exist: a typo in a deck id is a question, not a
+        failure, so nothing raises here and no traceback reaches the console.
+        """
+        report_path = os.path.join(".morph", "runs", deck_id, "report.json")
+        if not os.path.exists(report_path):
+            return (f"mrph> The run \"{deck_id}\" was not found -- run bare "
+                    f"/deck runs to see the archived runs there are.")
+        try:
+            with open(report_path, "r", encoding="utf-8") as handle:
+                report = json.load(handle)
+        except (OSError, ValueError) as error:
+            # A report that exists but cannot be read or parsed is news, not a
+            # crash: the archive is still on disk to be inspected there.
+            # ValueError covers json.JSONDecodeError, which subclasses it.
+            return (f"mrph> The report of run \"{deck_id}\" could not be read "
+                    f"({error}) -- it is at {report_path}.")
+        lines = [f"mrph> Archived run \"{deck_id}\", card by card:"]
+        lines.extend("    " + line for line in format_run_report(report))
+        return "\n".join(lines)
+
     def build_deck_transition(self):
         """``/deck`` shows the backlog; reset/clear/runs/check do more.
 
@@ -1020,6 +1051,14 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     chat_id=chat_id, text=self._deck_check_text())
                 return
             if len(arguments) > 1 and arguments[1].lower() == "runs":
+                # With a deck id, drill into that ONE archived run and print it
+                # card by card; without one, the listing below is served
+                # exactly as it always was.
+                if len(arguments) > 2:
+                    await action["context"].bot.send_message(
+                        chat_id=chat_id,
+                        text=self._run_report_text(arguments[2]))
+                    return
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=self._runs_text())
                 return
