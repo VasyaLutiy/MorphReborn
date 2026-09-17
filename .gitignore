@@ -5,4 +5,5 @@ venv
 .env
 build
 *.egg-info
-__pycache__.morph/
+__pycache__
+.morph/
