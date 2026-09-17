@@ -88,6 +88,11 @@ class _StubMorphBot:
     """The slice of ``MorphBot`` the three deck transitions actually use."""
 
     report_unexpected = staticmethod(MorphBot.report_unexpected)
+    # Phase 7: the transitions surface the store's git commentary (the branch a
+    # run opened, the commit each accepted card became) out of the log they
+    # otherwise discard.
+    git_notes = staticmethod(MorphBot.git_notes)
+    split_run_flags = staticmethod(MorphBot.split_run_flags)
 
     def __init__(self, backend, label="fake-processor"):
         self._active_backend = backend
@@ -217,9 +222,15 @@ class UnexpectedFailureTests(unittest.TestCase):
         self.assertEqual(len(self.nested_calls), 1)
         text = "\n".join(messages)
         self.assertIn("RuntimeError", text)
-        self.assertIn("the deck is unchanged", text)
-        # No run was recorded: the deck view still reads as never started.
-        self.assertEqual(self.store.load_state()["phase"], "idle")
+        self.assertIn("No outcome was recorded", text)
+        # No run was recorded: no card has an outcome and the deck view still
+        # reads as not-yet-submitted. (Phase 7: the run was OPENED before
+        # run_deck -- that is what a branch has to be -- so the composition is
+        # now in state.json; what must not be there is a result.)
+        state = self.store.load_state()
+        self.assertEqual(state["phase"], "idle")
+        self.assertEqual(state["outcomes"], {})
+        self.assertFalse(os.path.exists(os.path.join(".morph", "runs")))
 
 
 class _QueuedBackend:

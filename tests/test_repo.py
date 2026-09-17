@@ -146,6 +146,19 @@ class IsDirtyTests(_RepoCase):
         _write(self.tmp, "new.py", "print('new')\n")
         self.assertTrue(is_dirty(self.tmp))
 
+    def test_an_excluded_directory_does_not_make_the_tree_dirty(self):
+        # The case the caller needs: the orchestrator's own bookkeeping was
+        # written seconds ago (appending a card IS a change to it), and a run
+        # that counted it would refuse every deck that had just been planned.
+        _write(self.tmp, ".morph/deck.json", "[]\n")
+        self.assertTrue(is_dirty(self.tmp))
+        self.assertFalse(is_dirty(self.tmp, exclude=(".morph",)))
+
+    def test_excluding_one_directory_hides_nothing_else(self):
+        _write(self.tmp, ".morph/deck.json", "[]\n")
+        _write(self.tmp, "a.py", "print('an engineer was here')\n")
+        self.assertTrue(is_dirty(self.tmp, exclude=(".morph",)))
+
     def test_a_plain_directory_raises(self):
         plain = tempfile.mkdtemp(prefix="morph-plain-")
         try:

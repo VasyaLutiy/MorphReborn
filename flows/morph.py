@@ -22,8 +22,11 @@ from cards.generations import ensure_parent_dir, is_truncated_response, run_deck
 from cards.store import (
     DeckStore,
     StoreError,
+    begin_run,
     build_deck_status,
     collect_generation,
+    list_runs,
+    make_card_committer,
     record_run,
     recover_orphaned_local_batch,
     submit_generation,
@@ -231,6 +234,40 @@ class MorphBot(ConsoleBot):
         tokens = [token.lstrip("@") for token in re.split(r"[\s,]+", parts[1].strip())]
         tokens = [token for token in tokens if token]
         return tokens or None
+
+    @staticmethod
+    def split_run_flags(text):
+        """Split a ``/submit`` / ``/nightly`` line into ``(text, use_git)``.
+
+        The one flag is ``nogit``: this run opens no branch and writes no
+        commits. WHY a word on the command that STARTS a run, rather than a
+        setting or a new command (the ``/deck reset`` and ``/collect wait``
+        pattern): the decision belongs to one run, is taken at the moment the run
+        begins, and is exactly the answer to the refusal a dirty tree produces --
+        so the message that refuses can name the words that proceed anyway.
+
+        The flag is stripped BEFORE :meth:`resolve_batch_backend` sees the line,
+        because that reads every remaining token as a processor id and would
+        answer "no matching processor" to a bare ``/submit nogit``.
+        """
+        if not text:
+            return text, True
+        tokens = text.split()
+        remaining = [token for token in tokens[1:] if token.lower() != "nogit"]
+        use_git = len(remaining) == len(tokens) - 1
+        return " ".join(tokens[:1] + remaining), use_git
+
+    @staticmethod
+    def git_notes(lines):
+        """The git lines a store call logged, for the chat.
+
+        The store logs a running commentary the CLI otherwise discards (it
+        renders its own summary from the returned result), but the git lines
+        report things no result object carries -- which branch the run opened,
+        which card became which commit, what git refused. Selecting them by
+        prefix keeps that one channel open without reopening the rest.
+        """
+        return [line for line in lines if line.startswith("mrph> git:")]
 
     @staticmethod
     def resolve_processor_ids(registry, spec):
@@ -510,11 +547,25 @@ class MorphBot(ConsoleBot):
 /exit - Exit the application gracefully.
 
 Morph 2.0 batch orchestrator (see documentation/batch-orchestrator.md):
-/deck - Show the backlog, its generations and each card's status ("/deck reset" discards the run state, keeping the backlog).
+/deck - Show the backlog, its generations and each card's status ("/deck reset" discards the run state, keeping the backlog; "/deck runs" lists the archived runs).
 /card - Add a card: "/card" pastes one as JSON; "/card <goal>" decomposes a goal into cards.
 /submit - Compile and submit the current generation ("@id" pins a processor, "@all" the local pool).
 /collect - Fetch, verify and integrate the submitted generation, then advance ("/collect wait" polls until it lands, printing progress).
 /nightly - Run the whole deck generation by generation in one blocking pass.
+
+Git (a run is a branch, a card is a commit):
+    In a git working copy a run opens "morph/<deck-id>" from the current HEAD
+    and commits each accepted card on its own -- exactly the files that card
+    wrote, with its custom_id, model, winning variant and acceptance command in
+    the commit trailers, so "git log" answers where a line came from and
+    "git checkout" undoes the run. A dirty tree refuses to start the run.
+    /submit nogit  (or /nightly nogit) - run without touching git at all: no
+    branch, no commits. Decided when the run STARTS; a later /submit of the same
+    run follows what the first one chose. Outside a git repository, or with no
+    git on PATH, a run degrades to exactly this with one warning line.
+    When a run finishes it is archived under .morph/runs/<deck-id>/ (the deck as
+    executed plus a report of every card's outcome) and "/deck runs" lists what
+    has run.
 
 Choosing processors (multi-agent):
     /generate            - ride the round-robin pool (whichever processor is free next).
@@ -827,18 +878,54 @@ every slot is busy. /settings shows what is idle, busy or queued.
             lines.append(f"    {custom_id:24} {status}{detail}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _runs_text():
+        """Render ``/deck runs``: the archived runs, newest first.
+
+        The backlog view answers "what is the deck doing now"; this one answers
+        "what has this project run", which until the archive existed nothing
+        could -- each run overwrote the last. One line per run, carrying the id
+        (which is also the archive directory and the branch suffix), when it
+        finished, how big it was, how it went, and the branch to check out to see
+        it.
+        """
+        reports = list_runs(DeckStore("."))
+        if not reports:
+            return ("mrph> No archived runs yet. A run is archived under "
+                    ".morph/runs/<deck-id>/ the moment it finishes -- the deck "
+                    "as executed, plus a report of what happened to each card.")
+        lines = [f"mrph> {len(reports)} archived run(s), newest first:"]
+        for report in reports:
+            counts = report.counts
+            lines.append(
+                # The stored timestamp carries milliseconds so two runs of the
+                # same second still sort; a reader does not need them.
+                f"    {report.deck_id}  {report.completed_at[:19]}  "
+                f"{len(report.outcomes)} card(s): "
+                f"{counts['written']} written, {counts['failed']} failed, "
+                f"{counts['skipped']} skipped"
+                f"{'  branch ' + report.branch if report.branch else '  (no branch)'}")
+        lines.append("  Each run's deck and report: .morph/runs/<deck-id>/")
+        return "\n".join(lines)
+
     def build_deck_transition(self):
-        """``/deck`` shows the backlog; ``/deck reset`` discards the run state.
+        """``/deck`` shows the backlog; ``/deck reset`` and ``/deck runs`` do more.
 
         The reset is the only way out of a run the user wants to abandon (a deck
         already ``done``, or a batch that cannot be collected any more): the
-        backlog stays, every card goes back to ``pending``. An argument to
-        ``/deck`` other than ``reset`` is ignored -- bare ``/deck`` is a status
-        view and stays one.
+        backlog stays, every card goes back to ``pending``. ``runs`` lists the
+        archived runs instead of the backlog -- the history the backlog view
+        cannot show, since ``deck.json`` only ever holds the current one. Any
+        other argument to ``/deck`` is ignored -- bare ``/deck`` is a status view
+        and stays one.
         """
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
             arguments = (action.get("text") or "").split()
+            if len(arguments) > 1 and arguments[1].lower() == "runs":
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=self._runs_text())
+                return
             if len(arguments) > 1 and arguments[1].lower() == "reset":
                 store = DeckStore(".")
                 store.reset_state()
@@ -981,7 +1068,8 @@ every slot is busy. /settings shows what is idle, busy or queued.
     def build_submit_transition(self, nested_transition):
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
-            backend, label = self.resolve_batch_backend(action.get("text"))
+            spec, use_git = self.split_run_flags(action.get("text"))
+            backend, label = self.resolve_batch_backend(spec)
             if backend is None:
                 await action["context"].bot.send_message(chat_id=chat_id, text=label)
                 await nested_transition(action)
@@ -999,12 +1087,13 @@ every slot is busy. /settings shows what is idle, busy or queued.
                          "restart; its cards are pending again.")
 
             loop = asyncio.get_event_loop()
+            notes = []
             try:
                 result = await loop.run_in_executor(
                     None,
                     functools.partial(submit_generation, store, backend,
                                       root=".", backend_label=label,
-                                      log=lambda line: None))
+                                      use_git=use_git, log=notes.append))
             except StoreError as error:
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=f"mrph> {error}")
@@ -1030,7 +1119,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
 
             if result.submitted:
                 self._active_backend = backend
-                lines = [
+                lines = self.git_notes(notes) + [
                     f"mrph> Submitted generation {result.generation_number}/"
                     f"{result.total_generations} on \"{label}\" (batch {result.batch_id}):",
                     f"    cards: {', '.join(result.card_ids)}",
@@ -1041,7 +1130,8 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 text = "\n".join(lines)
             else:
                 self._active_backend = None
-                lines = ["mrph> Nothing to submit -- the deck run is complete."]
+                lines = self.git_notes(notes) + [
+                    "mrph> Nothing to submit -- the deck run is complete."]
                 for custom_id, dependency in result.skipped:
                     lines.append(f"    skipped {custom_id} (dependency {dependency})")
                 text = "\n".join(lines)
@@ -1108,11 +1198,12 @@ every slot is busy. /settings shows what is idle, busy or queued.
             loop = asyncio.get_event_loop()
             started = time.monotonic()
             while True:
+                notes = []
                 try:
                     result = await loop.run_in_executor(
                         None,
                         functools.partial(collect_generation, store, backend,
-                                          root=".", log=lambda line: None))
+                                          root=".", log=notes.append))
                 except StoreError as error:
                     await send(f"mrph> {error}")
                     break
@@ -1148,12 +1239,21 @@ every slot is busy. /settings shows what is idle, busy or queued.
                             lines.append(f"    {custom_id}: skipped (dependency {outcome.reason})")
                         else:
                             lines.append(f"    {custom_id}: {outcome.status}")
+                    lines.extend(self.git_notes(notes))
                     if result.phase == "done":
                         lines.append("mrph> The deck run is complete.")
                     else:
                         lines.append("mrph> Run /submit to send the next generation.")
                     await send("\n".join(lines))
                     break
+
+                # A generation is not always collected in one go: a card that
+                # passed acceptance is committed even when a generation-mate is
+                # being regenerated. Those commits are news now, not when the
+                # generation finally lands.
+                interim = self.git_notes(notes)
+                if interim:
+                    await send("\n".join(interim))
 
                 if not waiting:
                     await send(describe_collect_progress(result))
@@ -1190,7 +1290,8 @@ every slot is busy. /settings shows what is idle, busy or queued.
     def build_nightly_transition(self, nested_transition):
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
-            backend, label = self.resolve_batch_backend(action.get("text"))
+            spec, use_git = self.split_run_flags(action.get("text"))
+            backend, label = self.resolve_batch_backend(spec)
             if backend is None:
                 await action["context"].bot.send_message(chat_id=chat_id, text=label)
                 await nested_transition(action)
@@ -1205,42 +1306,70 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 await nested_transition(action)
                 return
 
+            # The branch has to exist before the first morph is written, and
+            # /nightly writes them all inside one blocking call -- so the run is
+            # opened here, and the commit hook built from what it returns.
+            notes = []
+            try:
+                run_state = begin_run(store, cards, root=".", use_git=use_git,
+                                      backend_label=label, log=notes.append)
+            except StoreError as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=f"mrph> {error}")
+                await nested_transition(action)
+                return
+            git_lines = self.git_notes(notes)
+
             await action["context"].bot.send_message(
                 chat_id=chat_id,
-                text=f"mrph> Nightly run of {len(cards)} card(s) on \"{label}\" -- "
-                     f"submitting and polling each generation to completion...")
+                text="\n".join(git_lines + [
+                    f"mrph> Nightly run of {len(cards)} card(s) on \"{label}\" -- "
+                    f"submitting and polling each generation to completion..."]))
+            del notes[:]  # reported; what follows is the run's own commentary
 
             loop = asyncio.get_event_loop()
             try:
                 result = await loop.run_in_executor(
                     None,
                     functools.partial(run_deck, cards, backend, root=".",
-                                      log=lambda line: None))
+                                      log=notes.append,
+                                      on_accepted=make_card_committer(
+                                          ".", run_state, notes.append)))
             except (CardError, DeckError) as error:
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=f"mrph> Backlog is invalid: {error}")
                 await nested_transition(action)
                 return
             except Exception as error:
-                # An overnight run is exactly where a crash costs the most. The
-                # run state is left untouched (``record_run`` below never ran),
-                # so /deck still shows the deck as it was and the user can fix
-                # the offending card and start again.
+                # An overnight run is exactly where a crash costs the most. No
+                # outcome is recorded (``record_run`` below never ran) and the
+                # run is not archived, so the user can fix the offending card and
+                # start again -- but the run WAS opened, so whatever cards were
+                # accepted before the crash are already commits on its branch,
+                # and the branch is still what is checked out.
                 await action["context"].bot.send_message(
                     chat_id=chat_id,
                     text=self.report_unexpected(
                         error, "running the deck",
-                        "mrph> The run state was not recorded -- the deck is "
-                        "unchanged and /nightly (or /submit) can be run again."))
+                        "mrph> No outcome was recorded and the run was not "
+                        "archived; /nightly (or /submit) can be run again. "
+                        "/deck reset discards the run state -- any cards "
+                        "accepted before the failure are already commits, and "
+                        "that branch stays checked out."))
                 await nested_transition(action)
                 return
 
             # Persist what just happened: /nightly writes every morph to disk,
             # so the run state must say so too -- otherwise the next /deck reads
-            # "idle, everything pending" for work that is finished.
-            record_run(store, result, backend_label=label)
+            # "idle, everything pending" for work that is finished. The same call
+            # archives the run under .morph/runs/<deck-id>/ and commits that
+            # record as the branch's final commit.
+            record_run(store, result, backend_label=label, root=".",
+                       run_state=run_state, log=notes.append)
             self._active_backend = None
-            await action["context"].bot.send_message(chat_id=chat_id, text="mrph> " + str(result))
+            await action["context"].bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(self.git_notes(notes) + ["mrph> " + str(result)]))
             await nested_transition(action)
 
         return transition

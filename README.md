@@ -206,7 +206,9 @@ batch executors, generation by generation. Five commands drive it:
 - `/deck` — show the backlog, its generation ordering, and each card's status
   (`pending` / `in_flight` / `written` / `failed` / `skipped`). `/deck reset`
   discards the run state and keeps the backlog: the way out of a finished run,
-  or of a batch that can no longer be collected.
+  or of a batch that can no longer be collected. `/deck runs` lists the archived
+  runs instead — newest first, with each run's id, size, outcome tally and
+  branch.
 - `/card` — add a card. `/card` alone prompts you to paste one morph card as
   JSON; `/card <goal text>` runs **decomposition mode**, asking the orchestrator
   to unfold a goal into a reviewed set of cards.
@@ -226,6 +228,62 @@ batch executors, generation by generation. Five commands drive it:
   guess whether a 40-minute queue is slow or hung.
 - `/nightly` — run the entire deck in one blocking pass (submit → poll →
   collect, generation after generation) and print the run summary.
+
+### A run is a branch, a card is a commit
+
+In a git working copy a run does not write into your tree undifferentiated. It
+opens `morph/<deck-id>` from the current HEAD and commits **each accepted card
+on its own** — exactly the files that card wrote, nothing else — with the card's
+provenance in the commit trailers:
+
+```
+morph cover-parity: parity.py, tests/test_parity.py
+
+Morph-Card: cover-parity
+Morph-Model: z-ai/glm-5.3-flash:batch
+Morph-Variant: cover-parity.v2
+Morph-Acceptance: PYTHONPATH=. python3 tests/test_parity.py
+Morph-Acceptance-Exit: 0
+```
+
+So `git log` answers "where did this line come from, and what proved it works",
+and `git checkout main` undoes a whole run without hand-cleaning the tree. The
+deck id is a timestamp plus a short digest of the backlog
+(`20260917-114233-9f1c4b02`), which both sorts chronologically and names the run
+in one word.
+
+The rules around it:
+
+- **A dirty tree refuses to start a run.** Starting there would make the run's
+  commits indistinguishable from your unfinished edits, and the `git checkout`
+  promise would quietly stop holding. Commit or stash (`git stash -u`) — or say
+  you accept the mess, below. Your `.morph/` directory does not count as dirty:
+  the deck you just wrote is the reason you are running.
+- **`/submit nogit` (and `/nightly nogit`) opts out entirely** — no branch, no
+  commits, the morphs land in the working tree as they always did. The choice is
+  made when the run *starts*; a later `/submit` of the same run follows it.
+- **Outside a repository nothing changes.** A plain directory, or a machine with
+  no `git` on `PATH`, runs exactly as before with one warning line at run start.
+- A card whose morph rewrote a file byte-identically changed nothing and gets no
+  commit. A card that fails acceptance is rolled back whole, so a failed
+  three-target card leaves `git status` clean.
+- Hooks are not bypassed and nothing is ever force-added: if a `pre-commit` hook
+  rejects a card, you are told which card is written but uncommitted, and the run
+  carries on.
+
+### A finished run is archived
+
+When a run finishes it is written to `.morph/runs/<deck-id>/` — `deck.json`, the
+deck **as executed**, and `report.json`, every card's outcome plus the generation
+composition, the batch ids and the branch. The archive is append-only: a later
+run never rewrites an earlier directory, so yesterday's three-card patch deck is
+still there next week. `/deck runs` lists what has run; on a branch, the deck and
+report are committed as the run's final commit, so "what was asked" and "what
+happened" live in the same history as the code.
+
+(If your project ignores `.morph/`, that ignore is respected: the archive is
+written to disk and the commit is skipped with a note. Add `!.morph/runs/` to
+your `.gitignore` if you want run records in git.)
 
 ### Cloud executors
 
@@ -253,6 +311,8 @@ a `/nightly` run, whose outcomes `/deck` reports afterwards. A *local* batch is
 the exception: it lives in the worker threads of the process that fired it, so if
 the CLI is restarted between `/submit` and `/collect` its cards are quietly
 returned to `pending` for the next `/submit` — a regeneration batch included.
+The morning review is then a branch to read: `git log morph/<deck-id>`, one
+commit per card, with the failure report in `.morph/runs/<deck-id>/report.json`.
 
 See [`documentation/batch-orchestrator.md`](./documentation/batch-orchestrator.md)
 for the design, [`documentation/NEW_PARADIGN.md`](./documentation/NEW_PARADIGN.md)

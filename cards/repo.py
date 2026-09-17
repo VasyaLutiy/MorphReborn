@@ -136,7 +136,7 @@ def is_git_repo(root: str) -> bool:
     return code == 0 and stdout.strip() == "true"
 
 
-def is_dirty(root: str) -> bool:
+def is_dirty(root: str, exclude: Sequence[str] = ()) -> bool:
     """Does the working copy hold changes a run would bury?
 
     True for an uncommitted change to a tracked file (staged or not) and for an
@@ -153,9 +153,21 @@ def is_dirty(root: str) -> bool:
     rather than left to default: a repository configured with
     ``status.showUntrackedFiles=no`` would otherwise report a tree full of
     unsaved new files as clean, and blind us exactly where it matters most.
+
+    ``exclude`` lists directories or files whose state is not the engineer's
+    work in progress and must not stand in the way of a run. WHY it has to
+    exist: the orchestrator's OWN bookkeeping directory is written seconds
+    before the run starts -- appending a card is a change to it -- so a check
+    that counted it would refuse every run that had just been planned, which is
+    all of them. It is a parameter rather than a constant here because this
+    module knows nothing about ``.morph/`` on purpose; the caller names what is
+    its own. Each entry becomes a git ``:(exclude)`` pathspec, so it is matched
+    by git's own path rules, not by string surgery on status output.
     """
-    _code, stdout, _stderr = _git(
-        root, ["status", "--porcelain", "--untracked-files=normal", "--ignored=no"])
+    args = ["status", "--porcelain", "--untracked-files=normal", "--ignored=no"]
+    if exclude:
+        args += ["--", "."] + [f":(exclude){path}" for path in exclude]
+    _code, stdout, _stderr = _git(root, args)
     return bool(stdout.strip())
 
 

@@ -56,7 +56,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from cards.compiler import compile_card
 from cards.schema import MorphCard
@@ -142,6 +142,31 @@ class CardOutcome:
         return f"{self.custom_id}: failed"
 
 
+# The hook a run fires the instant one card is accepted -- ``(card, outcome)``,
+# with the outcome already recorded and its files final on disk.
+#
+# WHY a hook rather than a sweep over the finished ``outcomes`` map: the run's
+# git layer (:func:`cards.store.make_card_committer`) commits exactly the files
+# one card wrote, and "exactly" only holds at THIS moment. A patch chain --
+# card A writes ``foo.py`` in generation 1, card B rewrites it in generation 2 --
+# has one true state of ``foo.py`` per card, and a commit taken afterwards would
+# attribute B's content to A and then find nothing left to commit for B. So the
+# accepted card is committed where it is accepted, before the next one runs.
+#
+# The hook is called for accepted cards only (a failed card has nothing on disk
+# to record, a skipped one never ran), it may not raise -- a run must not die of
+# its bookkeeping -- and a run that passes none behaves exactly as before.
+AcceptedHook = Callable[["MorphCard", "CardOutcome"], None]
+
+
+def _fire(on_accepted: Optional[AcceptedHook], card: "MorphCard",
+          outcome: "CardOutcome") -> None:
+    """Call the accepted-card hook, if any. Kept in one place so every
+    ``"written"`` branch below announces itself identically."""
+    if on_accepted is not None:
+        on_accepted(card, outcome)
+
+
 @dataclass
 class DeckResult:
     """A summary of one :func:`run_deck` execution.
@@ -151,10 +176,19 @@ class DeckResult:
     ``generations`` records the composition as executed: the ``custom_id``\\ s of
     each generation, index ``0`` first. The Phase 5 ``/deck`` status view builds
     on this.
+
+    ``batch_ids`` lists every batch this run submitted, in submission order --
+    generation batches and regeneration batches alike. The split-step path keeps
+    the same list in ``state.json`` (one id is appended per ``/submit`` and per
+    persisted retry); recording it here gives ``/nightly`` the same facts, which
+    is what the run archive (:func:`cards.store.archive_run`) writes down: the
+    provider-side ids are the only way to go back and ask what a run actually
+    cost or why a batch failed.
     """
 
     outcomes: Dict[str, CardOutcome] = field(default_factory=dict)
     generations: List[List[str]] = field(default_factory=list)
+    batch_ids: List[str] = field(default_factory=list)
 
     def __str__(self) -> str:
         total = len(self.generations)
@@ -431,13 +465,19 @@ def ensure_parent_dir(path: str) -> None:
 
 def _submit_poll_collect(
     requests: List[dict], backend, poll_interval: float
-) -> Optional[Dict[str, Optional[str]]]:
+) -> Tuple[str, Optional[Dict[str, Optional[str]]]]:
     """Submit one batch, poll to completion, and collect -- or ``None`` on failure.
 
-    Returns the ``{custom_id: text|None}`` map on a completed batch, or ``None``
-    when the backend reports the whole batch ``"failed"`` (in which case there is
-    nothing to collect). Sleeps ``poll_interval`` between polls. ``backend`` is
-    duck-typed: only ``submit`` / ``status`` / ``collect`` are called.
+    Returns ``(batch_id, results)``: the ``{custom_id: text|None}`` map on a
+    completed batch, or ``None`` when the backend reports the whole batch
+    ``"failed"`` (in which case there is nothing to collect). Sleeps
+    ``poll_interval`` between polls. ``backend`` is duck-typed: only ``submit`` /
+    ``status`` / ``collect`` are called.
+
+    The batch id is returned alongside the results, rather than dropped once the
+    batch is drained, because it is the run's receipt: ``/nightly`` records it in
+    :class:`DeckResult` and the archive writes it down, so a finished run can
+    still be asked what it submitted.
     """
     batch_id = backend.submit(requests)
     while True:
@@ -446,8 +486,8 @@ def _submit_poll_collect(
             break
         time.sleep(poll_interval)
     if status == "failed":
-        return None
-    return backend.collect(batch_id)
+        return batch_id, None
+    return batch_id, backend.collect(batch_id)
 
 
 def _write_variants(
@@ -583,6 +623,8 @@ def process_generation(
     outcomes: Dict[str, CardOutcome],
     blocked: set,
     inline_retries: bool = True,
+    on_accepted: Optional[AcceptedHook] = None,
+    batch_ids: Optional[List[str]] = None,
 ) -> List[tuple]:
     """Turn one generation's collected ``results`` into outcomes (with retries).
 
@@ -608,6 +650,11 @@ def process_generation(
     batch, persist it and return -- an unfinished generation whose retry survives
     a restart, rather than an hour of silence inside one call. The returned list
     is empty whenever retries ran here or nothing needs one.
+
+    ``on_accepted`` (see :data:`AcceptedHook`) fires once per accepted card, at
+    the moment its files are final -- that is where the run's git layer turns a
+    card into a commit. ``batch_ids``, when given, is the list an inline retry
+    batch's id is appended to: the run's receipt of everything it submitted.
     """
     from cards.acceptance import verify_card
 
@@ -644,6 +691,7 @@ def process_generation(
                     f"written (variant {outcome.winning_custom_id!r} passed "
                     f"acceptance): {', '.join(outcome.paths)}"
                 )
+                _fire(on_accepted, card, outcomes[card.custom_id])
             elif max_regenerations > 0:
                 retry_pending.append((card, outcome.result))
             else:
@@ -668,6 +716,7 @@ def process_generation(
                     f"mrph> [generation {index}/{total}] {card.custom_id!r} "
                     f"written: {', '.join(written)}"
                 )
+                _fire(on_accepted, card, outcomes[card.custom_id])
             else:
                 outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
                 blocked.add(card.custom_id)
@@ -693,6 +742,8 @@ def process_generation(
         max_regenerations,
         outcomes,
         blocked,
+        on_accepted,
+        batch_ids,
     )
     return []
 
@@ -706,6 +757,7 @@ def run_deck(
     verify: bool = True,
     acceptance_timeout: float = 300.0,
     max_regenerations: int = 2,
+    on_accepted: Optional[AcceptedHook] = None,
 ) -> DeckResult:
     """Execute a deck generation by generation through one batch backend.
 
@@ -737,11 +789,18 @@ def run_deck(
     responses to judge) fails every card it carried terminally -- no retry. A
     failed or skipped card's transitive dependents are skipped.
 
+    ``on_accepted`` (see :data:`AcceptedHook`) fires as each card is accepted, so
+    a blocking ``/nightly`` pass produces the same per-card commits, in the same
+    order, as the split-step route -- the hook is the ONLY thing the two paths
+    need to share for that, since everything else about a commit is derived from
+    the card and its outcome.
+
     ``backend`` is duck-typed: only ``submit(requests) -> batch_id``,
     ``status(batch_id) -> str`` and ``collect(batch_id) -> {custom_id: text|None}``
     are called. Returns a :class:`DeckResult` whose ``generations`` records the
     static generation composition (retry batches are extra submits, not extra
-    generations).
+    generations) and whose ``batch_ids`` records every submission, retries
+    included.
     """
     generations = split_into_generations(cards)
     total = len(generations)
@@ -750,6 +809,7 @@ def run_deck(
     outcomes: Dict[str, CardOutcome] = {}
     # custom_ids that failed or were skipped: their dependents cannot run.
     blocked: set = set()
+    batch_ids: List[str] = []
 
     for index, generation in enumerate(generations, start=1):
         runnable = resolve_runnable(generation, index, total, outcomes, blocked, log)
@@ -768,7 +828,8 @@ def run_deck(
         for card in runnable:
             requests.extend(compile_card(card, root))
 
-        results = _submit_poll_collect(requests, backend, poll_interval)
+        batch_id, results = _submit_poll_collect(requests, backend, poll_interval)
+        batch_ids.append(batch_id)
 
         process_generation(
             runnable,
@@ -784,9 +845,12 @@ def run_deck(
             max_regenerations,
             outcomes,
             blocked,
+            inline_retries=True,
+            on_accepted=on_accepted,
+            batch_ids=batch_ids,
         )
 
-    return DeckResult(outcomes=outcomes, generations=composition)
+    return DeckResult(outcomes=outcomes, generations=composition, batch_ids=batch_ids)
 
 
 def _acceptance_output(result) -> Optional[str]:
@@ -835,6 +899,7 @@ def process_retry_batch(
     max_regenerations: int,
     outcomes: Dict[str, CardOutcome],
     blocked: set,
+    on_accepted: Optional[AcceptedHook] = None,
 ) -> List[tuple]:
     """Judge one retry batch's results; return what is still pending after it.
 
@@ -854,7 +919,10 @@ def process_retry_batch(
 
     Shared by the blocking loop (:func:`_run_retries`) and the persisted one
     (:func:`cards.store.collect_generation`), so an outcome reads the same
-    whichever route produced it.
+    whichever route produced it -- ``on_accepted`` (see :data:`AcceptedHook`)
+    included: a card accepted on its third attempt becomes a commit exactly as
+    one accepted on its first does, and the hook is handed the ORIGINAL card, not
+    the regenerated stand-in whose instruction carries an error message.
     """
     from cards.acceptance import verify_card
 
@@ -890,6 +958,7 @@ def process_retry_batch(
                 f"{outcome.winning_custom_id!r} passed): "
                 f"{', '.join(outcome.paths)}"
             )
+            _fire(on_accepted, card, outcomes[card.custom_id])
         elif attempt < max_regenerations:
             next_pending.append((card, outcome.result))
         else:
@@ -920,6 +989,8 @@ def _run_retries(
     max_regenerations: int,
     outcomes: Dict[str, CardOutcome],
     blocked: set,
+    on_accepted: Optional[AcceptedHook] = None,
+    batch_ids: Optional[List[str]] = None,
 ) -> None:
     """Regenerate cards that failed acceptance, up to ``max_regenerations`` times.
 
@@ -944,8 +1015,10 @@ def _run_retries(
         for retry_card in retry_cards:
             requests.extend(compile_card(retry_card, root))
 
-        results = _submit_poll_collect(requests, backend, poll_interval)
+        batch_id, results = _submit_poll_collect(requests, backend, poll_interval)
+        if batch_ids is not None:
+            batch_ids.append(batch_id)
 
         pending = process_retry_batch(
             retry_cards, pending, results, attempt, index, total, root, log,
-            acceptance_timeout, max_regenerations, outcomes, blocked)
+            acceptance_timeout, max_regenerations, outcomes, blocked, on_accepted)

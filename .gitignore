@@ -6,4 +6,5 @@ venv
 build
 *.egg-info
 __pycache__
-.morph/
+.morph/*
+!.morph/runs/
