@@ -1218,6 +1218,39 @@ def _record_retry(
     store.save_state(state)
 
 
+def _log_provider_rejection(backend, batch_id: str,
+                            log: Callable[[str], None]) -> None:
+    """Say why the provider rejected a batch, when the backend can say.
+
+    A batch that polls as ``"failed"`` reaches the rest of ``collect_generation``
+    as ``results = None``: every card of the generation is recorded failed, and
+    until now the log said nothing about why -- the reason sat on the batch
+    object the provider returned, readable only by hand
+    (:meth:`OpenRouterBatchBackend.failure_reason` surfaces it, e.g. ``HTTP 400:
+    invalid batch inference job: job-submission-count for account alex-79b5d6,
+    in use: 16, quota: 16``). This asks the backend for that message and logs it
+    once, naming the batch.
+
+    Deliberately defensive at both ends, because this is a diagnosis and must
+    never become a second way for collection to fail: the method is looked up
+    with :func:`getattr`, so the local, OpenAI and Anthropic backends -- which
+    have no ``failure_reason`` -- are skipped without a word; a backend whose
+    ``failure_reason`` raises is treated as one with nothing to say rather than
+    being allowed to break the collection that already succeeded in polling; and
+    a ``None``/empty answer prints nothing, because "no reason available" is not
+    a diagnosis.
+    """
+    ask = getattr(backend, "failure_reason", None)
+    if ask is None:
+        return
+    try:
+        message = ask(batch_id)
+    except Exception:
+        return
+    if message:
+        log(f"mrph> the provider rejected batch {batch_id}: {message}")
+
+
 def collect_generation(
     store: DeckStore,
     backend,
@@ -1289,6 +1322,15 @@ def collect_generation(
             retry_limit=max_regenerations,
             retry_card_ids=sorted(retries),
             retry_batch_id=batch_id if retries else None)
+
+    if status == "failed":
+        # The batch failed as a WHOLE: results will be None below and every card
+        # of the generation recorded failed. The provider often said why on the
+        # batch object itself; say it here, once, before the outcomes bury the
+        # question. The helper is defensive -- a backend with no
+        # failure_reason, or one whose failure_reason raises, must not turn a
+        # diagnosis into a second way for collection to fail.
+        _log_provider_rejection(backend, batch_id, log)
 
     cards = store.load_cards()
     by_id = {card.custom_id: card for card in cards}
