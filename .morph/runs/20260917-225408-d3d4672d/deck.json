@@ -1,0 +1,88 @@
+[
+  {
+    "custom_id": "repo-diffstat",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "cards/repo.py",
+        "tests/test_diffstat.py"
+      ],
+      "context_slice": [
+        "tests/test_repo.py"
+      ],
+      "acceptance": "venv/bin/python -c \"import sys;s=open('cards/repo.py').read();sys.exit(0 if s.count(chr(34)*3)>=24 else 1)\" && venv/bin/python -m pytest tests/test_diffstat.py -q && venv/bin/python -m pytest tests/ -q"
+    },
+    "instruction": "cards/repo.py has no way to report what a commit changed. Add exactly one function:\n\n    def diffstat(root: str, sha: str) -> List[dict]\n\nIt runs `git show --numstat --format= <sha>` through the existing _git helper of this module and returns, in git's own order, a list of {\"path\": str, \"insertions\": int | None, \"deletions\": int | None}.\n\n* git prints a binary file as `-\\t-\\t<path>`: those two fields become None, NOT 0. \"unknown\" and \"zero\" are different facts and the consumer distinguishes them.\n* the path is exactly as git prints it, relative to the repository root.\n* on a git failure raise GitError, like every other function in this module.\n\nFollow this module's existing style for invoking git and parsing its output. Do not add a subprocess call of your own, do not change any existing function, and do not change any existing signature.\n\nAlso write a NEW self-contained pytest tests/test_diffstat.py covering: a commit touching two files reports the right insertions and deletions per path; a commit adding a binary file reports None/None for it; an unknown sha raises GitError; the returned order is git's order. Build the throwaway git repository the way tests/test_repo.py already does -- reuse that idiom, do not invent a new one.\n\nPreserve every existing docstring and comment in cards/repo.py verbatim. This card is additive: it must not delete a single existing line."
+  },
+  {
+    "custom_id": "outcome-carries-commit",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "cards/generations.py",
+        "tests/test_outcome_diffstat_fields.py"
+      ],
+      "context_slice": [
+        "tests/test_generations.py"
+      ],
+      "acceptance": "venv/bin/python -c \"import sys;s=open('cards/generations.py').read();sys.exit(0 if s.count(chr(34)*3)>=64 else 1)\" && venv/bin/python -m pytest tests/test_outcome_diffstat_fields.py -q && venv/bin/python -m pytest tests/ -q"
+    },
+    "instruction": "cards/generations.py defines CardOutcome, which records how one card ended. It cannot say which commit the card became, nor what that commit changed. Add exactly two fields to CardOutcome:\n\n    commit: Optional[str] = None             # sha of this card's commit\n    diffstat: Optional[List[dict]] = None    # what cards.repo.diffstat returned\n\nBoth default to None so that NOT ONE existing construction site of CardOutcome anywhere in the project has to change. That is the whole point of the defaults: do not touch a single caller.\n\nDocument the two fields in the class docstring: they are filled only for a card that became a commit (a run in git mode) and stay None otherwise. EXTEND the docstring; do not rewrite it.\n\nAlso write a NEW self-contained pytest tests/test_outcome_diffstat_fields.py covering: a CardOutcome built with exactly the arguments callers used before still constructs, and both new fields are None; both fields accept and keep a sha and a list of diffstat dicts; both fields are settable after construction (CardOutcome is a mutable dataclass and a later card depends on that).\n\nPreserve every existing docstring and comment in cards/generations.py verbatim. This card is additive: it must not delete a single existing line."
+  },
+  {
+    "custom_id": "runs-view-formatter",
+    "meta": {
+      "intent": "generate",
+      "targets": [
+        "cards/runs_view.py",
+        "tests/test_runs_view.py"
+      ],
+      "context_slice": [
+        ".morph/runs/20260917-174646-f718dfe2/report.json"
+      ],
+      "acceptance": "venv/bin/python -m pytest tests/test_runs_view.py -q && venv/bin/python -m pytest tests/ -q"
+    },
+    "instruction": "Write a NEW module cards/runs_view.py: the pure formatting of one archived run report into the lines a CLI prints. It exists so the CLI wiring in flows/morph.py stays a handful of lines. It does no argument parsing, no filesystem access, no git and no printing -- those stay in the caller.\n\nExport exactly one function:\n\n    def format_run_report(report: dict) -> List[str]\n\n`report` is an archived .morph/runs/<deck-id>/report.json. A REAL one is in your slice: read it, it is the exact input. Its shape, so there is no guessing:\n* report[\"generations\"] is a list of generations, each a list of custom_id strings. Flattened in order, that is the order of the lines you return.\n* report[\"outcomes\"] is a DICT KEYED BY custom_id (not a list). Each outcome carries at least `custom_id`, `status`, `paths`, `reason`, `attempts`, `winning_variant` and -- for a card that became a commit -- the two new keys `commit` (a sha string) and `diffstat` (a list of {\"path\", \"insertions\", \"deletions\"}, where insertions and deletions are int, or None for a binary file).\n\nReturn one line per card, shaped exactly:\n\n    <custom_id>   <status>   +<insertions> -<deletions>   <sha[:10]>   <paths>\n\nwhere insertions and deletions are the sums over that card's `diffstat` entries skipping None values, `sha` comes from the card's `commit` field, and `paths` are the diffstat paths joined with \", \" -- falling back to the outcome's own `paths` when there is no diffstat.\n\nThree rules, all mandatory:\n* a card whose deletions exceed its insertions gets a mark appended at the end of its line -- a visible warning that the executor removed more than it added. It is a MARK, never a refusal: the card is still listed normally.\n* a card with no commit (a run made with nogit, or a card that changed nothing) prints `-` where the numbers and the sha would go, and must not raise.\n* every report written BEFORE `commit` and `diffstat` existed has neither key -- the one in your slice is exactly such a report. Read every field with .get(...) so an old report formats as the no-commit case instead of raising KeyError. A custom_id listed in `generations` but missing from `outcomes` must not raise either.\n\nAlso write a NEW self-contained pytest tests/test_runs_view.py covering all three rules, the happy path, and diffstat entries whose insertions/deletions are None. It builds its report dicts inline: no git, no temp repo, no filesystem.\n\nGive the module and the function real docstrings; they are the only documentation this seam will have."
+  },
+  {
+    "custom_id": "store-persists-diffstat",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "cards/store.py",
+        "tests/test_store_diffstat.py"
+      ],
+      "context_slice": [
+        "cards/repo.py",
+        "cards/generations.py",
+        "tests/test_run_git.py"
+      ],
+      "acceptance": "venv/bin/python -c \"import sys;s=open('cards/store.py').read();sys.exit(0 if s.count(chr(34)*3)>=84 else 1)\" && venv/bin/python -m pytest tests/test_store_diffstat.py -q && venv/bin/python -m pytest tests/ -q",
+      "depends_on": [
+        "repo-diffstat",
+        "outcome-carries-commit"
+      ]
+    },
+    "instruction": "cards/store.py must now carry the two new CardOutcome fields (`commit`, `diffstat`) to disk, and fill them. Two changes, both small.\n\n1. Serialization. `_outcome_to_dict` writes both fields. `_outcome_from_dict` reads both with .get(..., None), so that a state.json or report.json written BEFORE this change keeps loading. That backward compatibility is a requirement, not a nicety.\n\n2. `make_card_committer`. After a successful commit, when sha is not None:\n\n       outcome.commit = sha\n       outcome.diffstat = repo.diffstat(root, sha)\n\n   The hook must not be able to fail. It already promises exactly this in its docstring: a card that was accepted and is on disk must never be undone by bookkeeping. So catch GitError here, leave both fields None, and log one single line. Do not widen the hook's contract beyond that.\n\nWrite no other code. The mutation reaches disk by itself: CardOutcome is a mutable dataclass and both run routes save outcomes AFTER the hook has fired (process_generation -> _store_outcomes in collect_generation, and run_deck -> DeckResult -> record_run). Do not add plumbing for it -- prove it with a test instead.\n\nAlso write a NEW self-contained pytest tests/test_store_diffstat.py covering: _outcome_to_dict/_outcome_from_dict round-trip both fields; a dict written without the two keys still loads with both None; after a real commit the hook sets commit and diffstat on the outcome; a repo.diffstat that raises GitError leaves the card accepted with both fields None and does not propagate; and that the filled fields survive to disk on BOTH routes named above. Build the throwaway git repository the way tests/test_run_git.py already does -- reuse that idiom, do not invent a new one.\n\nPreserve every existing docstring and comment in cards/store.py verbatim. This card is additive."
+  },
+  {
+    "custom_id": "deck-runs-per-card",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "flows/morph.py",
+        "tests/test_deck_runs_view.py"
+      ],
+      "context_slice": [
+        "cards/runs_view.py",
+        "tests/test_deck_clear.py"
+      ],
+      "acceptance": "venv/bin/python -c \"import sys;s=open('flows/morph.py').read();sys.exit(0 if s.count(chr(34)*3)>=46 else 1)\" && venv/bin/python -m pytest tests/test_deck_runs_view.py -q && venv/bin/python -m pytest tests/ -q",
+      "variants": 2,
+      "depends_on": [
+        "runs-view-formatter"
+      ]
+    },
+    "instruction": "flows/morph.py handles `/deck runs`, which today lists the archived runs. Give it an argument.\n\nBare `/deck runs` must keep behaving EXACTLY as it does now. Do not touch that path.\n\n`/deck runs <deck-id>` loads .morph/runs/<deck-id>/report.json, hands it to cards.runs_view.format_run_report (already written -- it is in your slice) and prints the returned lines indented, one per card. ALL formatting lives in that function: do not reimplement any of it here and do not add formatting logic to this file.\n\nAn unknown identifier prints one clear line saying that run was not found, plus a hint to run bare `/deck runs` to see what there is. It must not raise and must not print a traceback.\n\nExtend the `/deck` line of the /help text with the new argument, in the voice of the lines around it.\n\nIMPORTANT, and measured: this file is 1729 lines long, and a previous card that added a command here silently broke fourteen tests in unrelated modules. So change ONLY the `/deck runs` branch and that one help string. Do not touch any other command, any other handler, or any import beyond the one you need. Preserve every existing docstring and comment in this file verbatim. This card is additive.\n\nAlso write a NEW self-contained pytest tests/test_deck_runs_view.py covering: bare `/deck runs` is unchanged; `/deck runs <id>` over an archive prints one line per card; an unknown id prints the not-found line and raises nothing. Drive the flow the way tests/test_deck_clear.py already does -- reuse that idiom, do not invent a new one."
+  }
+]
