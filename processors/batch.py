@@ -34,6 +34,7 @@ import abc
 import io
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -331,6 +332,24 @@ OPENROUTER_SUBMIT_GRACE_SECONDS = 60.0
 # socket, it does not police latency.
 OPENROUTER_HTTP_TIMEOUT_SECONDS = 120.0
 
+# The catalogue also lists ``:batch`` slugs that have NO batch endpoint behind
+# them: POSTing a deck pinned to one comes back as HTTP 400 with the sentence
+# "Model 'anthropic/claude-sonnet-5:batch' does not have a :batch endpoint."
+# -- measured on four Anthropic slugs. Left to the generic handler in
+# ``submit`` that reads as "submission failed with HTTP 400", indistinguishable
+# from a transient fault, and the whole generation dies for a reason that has
+# nothing to do with the cards. ``submit`` matches this phrase in the rejected
+# body and raises the configuration mistake by name instead; every other
+# rejection keeps the generic message untouched.
+OPENROUTER_NO_BATCH_ENDPOINT_MARKER = "does not have a :batch endpoint"
+
+# Pulls the offending slug out of that sentence, in either quote style. A body
+# that carries the phrase without a quoted slug falls back to the backend's own
+# configured model -- the setting that has to change either way.
+_OPENROUTER_BATCH_SLUG_IN_MESSAGE = re.compile(
+    r"['\"]([^'\"]+)['\"]\s*" + re.escape(OPENROUTER_NO_BATCH_ENDPOINT_MARKER),
+    re.IGNORECASE)
+
 
 class _BatchNotVisibleYet(RuntimeError):
     """Internal: a 404 for a just-submitted id, inside the grace period above.
@@ -439,6 +458,14 @@ class OpenRouterBatchBackend(BatchBackend):
     ``now`` is the second seam: a zero-arg clock, so the read-after-write grace
     period (see :data:`OPENROUTER_SUBMIT_GRACE_SECONDS`) can be tested without
     sleeping.
+
+    One submission rejection is special-cased: the catalogue lists ``:batch``
+    slugs that have no batch endpoint behind them, and OpenRouter answers a deck
+    pinned to one with HTTP 400 and ``"Model '...:batch' does not have a :batch
+    endpoint."`` -- a configuration mistake, not a transient fault. ``submit``
+    recognizes that sentence in the body and raises an error naming the slug and
+    saying a different model must be configured; every other rejected submission
+    keeps the generic message.
     """
 
     def __init__(self, model: str, api_key: str = None, base_url: str = None,
@@ -462,6 +489,13 @@ class OpenRouterBatchBackend(BatchBackend):
         # deck is queued, not run); 200 is accepted too, so a future change of
         # heart about the code does not wedge every deck.
         if status_code not in (200, 202):
+            slug = self._no_batch_endpoint_slug(body)
+            if slug is not None:
+                raise RuntimeError(
+                    f"OpenRouter batch submission rejected: the model slug "
+                    f"{slug!r} is listed in the model catalogue but has no "
+                    f"batch endpoint, so a different model must be configured "
+                    f"(HTTP {status_code}: {self._trim(body)})")
             raise RuntimeError(
                 f"OpenRouter batch submission failed with HTTP {status_code}: "
                 f"{self._trim(body)}")
@@ -469,6 +503,26 @@ class OpenRouterBatchBackend(BatchBackend):
         self._submitted_id = batch_id
         self._submitted_at = self._now()
         return batch_id
+
+    def _no_batch_endpoint_slug(self, body: dict) -> Optional[str]:
+        """The slug a rejected submission names, if this is the no-endpoint kind.
+
+        Scans the whole body text for
+        :data:`OPENROUTER_NO_BATCH_ENDPOINT_MARKER` rather than walking to
+        ``error.message``: the sentence is the stable part, the envelope around
+        it is not. Returns the slug the sentence quotes, or -- when the phrase
+        is present but no slug is quoted -- this backend's configured model,
+        which is the setting that has to change either way. ``None`` means the
+        body does not say this at all: an unrelated failure that must keep the
+        generic submission message.
+        """
+        text = json.dumps(body, ensure_ascii=False)
+        if OPENROUTER_NO_BATCH_ENDPOINT_MARKER not in text:
+            return None
+        match = _OPENROUTER_BATCH_SLUG_IN_MESSAGE.search(text)
+        if match:
+            return match.group(1)
+        return self.model
 
     def _retrieve(self, batch_id: str) -> dict:
         """GET one batch object, raising on anything but a 200.
