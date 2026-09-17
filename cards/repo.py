@@ -306,3 +306,73 @@ def commit_paths(
     _git(root, ["commit"] + _build_message(message, trailers) + ["--"] + relative)
     _code, head, _stderr = _git(root, ["rev-parse", "HEAD"])
     return head.strip()
+
+
+# -- what a commit changed ---------------------------------------------------
+
+
+def diffstat(root: str, sha: str) -> List[dict]:
+    """What the commit ``sha`` changed: one dict per file, in git's own order.
+
+    The run holds a sha from :func:`commit_paths`; this turns it into the
+    per-file footprint a report can quote, read straight out of git rather
+    than reconstructed from what the run thinks it wrote. The command is
+    ``git show --numstat --format= <sha>``: ``--numstat`` states added and
+    removed line counts as plain tab-separated fields, one line per path, and
+    the empty ``--format=`` removes the commit header so nothing but those
+    lines comes back.
+
+    A binary file is printed by git as ``-\\t-\\t<path>`` and arrives here with
+    ``None`` for both counts -- NOT 0. Git cannot count lines in a binary blob;
+    "cannot count" and "counted zero" are different facts, and the consumer is
+    entitled to the difference: a card that touched one image and no text must
+    not be summarised as "changed 0 lines".
+
+    The path is exactly the string git prints -- relative to the repository
+    root, in git's own quoting when a name needs it -- and the list keeps
+    git's order, the order the diff visits paths. Both are relays, not
+    re-interpretations: sorting or unquoting here would be a presentation
+    policy this plumbing has no basis for. Lines are split at most twice, so
+    everything after the second tab stays the path, whatever it holds.
+
+    A sha that names no object fails like every other git refusal in this
+    module: a :class:`GitError` carrying git's own message. So does a numstat
+    line this parser cannot read -- git's output changing shape under us is
+    something to be read, not a zero to be swallowed.
+    """
+    if not sha or sha.startswith("-"):
+        # An object name is data; a leading dash would reach git as an option,
+        # the same misread commit_paths pre-empts with its ``--`` separator.
+        raise GitError(f"not an object name: {sha!r}")
+
+    _code, stdout, _stderr = _git(root, ["show", "--numstat", "--format=", sha])
+
+    # One line per changed path, in the order git printed them; blank lines
+    # (separators around the now-empty header) carry nothing and are skipped.
+    entries = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t", 2)
+        if len(fields) != 3:
+            raise GitError(
+                f"unreadable numstat line from git show {sha}: {line!r}")
+        counts = []
+        for field in fields[:2]:
+            if field == "-":
+                # git's word for "binary; cannot count" -- kept as None, never
+                # coerced into a 0 the file did not earn.
+                counts.append(None)
+            else:
+                try:
+                    counts.append(int(field))
+                except ValueError:
+                    raise GitError(
+                        f"unreadable numstat count from git show {sha}:"
+                        f" {line!r}") from None
+        entries.append({
+            "path": fields[2],
+            "insertions": counts[0],
+            "deletions": counts[1],
+        })
+    return entries

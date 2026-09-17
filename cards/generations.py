@@ -137,6 +137,14 @@ class CardOutcome:
     report nothing about the first two. ``None`` for a card accepted on its
     first attempt, for a card without acceptance, and when the last failed
     attempt left no captured output at all.
+
+    Git mode adds two fields, filled only for a card that BECAME a commit -- a
+    run in git mode, whose accepted-card hook records them once the commit is
+    made -- and ``None`` otherwise: ``commit`` is the sha of this card's commit
+    and ``diffstat`` is what :func:`cards.repo.diffstat` returned for it (what
+    that commit changed). Both default to ``None``, so not one existing
+    construction site of this class had to change, and a card that was merely
+    written outside git mode, failed, or was skipped keeps both ``None``.
     """
 
     custom_id: str
@@ -151,6 +159,9 @@ class CardOutcome:
     # which ``acceptance_output`` (set only on a terminal failure) drops. None
     # unless a retry succeeded after a failure that produced captured output.
     earlier_failures: Optional[str] = None
+
+    commit: Optional[str] = None             # sha of this card's commit
+    diffstat: Optional[List[dict]] = None    # what cards.repo.diffstat returned
 
     def __str__(self) -> str:
         if self.status == "written":

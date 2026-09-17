@@ -1,0 +1,83 @@
+{
+  "deck_id": "20260917-225408-d3d4672d",
+  "completed_at": "2026-09-17T23:39:07.545",
+  "branch": "morph/20260917-225408-d3d4672d",
+  "backend_label": "glm",
+  "generations": [
+    [
+      "repo-diffstat",
+      "outcome-carries-commit",
+      "runs-view-formatter"
+    ],
+    [
+      "store-persists-diffstat",
+      "deck-runs-per-card"
+    ]
+  ],
+  "batch_ids": [
+    "batch-1789674851-LornydibnKHn0b5djVan",
+    "batch-1789676142-9Fzb1AleqVaKP3PIHVSy"
+  ],
+  "outcomes": {
+    "repo-diffstat": {
+      "custom_id": "repo-diffstat",
+      "status": "written",
+      "paths": [
+        "./cards/repo.py",
+        "./tests/test_diffstat.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "repo-diffstat",
+      "acceptance_output": null
+    },
+    "outcome-carries-commit": {
+      "custom_id": "outcome-carries-commit",
+      "status": "written",
+      "paths": [
+        "./cards/generations.py",
+        "./tests/test_outcome_diffstat_fields.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "outcome-carries-commit",
+      "acceptance_output": null
+    },
+    "runs-view-formatter": {
+      "custom_id": "runs-view-formatter",
+      "status": "written",
+      "paths": [
+        "./cards/runs_view.py",
+        "./tests/test_runs_view.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "runs-view-formatter",
+      "acceptance_output": null
+    },
+    "store-persists-diffstat": {
+      "custom_id": "store-persists-diffstat",
+      "status": "written",
+      "paths": [
+        "./cards/store.py",
+        "./tests/test_store_diffstat.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "store-persists-diffstat",
+      "acceptance_output": null
+    },
+    "deck-runs-per-card": {
+      "custom_id": "deck-runs-per-card",
+      "status": "written",
+      "paths": [
+        "./flows/morph.py",
+        "./tests/test_deck_runs_view.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "deck-runs-per-card.v1",
+      "acceptance_output": null
+    }
+  }
+}

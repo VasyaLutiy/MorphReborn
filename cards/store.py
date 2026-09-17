@@ -182,6 +182,13 @@ def _outcome_to_dict(outcome: CardOutcome) -> dict:
         "attempts": outcome.attempts,
         "winning_variant": outcome.winning_variant,
         "acceptance_output": outcome.acceptance_output,
+        # The two git-mode fields (cards.generations.CardOutcome): both None
+        # outside a run that opened a branch. _outcome_from_dict reads them
+        # with .get, so a state.json or report.json written before they
+        # existed keeps loading.
+        "commit": outcome.commit,
+        "diffstat": (list(outcome.diffstat)
+                     if outcome.diffstat is not None else None),
     }
 
 
@@ -194,6 +201,11 @@ def _outcome_from_dict(data: dict) -> CardOutcome:
         attempts=data.get("attempts", 1),
         winning_variant=data.get("winning_variant"),
         acceptance_output=data.get("acceptance_output"),
+        # .get(..., None), never [...]: a state.json or report.json written
+        # before these two fields existed carries neither key, and an old
+        # record must keep loading as the not-a-commit it was.
+        commit=data.get("commit", None),
+        diffstat=data.get("diffstat", None),
     )
 
 
@@ -623,6 +635,16 @@ def make_card_committer(
     that rewrote a file byte-identically changed nothing, and
     :func:`cards.repo.commit_paths` answers ``None`` for it rather than putting a
     provenance record in the history of a line that was never generated.
+
+    A commit that SUCCEEDS is also written onto the outcome it was handed:
+    ``commit`` takes the sha and ``diffstat`` what that commit changed, read
+    back out of git (:func:`cards.repo.diffstat`). No plumbing carries them
+    anywhere: both run routes save their outcomes only after this hook has
+    fired, so setting the fields here is what puts them into ``state.json`` and
+    the run report. Reading the diffstat can fail where committing succeeded,
+    and that failure is caught: both fields stay ``None`` (a sha without its
+    measurement is not recorded as provenance), one line says the commit stands
+    anyway, and the hook still does not raise.
     """
     branch = state.get("branch")
     if not branch:
@@ -645,6 +667,20 @@ def make_card_committer(
             log(f"mrph> git: {card.custom_id!r} changed nothing on disk -- "
                 f"no commit.")
         else:
+            # The commit's footprint, read back out of git and carried on the
+            # outcome into state.json and the run report. Computed BEFORE either
+            # field is set: a failure here leaves both None -- a sha whose
+            # diffstat could not be read is recorded as no commit at all, which
+            # is the honest half-record -- and the one log line still says the
+            # commit itself went through.
+            try:
+                changed = repo.diffstat(root, sha)
+            except repo.GitError as error:
+                log(f"mrph> git: {card.custom_id!r} committed as {sha[:10]}; "
+                    f"its diffstat could not be read: {error}")
+                return
+            outcome.commit = sha
+            outcome.diffstat = changed
             log(f"mrph> git: {card.custom_id!r} committed as {sha[:10]}.")
 
     return commit
