@@ -330,6 +330,20 @@ def _tool_deck_collect(arguments: Dict[str, Any], root: str) -> str:
     result = collect_generation(store, backend, root=root, log=progress.append)
 
     if result.in_progress:
+        if result.retry_in_flight:
+            # Not merely "still running": a card failed acceptance and its
+            # regeneration is the batch now in flight. Saying so is the whole
+            # point -- and calling deck_collect again polls that batch, it never
+            # submits a second one.
+            cards = ", ".join(result.retry_card_ids)
+            verb = "submitted" if result.retry_submitted else "in flight"
+            return (
+                f"generation {result.generation_number} of "
+                f"{result.total_generations}: regeneration "
+                f"{result.retry_attempt} of {result.retry_limit} for {cards} "
+                f"{verb} (batch {result.retry_batch_id!r}); call deck_collect "
+                "again to pick it up"
+            )
         return (
             f"generation {result.generation_number} of "
             f"{result.total_generations} is still running; call deck_collect "

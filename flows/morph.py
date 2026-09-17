@@ -3,6 +3,7 @@ import re
 import sys
 import copy
 import json
+import time
 import asyncio
 import functools
 import traceback
@@ -17,7 +18,7 @@ from settings import load_settings, load_registry
 
 from cards.schema import CardError
 from cards.deck import DeckError
-from cards.generations import ensure_parent_dir, run_deck
+from cards.generations import ensure_parent_dir, is_truncated_response, run_deck
 from cards.store import (
     DeckStore,
     StoreError,
@@ -107,6 +108,67 @@ def filter_source_code_file_names(file_path):
             file_path.endswith('.ts') or
             file_path.endswith('.tsx')
     )
+
+
+# ``/collect wait`` polling. WHY these numbers. A cloud batch queue runs 10-40
+# minutes, and a card with the default two regenerations chains up to three of
+# them, so the timeout is sized for the worst case a single generation can
+# honestly produce -- past that, something is wrong and an operator should be
+# told rather than kept waiting. The interval is the granularity that actually
+# helps: a batch that lands is noticed within half a minute, and an hour of
+# waiting costs 120 log lines instead of 3600. Nothing is lost at the timeout:
+# the batch is still in flight and still collectable by the next /collect.
+COLLECT_WAIT_POLL_SECONDS = 30.0
+COLLECT_WAIT_TIMEOUT_SECONDS = 2 * 60 * 60.0
+
+
+def format_elapsed(seconds):
+    """``seconds`` as a compact ``1h02m``/``12m30s``/``45s`` for a progress line."""
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds}s"
+
+
+def describe_collect_wait(result, batch_id, elapsed):
+    """The progress line one poll of ``/collect wait`` prints.
+
+    Names what is being waited for -- the generation, or the regeneration and
+    the cards in it -- which batch id is in the queue, and how long the wait has
+    been going. An operator reading this can tell a slow batch from a hung one,
+    and can look the batch up on the provider's side; the silent hour that this
+    replaces could do neither.
+    """
+    waited = format_elapsed(elapsed)
+    where = f"generation {result.generation_number}/{result.total_generations}"
+    if result.retry_in_flight:
+        cards = ", ".join(result.retry_card_ids) or "?"
+        where = (f"regeneration {result.retry_attempt}/{result.retry_limit} of "
+                 f"{cards} in {where}")
+    return f"mrph> Waiting for {where} (batch {batch_id}) -- {waited} elapsed."
+
+
+def describe_collect_progress(result):
+    """What a single-poll ``/collect`` says when the generation is not in yet.
+
+    Two different pieces of news: a batch still in a queue (nothing happened,
+    ask again later), or a regeneration this very call submitted (cards failed
+    acceptance and are being rewritten -- ``/collect`` again picks THAT batch up,
+    it is never re-sent).
+    """
+    if not result.retry_in_flight:
+        return (f"mrph> Generation {result.generation_number}/"
+                f"{result.total_generations} is still in progress -- "
+                f"try /collect again in a moment.")
+    cards = ", ".join(result.retry_card_ids)
+    verb = "submitted" if result.retry_submitted else "still in flight"
+    return (f"mrph> Generation {result.generation_number}/"
+            f"{result.total_generations}: regeneration {result.retry_attempt}/"
+            f"{result.retry_limit} for {cards} {verb} "
+            f"(batch {result.retry_batch_id}) -- run /collect again to pick it "
+            f"up. Running it while it is in flight costs nothing.")
 
 
 def build_current_project_context():
@@ -226,7 +288,18 @@ class MorphBot(ConsoleBot):
 
     @staticmethod
     def response_to_file_body(response, append_if_plain=False):
-        """Extract the file body from a response and choose the write mode."""
+        """Extract the file body from a response and choose the write mode.
+
+        Mirrors ``cards.generations.response_to_file_body`` (which has no append
+        mode). Callers must reject a CUT-OFF answer first -- one that opened a
+        ``` fence and never closed it -- with
+        :func:`cards.generations.is_truncated_response`: the "no fenced block"
+        branch below cannot tell that from a model answering in bare code, and
+        would write the literal ```` ```python ```` line into the file. That
+        detector is IMPORTED rather than mirrored a second time: the layering
+        rule forbids ``cards`` importing ``flows``, not the reverse, and one copy
+        of the rule is what keeps the two paths honest about the same defect.
+        """
         code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
         if 0 < len(code_blocks):
             body = "".join(f"{code_block}\n" for _, code_block in code_blocks)
@@ -258,10 +331,19 @@ class MorphBot(ConsoleBot):
                 results = await self.run_morphers(self.registry, processor_ids, dialog)
 
                 saved = []
+                cut_off = []
                 for processor_id in processor_ids:
                     response = results.get(processor_id)
                     print(f"llm[{processor_id}]> {response}")
                     if response is None:
+                        continue
+                    if is_truncated_response(response):
+                        # An answer that ran out of output budget inside a code
+                        # fence is a corrupt response, not a file body. Saving it
+                        # verbatim used to put the ```` ```python ```` line on
+                        # disk and hand the user a file that will not even parse;
+                        # the honest report is that the answer was cut off.
+                        cut_off.append(processor_id)
                         continue
                     out_name = self.output_file_name(file_name, processor_id, multi)
                     body, mode = self.response_to_file_body(response, append_if_plain)
@@ -277,6 +359,13 @@ class MorphBot(ConsoleBot):
                         text = f"mrph> {tag} Saved (parallel):\n  " + "\n  ".join(saved)
                     else:
                         text = f"mrph> {tag} Your \"{saved[0]}\" file was saved."
+                    if cut_off:
+                        text += (f"\n  cut off mid-file, nothing saved for: "
+                                 f"{', '.join(cut_off)}")
+                elif cut_off:
+                    text = (f"mrph> {tag} The answer was cut off mid-file -- it opened a "
+                            f"``` code fence and never closed it, so nothing was saved. "
+                            f"Ask again (a shorter file, or a smaller context).")
                 else:
                     text = f"mrph> {tag} No morph was produced (all selected processors failed)."
             except Exception as error:
@@ -419,7 +508,7 @@ Morph 2.0 batch orchestrator (see documentation/batch-orchestrator.md):
 /deck - Show the backlog, its generations and each card's status ("/deck reset" discards the run state, keeping the backlog).
 /card - Add a card: "/card" pastes one as JSON; "/card <goal>" decomposes a goal into cards.
 /submit - Compile and submit the current generation ("@id" pins a processor, "@all" the local pool).
-/collect - Fetch, verify and integrate the submitted generation, then advance.
+/collect - Fetch, verify and integrate the submitted generation, then advance ("/collect wait" polls until it lands, printing progress).
 /nightly - Run the whole deck generation by generation in one blocking pass.
 
 Choosing processors (multi-agent):
@@ -705,6 +794,14 @@ every slot is busy. /settings shows what is idle, busy or queued.
             if batch_id or backend_label:
                 lines.append(f"  in flight: batch \"{batch_id}\" on \"{backend_label}\" "
                              f"-- fetch it with /collect")
+            # A regeneration is a batch like any other, but it is NOT the
+            # generation's first attempt, and an operator reading "in flight"
+            # deserves to know which it is looking at.
+            retries = state.get("retries") or {}
+            if retries:
+                attempt = max(int(entry.get("attempt", 1)) for entry in retries.values())
+                lines.append(f"    that batch is regeneration {attempt} of "
+                             f"{', '.join(sorted(retries))} (acceptance failed)")
         lines.append("  generations:")
         for number, generation in enumerate(view.generations, start=1):
             marker = ""
@@ -950,8 +1047,27 @@ every slot is busy. /settings shows what is idle, busy or queued.
         return transition
 
     def build_collect_transition(self, nested_transition):
+        """``/collect`` polls once; ``/collect wait`` polls until the work lands.
+
+        WHY an argument rather than a new command (the ``/deck reset`` pattern):
+        it is the same operation with the same preconditions, differing only in
+        who does the re-running -- the operator or the loop. A bare ``/collect``
+        keeps its exact single-poll behaviour, which is what a script or an
+        impatient human wants.
+
+        WHY wait at all. A cloud queue runs 10-40 minutes, so ``/collect`` used
+        to be a coin toss ("still in progress") and ``/nightly`` an hour of
+        silence: nothing distinguished a slow batch from a hung one. The loop
+        prints a line per poll naming the generation, the batch and the elapsed
+        time, and -- since a regeneration is now a persisted batch of its own
+        (:func:`cards.store.collect_generation`) -- carries on across it instead
+        of stopping there. Every poll goes through the same single-poll call, so
+        waiting cannot cost more than not waiting.
+        """
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
+            arguments = (action.get("text") or "").split()
+            waiting = len(arguments) > 1 and arguments[1].lower() == "wait"
             store = DeckStore(".")
 
             backend = self._active_backend
@@ -981,63 +1097,87 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     await nested_transition(action)
                     return
 
+            async def send(text):
+                await action["context"].bot.send_message(chat_id=chat_id, text=text)
+
             loop = asyncio.get_event_loop()
-            try:
-                result = await loop.run_in_executor(
-                    None,
-                    functools.partial(collect_generation, store, backend,
-                                      root=".", log=lambda line: None))
-            except StoreError as error:
-                await action["context"].bot.send_message(
-                    chat_id=chat_id, text=f"mrph> {error}")
-                await nested_transition(action)
-                return
-            except Exception as error:
-                # One bad card must not kill the CLI. ``collect_generation``
-                # saves the advanced state only after every card is processed,
-                # so a failure here leaves the generation marked in flight:
-                # nothing is silently written off, and the batch (cloud batches
-                # live on the provider's side, local ones in this process) is
-                # still there to be collected again. ``self._active_backend`` is
-                # deliberately left set so the retry needs no re-resolution.
-                await action["context"].bot.send_message(
-                    chat_id=chat_id,
-                    text=self.report_unexpected(
+            started = time.monotonic()
+            while True:
+                try:
+                    result = await loop.run_in_executor(
+                        None,
+                        functools.partial(collect_generation, store, backend,
+                                          root=".", log=lambda line: None))
+                except StoreError as error:
+                    await send(f"mrph> {error}")
+                    break
+                except Exception as error:
+                    # One bad card must not kill the CLI -- and a waiting loop
+                    # must not swallow the failure into another poll either.
+                    # ``collect_generation`` saves the advanced state only after
+                    # every card is processed, so a failure here leaves the
+                    # generation marked in flight: nothing is silently written
+                    # off, and the batch (cloud batches live on the provider's
+                    # side, local ones in this process) is still there to be
+                    # collected again. ``self._active_backend`` is deliberately
+                    # left set so the retry needs no re-resolution.
+                    await send(self.report_unexpected(
                         error, "collecting the generation",
                         "mrph> The generation is still in flight and nothing was "
                         "marked done -- the results are not lost, so run /collect "
                         "again (fix the card first if the error names one)."))
-                await nested_transition(action)
-                return
+                    break
 
-            if result.in_progress:
-                await action["context"].bot.send_message(
-                    chat_id=chat_id,
-                    text=f"mrph> Generation {result.generation_number}/"
-                         f"{result.total_generations} is still in progress -- "
-                         f"try /collect again in a moment.")
-                await nested_transition(action)
-                return
+                if not result.in_progress:
+                    self._active_backend = None
+                    lines = [
+                        f"mrph> Collected generation {result.generation_number}/"
+                        f"{result.total_generations}:"
+                    ]
+                    for custom_id, outcome in result.outcomes.items():
+                        if outcome.status == "written":
+                            lines.append(f"    {custom_id}: written -> {', '.join(outcome.paths)}")
+                        elif outcome.status == "failed":
+                            lines.append(f"    {custom_id}: failed after {outcome.attempts} attempt(s)")
+                        elif outcome.status == "skipped":
+                            lines.append(f"    {custom_id}: skipped (dependency {outcome.reason})")
+                        else:
+                            lines.append(f"    {custom_id}: {outcome.status}")
+                    if result.phase == "done":
+                        lines.append("mrph> The deck run is complete.")
+                    else:
+                        lines.append("mrph> Run /submit to send the next generation.")
+                    await send("\n".join(lines))
+                    break
 
-            self._active_backend = None
-            lines = [
-                f"mrph> Collected generation {result.generation_number}/"
-                f"{result.total_generations}:"
-            ]
-            for custom_id, outcome in result.outcomes.items():
-                if outcome.status == "written":
-                    lines.append(f"    {custom_id}: written -> {', '.join(outcome.paths)}")
-                elif outcome.status == "failed":
-                    lines.append(f"    {custom_id}: failed after {outcome.attempts} attempt(s)")
-                elif outcome.status == "skipped":
-                    lines.append(f"    {custom_id}: skipped (dependency {outcome.reason})")
-                else:
-                    lines.append(f"    {custom_id}: {outcome.status}")
-            if result.phase == "done":
-                lines.append("mrph> The deck run is complete.")
-            else:
-                lines.append("mrph> Run /submit to send the next generation.")
-            await action["context"].bot.send_message(chat_id=chat_id, text="\n".join(lines))
+                if not waiting:
+                    await send(describe_collect_progress(result))
+                    break
+
+                if result.retry_submitted:
+                    # A poll that SPENT money is news of its own, distinct from
+                    # the "still queued" lines around it: name the cards that
+                    # failed acceptance at the moment the regeneration goes out.
+                    await send(
+                        f"mrph> {', '.join(result.retry_card_ids)} failed "
+                        f"acceptance -- regeneration {result.retry_attempt}/"
+                        f"{result.retry_limit} submitted as batch "
+                        f"{result.retry_batch_id}; still waiting.")
+
+                elapsed = time.monotonic() - started
+                if COLLECT_WAIT_TIMEOUT_SECONDS <= elapsed:
+                    await send(
+                        f"mrph> Gave up waiting after "
+                        f"{format_elapsed(elapsed)} -- nothing was lost: the "
+                        f"batch is still in flight and the next /collect picks "
+                        f"it up. A queue this slow is worth checking on the "
+                        f"provider's side.")
+                    break
+
+                batch_id = result.retry_batch_id or store.load_state().get("batch_id")
+                await send(describe_collect_wait(result, batch_id, elapsed))
+                await asyncio.sleep(COLLECT_WAIT_POLL_SECONDS)
+
             await nested_transition(action)
 
         return transition

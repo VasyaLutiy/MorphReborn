@@ -1,5 +1,7 @@
 """
-Phase 7 regression: one bad card must not kill the CLI.
+Transition-level regressions for the deck commands.
+
+Phase 7: one bad card must not kill the CLI.
 
 ``/submit``, ``/collect`` and ``/nightly`` used to catch only ``CardError`` /
 ``DeckError`` / ``StoreError``. Anything else -- a ``FileNotFoundError`` from a
@@ -7,6 +9,12 @@ card targeting a package that did not exist yet, a provider transport error, a
 bug inside a morph body -- propagated out of the transition, through the state
 machine, and terminated the whole ``mrph`` process. An operator collecting an
 overnight deck lost the session to a single card.
+
+Two later defects are pinned down in the same style, at the bottom of the file:
+``/collect wait`` (a cloud queue runs 10-40 minutes, and a ``/collect`` that
+prints nothing for an hour cannot be told from a hung one) and the interactive
+save path's handling of an answer cut off inside a code fence (which used to be
+written to disk verbatim, ```` ```python ```` line and all).
 
 The transitions are driven WITHOUT a ConsoleBot: ``build_*_transition`` are
 ordinary methods returning a closure over ``self``, so a stub carrying the three
@@ -22,8 +30,9 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
-from cards.store import DeckStore, submit_generation
+from cards.store import DeckStore, collect_generation, submit_generation
 from flows.morph import MorphBot
 
 
@@ -88,12 +97,12 @@ class _StubMorphBot:
         return self._active_backend, self._label
 
 
-def _action():
+def _action(text=None):
     context = _FakeContext()
     return {
         "update": {"effective_chat": {"id": 1}},
         "context": context,
-        "text": None,
+        "text": text,
     }
 
 
@@ -121,8 +130,8 @@ class UnexpectedFailureTests(unittest.TestCase):
     async def _nested(self, action):
         self.nested_calls.append(action)
 
-    def _run(self, transition):
-        action = _action()
+    def _run(self, transition, text=None):
+        action = _action(text)
         asyncio.get_event_loop().run_until_complete(transition(action))
         return action["context"].bot.messages
 
@@ -211,6 +220,303 @@ class UnexpectedFailureTests(unittest.TestCase):
         self.assertIn("the deck is unchanged", text)
         # No run was recorded: the deck view still reads as never started.
         self.assertEqual(self.store.load_state()["phase"], "idle")
+
+
+class _QueuedBackend:
+    """A cloud batch that sits in a queue before it completes.
+
+    ``pending_polls`` is how many ``status`` calls each batch answers
+    ``in_progress`` before reporting ``completed`` -- the thing ``/collect wait``
+    exists for, and the thing a backend that is instantly ``completed`` cannot
+    express. Responses are scripted by (variant) custom_id, as elsewhere.
+    """
+
+    def __init__(self, scripts=None, default_response=None, pending_polls=0):
+        self.scripts = scripts or {}
+        self.default_response = default_response or "```python\nOK = 1\n```"
+        self.pending_polls = pending_polls
+        self.polls = {}
+        self.submissions = []
+
+    def submit(self, requests):
+        self.submissions.append(requests)
+        return f"cloud-batch-{len(self.submissions)}"
+
+    def status(self, batch_id):
+        self.polls[batch_id] = self.polls.get(batch_id, 0) + 1
+        if self.polls[batch_id] <= self.pending_polls:
+            return "in_progress"
+        return "completed"
+
+    def collect(self, batch_id):
+        index = int(batch_id.rsplit("-", 1)[1]) - 1
+        return {
+            request["custom_id"]: self.scripts.get(request["custom_id"],
+                                                   self.default_response)
+            for request in self.submissions[index]
+        }
+
+
+class CollectWaitTests(unittest.TestCase):
+    """``/collect`` polls once; ``/collect wait`` polls until the work lands."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-wait-")
+        self.root = os.path.join(self.tmp, "miniproject")
+        shutil.copytree(MINIPROJECT, self.root,
+                        ignore=shutil.ignore_patterns("node_modules"))
+        self.previous_cwd = os.getcwd()
+        os.chdir(self.root)
+        self.store = DeckStore(".")
+        self.nested_calls = []
+
+    def tearDown(self):
+        os.chdir(self.previous_cwd)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def _nested(self, action):
+        self.nested_calls.append(action)
+
+    def _add(self, custom_id, target, **meta):
+        self.store.add_card({
+            "custom_id": custom_id,
+            "meta": {"intent": "generate", "target": target,
+                     "context_slice": ["util.py"], **meta},
+            "instruction": "make it",
+        })
+
+    def _collect(self, backend, text=None):
+        bot = _StubMorphBot(backend)
+        action = _action(text)
+        asyncio.get_event_loop().run_until_complete(
+            MorphBot.build_collect_transition(bot, self._nested)(action))
+        return action["context"].bot.messages
+
+    def test_bare_collect_still_polls_exactly_once(self):
+        self._add("card-a", "gen_a.py")
+        backend = _QueuedBackend(pending_polls=5)
+        submit_generation(self.store, backend, root=".", backend_label="fake",
+                          log=lambda _l: None)
+
+        messages = self._collect(backend, text="/collect")
+
+        self.assertEqual(backend.polls["cloud-batch-1"], 1)
+        self.assertIn("still in progress", "\n".join(messages))
+        self.assertEqual(self.store.load_state()["phase"], "submitted")
+        self.assertEqual(len(self.nested_calls), 1)
+
+    def test_collect_wait_polls_until_the_generation_lands(self):
+        self._add("card-a", "gen_a.py")
+        backend = _QueuedBackend(pending_polls=2)
+        submit_generation(self.store, backend, root=".", backend_label="fake",
+                          log=lambda _l: None)
+
+        with mock.patch("flows.morph.COLLECT_WAIT_POLL_SECONDS", 0):
+            messages = self._collect(backend, text="/collect wait")
+
+        text = "\n".join(messages)
+        # One progress line per unfinished poll, each naming what is being
+        # waited for, which batch, and for how long.
+        waiting = [line for line in messages if line.startswith("mrph> Waiting for")]
+        self.assertEqual(len(waiting), 2)
+        self.assertIn("generation 1/1", waiting[0])
+        self.assertIn("cloud-batch-1", waiting[0])
+        self.assertIn("elapsed", waiting[0])
+        self.assertIn("Collected generation 1/1", text)
+        self.assertEqual(self.store.load_state()["phase"], "done")
+        self.assertTrue(os.path.exists("gen_a.py"))
+        self.assertEqual(len(self.nested_calls), 1)
+
+    def test_collect_wait_carries_on_across_a_regeneration(self):
+        # The wait must not stop at the retry batch -- that is the hour of
+        # silence it was built to replace.
+        self._add("card-c", "gen_c.py", acceptance="grep -q PASS gen_c.py")
+        backend = _QueuedBackend(pending_polls=1, scripts={
+            "card-c": "```python\nVALUE = 1\n```",     # fails acceptance
+            "card-c.r1": "```python\nPASS = 1\n```",   # the regeneration passes
+        })
+        submit_generation(self.store, backend, root=".", backend_label="fake",
+                          log=lambda _l: None)
+
+        with mock.patch("flows.morph.COLLECT_WAIT_POLL_SECONDS", 0):
+            messages = self._collect(backend, text="/collect wait")
+
+        text = "\n".join(messages)
+        self.assertIn("card-c failed acceptance -- regeneration 1/2 submitted", text)
+        self.assertIn("regeneration 1/2 of card-c", text)
+        self.assertIn("cloud-batch-2", text)
+        self.assertIn("Collected generation 1/1", text)
+        self.assertIn("card-c: written", text)
+        # Exactly two batches: the generation and ONE regeneration.
+        self.assertEqual(len(backend.submissions), 2)
+        self.assertEqual(self.store.load_state()["phase"], "done")
+
+    def test_bare_collect_reports_the_regeneration_it_submitted(self):
+        self._add("card-c", "gen_c.py", acceptance="grep -q PASS gen_c.py")
+        backend = _QueuedBackend(scripts={"card-c": "```python\nVALUE = 1\n```"})
+        submit_generation(self.store, backend, root=".", backend_label="fake",
+                          log=lambda _l: None)
+
+        messages = self._collect(backend, text="/collect")
+
+        text = "\n".join(messages)
+        self.assertIn("regeneration 1/2 for card-c submitted", text)
+        self.assertIn("/collect again", text)
+        self.assertIn("costs nothing", text)
+        self.assertEqual(len(backend.submissions), 2)
+
+    def test_collect_wait_gives_up_at_the_timeout_and_leaves_the_batch(self):
+        self._add("card-a", "gen_a.py")
+        backend = _QueuedBackend(pending_polls=5)
+        submit_generation(self.store, backend, root=".", backend_label="fake",
+                          log=lambda _l: None)
+
+        with mock.patch("flows.morph.COLLECT_WAIT_POLL_SECONDS", 0), \
+                mock.patch("flows.morph.COLLECT_WAIT_TIMEOUT_SECONDS", 0):
+            messages = self._collect(backend, text="/collect wait")
+
+        text = "\n".join(messages)
+        self.assertIn("Gave up waiting", text)
+        self.assertIn("still in flight", text)
+        # Nothing was collected and the batch is untouched: one poll, no writes.
+        self.assertEqual(backend.polls["cloud-batch-1"], 1)
+        self.assertEqual(self.store.load_state()["phase"], "submitted")
+        self.assertFalse(os.path.exists("gen_a.py"))
+        self.assertEqual(len(self.nested_calls), 1)
+
+    def test_collect_wait_reports_an_unexpected_failure_instead_of_looping(self):
+        self._add("card-a", "gen_a.py")
+        submit_generation(self.store, _Exploding(on="never"), root=".",
+                          backend_label="fake", log=lambda _l: None)
+
+        with mock.patch("flows.morph.COLLECT_WAIT_POLL_SECONDS", 0):
+            messages = self._collect(_Exploding(on="status"), text="/collect wait")
+
+        text = "\n".join(messages)
+        self.assertIn("RuntimeError", text)
+        self.assertIn("still in flight", text)
+        self.assertEqual(self.store.load_state()["phase"], "submitted")
+        self.assertEqual(len(self.nested_calls), 1)
+
+
+# -- the interactive save path (/generate, /patch) ----------------------------
+
+
+class _Job:
+    def __init__(self, assigned):
+        self.id = 7
+        self.assigned = assigned
+        self.was_queued = False
+
+
+class _StubScheduler:
+    """Launches immediately and records the release, like the real pool."""
+
+    def __init__(self):
+        self.released = []
+
+    def attach_launch(self, job, launch):
+        launch()
+
+    def release(self, processor_ids):
+        self.released.append(list(processor_ids))
+
+
+class _JobContext:
+    """An ``action["context"]`` that carries a job, as ``context_get`` reads it."""
+
+    def __init__(self, job):
+        self.bot = _FakeChatBot()
+        self._job = job
+
+    def get(self, name):
+        if name == "job":
+            return self._job
+        raise KeyError(name)
+
+
+class _SaveStubBot:
+    """The slice of ``MorphBot`` that ``morph_and_save`` actually touches."""
+
+    context_get = staticmethod(MorphBot.context_get)
+    output_file_name = staticmethod(MorphBot.output_file_name)
+    response_to_file_body = staticmethod(MorphBot.response_to_file_body)
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.registry = None
+        self.scheduler = _StubScheduler()
+        self.messages = []
+
+    async def run_morphers(self, registry, processor_ids, dialog):
+        return dict(self.responses)
+
+    async def send_message(self, chat_id, text, **_kwargs):
+        self.messages.append(text)
+
+
+class TruncatedInteractiveSaveTests(unittest.TestCase):
+    """A cut-off answer must be reported, not written out with its fence.
+
+    ``/generate`` and ``/patch`` share ``morph_and_save``. An answer that opened
+    ```` ```python ```` and was cut off before the closing fence used to fall
+    through to "no fenced block -> write it verbatim", handing the user a file
+    whose first line is ```` ```python ```` and which does not parse.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-cut-")
+        self.previous_cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.nested_calls = []
+
+    def tearDown(self):
+        os.chdir(self.previous_cwd)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def _nested(self, action):
+        self.nested_calls.append(action)
+
+    def _save(self, responses, processor_ids, file_name="out.py"):
+        bot = _SaveStubBot(responses)
+        action = {
+            "update": {"effective_chat": {"id": 1}},
+            "context": _JobContext(_Job(processor_ids)),
+            "text": None,
+        }
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            MorphBot.morph_and_save(bot, action, None, file_name, self._nested))
+        # ``morph_and_save`` returns to the menu immediately and finishes the
+        # write in a background task; drain it before asserting.
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        loop.run_until_complete(asyncio.gather(*pending))
+        return bot
+
+    def test_a_cut_off_answer_saves_nothing_and_says_so(self):
+        bot = self._save({"p1": "```python\nOK = 1\n# cut off here"}, ["p1"])
+
+        self.assertFalse(os.path.exists("out.py"))
+        self.assertIn("cut off mid-file", "\n".join(bot.messages))
+        self.assertEqual(bot.scheduler.released, [["p1"]])
+
+    def test_a_whole_answer_is_still_saved(self):
+        bot = self._save({"p1": "```python\nOK = 1\n```"}, ["p1"])
+
+        self.assertTrue(os.path.exists("out.py"))
+        with open("out.py", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "OK = 1\n")
+        self.assertIn("was saved", "\n".join(bot.messages))
+
+    def test_one_cut_off_processor_does_not_hide_the_others(self):
+        bot = self._save({"p1": "```python\nCUT = 1",
+                          "p2": "```python\nWHOLE = 2\n```"}, ["p1", "p2"])
+
+        text = "\n".join(bot.messages)
+        self.assertFalse(os.path.exists("out.p1.py"))
+        self.assertTrue(os.path.exists("out.p2.py"))
+        self.assertIn("Saved (parallel)", text)
+        self.assertIn("cut off mid-file, nothing saved for: p1", text)
 
 
 if __name__ == "__main__":

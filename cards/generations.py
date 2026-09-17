@@ -34,6 +34,13 @@ runs before its dependents. A card *without* an ``acceptance`` command keeps the
 exact Phase 3 semantics below (write every surviving variant, no verification,
 no retries), so ``verify=True`` is a no-op for it.
 
+The retry machinery comes in three pieces on purpose -- :func:`build_retry_cards`
+(prepare), :func:`process_retry_batch` (judge), :func:`_run_retries` (the
+blocking submit/poll loop over the two). ``/nightly`` uses all three; the
+split-step ``/collect`` (:func:`cards.store.collect_generation`) uses the first
+two and PERSISTS the batch between them, so a regeneration survives a restart and
+a second CLI session cannot pay for the same retry twice.
+
 Known simplification, still in force: ``flows.morph``'s ``append_if_plain`` /
 ``todo`` append semantics are *not* reproduced. A response with no fenced code
 block is written verbatim in mode ``'w'`` (never appended). Per-card backend
@@ -163,15 +170,58 @@ def response_to_file_body(response: str) -> str:
     Mirrors ``flows.morph.MorphBot.response_to_file_body``: pull the fenced code
     blocks if any are present, else use the response verbatim. Duplicated (not
     imported) to keep ``cards`` free of any dependency on ``flows``; keep the two
-    in step when either changes. Public so :mod:`cards.acceptance` reuses this
-    one copy rather than adding a third. Simplification for this phase: the
-    ``append_if_plain`` / ``todo`` append mode is dropped -- callers here always
-    write mode ``'w'``.
+    in step when either changes. Callers must reject a CUT-OFF response
+    (:func:`is_truncated_response`) before calling this: the verbatim fallback
+    below cannot tell "the model answered with bare code" from "the model was cut
+    off inside a fence", and would write the ```` ```python ```` line to disk.
+    Public so :mod:`cards.acceptance` reuses this one copy rather than a third.
+    Simplification for this phase: the ``append_if_plain`` / ``todo`` append mode
+    is dropped -- callers here always write mode ``'w'``.
     """
     code_blocks = re.findall(r"```(.*?)\n(.*?)\n```", response, re.DOTALL)
     if 0 < len(code_blocks):
         return "".join(f"{code_block}\n" for _, code_block in code_blocks)
     return response
+
+
+# A fence marker only counts at the start of a line -- that is where both the
+# opening ```` ```python ```` and the closing ```` ``` ```` are written, while a
+# stray ```` ``` ```` quoted mid-sentence in prose is not a delimiter.
+_FENCE_MARKER = re.compile(r"^```", re.MULTILINE)
+
+
+# What a card that was cut off mid-file carries into its retry, in place of the
+# acceptance output it never got to produce. Written AT the executor: it is
+# pasted into the next attempt's instruction by :func:`_retry_card`.
+TRUNCATED_RESPONSE_MESSAGE = (
+    "The previous answer was cut off mid-file: it opened a ``` code fence and "
+    "never closed it, so the file body could not be extracted. Answer again "
+    "with the COMPLETE file, and close the fence."
+)
+
+
+def is_truncated_response(response: Optional[str]) -> bool:
+    """Is this answer a code fence that was never closed -- a corrupt response?
+
+    WHY this exists. :func:`response_to_file_body` needs the CLOSING fence to
+    match a block; an answer that opened ```` ```python ```` and then ran out of
+    output budget matches nothing, so the "no fenced block, use it verbatim"
+    fallback wrote the literal ```` ```python ```` line into the file. The card
+    then failed with ``SyntaxError: invalid syntax`` on every attempt -- a full
+    paid batch each -- because the executor was never told what was wrong.
+
+    A cut-off answer is a CORRUPT RESPONSE, not a file body: callers must reject
+    it exactly the way they reject a missing (``None``) response, so the variant
+    is unusable and the card is retried with :data:`TRUNCATED_RESPONSE_MESSAGE`
+    as its error context. An answer with NO fence at all is not truncated -- a
+    model that simply answers with bare code keeps being written verbatim.
+
+    Detection is a parity count of line-leading fence markers: every opened block
+    must be closed, so an odd count means the last one never was.
+    """
+    if not response:
+        return False
+    return len(_FENCE_MARKER.findall(response)) % 2 == 1
 
 
 def _variant_ids(card: MorphCard) -> List[str]:
@@ -246,17 +296,27 @@ def _submit_poll_collect(
 
 
 def _write_variants(
-    card: MorphCard, results: Dict[str, Optional[str]], root: str
+    card: MorphCard,
+    results: Dict[str, Optional[str]],
+    root: str,
+    log: Callable[[str], None] = print,
 ) -> List[str]:
     """Write every surviving variant of a card (Phase 3, no-acceptance path).
 
-    A ``None`` response is a failed variant and is skipped. Returns the paths
-    written; an empty list means every variant response was ``None``.
+    A ``None`` response is a failed variant and is skipped; so is a response cut
+    off inside an unclosed code fence (:func:`is_truncated_response`) -- it is a
+    corrupt response, not a file body, and writing it verbatim used to put the
+    literal ```` ```python ```` line on disk. Returns the paths written; an empty
+    list means every variant response was missing or cut off.
     """
     written: List[str] = []
     for variant_id in _variant_ids(card):
         response = results.get(variant_id)
         if response is None:
+            continue
+        if is_truncated_response(response):
+            log(f"mrph> variant {variant_id!r} was cut off mid-file "
+                f"(unclosed code fence) -- discarded")
             continue
         body = response_to_file_body(response)
         path = _output_path(card, variant_id, root)
@@ -350,7 +410,8 @@ def process_generation(
     max_regenerations: int,
     outcomes: Dict[str, CardOutcome],
     blocked: set,
-) -> None:
+    inline_retries: bool = True,
+) -> List[tuple]:
     """Turn one generation's collected ``results`` into outcomes (with retries).
 
     ``results`` is the ``{variant_custom_id: text|None}`` map ``backend.collect``
@@ -367,6 +428,14 @@ def process_generation(
     :func:`cards.store.collect_generation` (which collects the in-flight batch
     across a CLI restart, then hands the results here) -- so the two paths keep
     identical best-of-N / rollback / retry / skip-cascade semantics.
+
+    ``inline_retries`` is the one difference between them. ``True`` (``run_deck``
+    /``/nightly``) runs :func:`_run_retries` here and blocks until every card is
+    settled. ``False`` (``/collect``) returns the still-pending
+    ``(card, verify_outcome)`` pairs instead, so the caller can submit ONE retry
+    batch, persist it and return -- an unfinished generation whose retry survives
+    a restart, rather than an hour of silence inside one call. The returned list
+    is empty whenever retries ran here or nothing needs one.
     """
     from cards.acceptance import verify_card
 
@@ -378,10 +447,13 @@ def process_generation(
         for card in runnable:
             outcomes[card.custom_id] = CardOutcome(card.custom_id, "failed")
             blocked.add(card.custom_id)
-        return
+        return []
 
     # Cards that failed acceptance but have retries left, paired with the
-    # verify outcome carrying the error context for their next attempt.
+    # failing :class:`cards.acceptance.AcceptanceResult` (or ``None`` when
+    # nothing ran) that is their next attempt's error context. The result rather
+    # than the whole verify outcome, because that pair is what survives into
+    # ``.morph/state.json`` when the retry is persisted instead of run inline.
     retry_pending: List[tuple] = []
 
     for card in runnable:
@@ -401,7 +473,7 @@ def process_generation(
                     f"acceptance): {', '.join(outcome.paths)}"
                 )
             elif max_regenerations > 0:
-                retry_pending.append((card, outcome))
+                retry_pending.append((card, outcome.result))
             else:
                 outcomes[card.custom_id] = CardOutcome(
                     card.custom_id,
@@ -415,7 +487,7 @@ def process_generation(
                     f"failed acceptance (no retries)"
                 )
         else:
-            written = _write_variants(card, results, root)
+            written = _write_variants(card, results, root, log)
             if written:
                 outcomes[card.custom_id] = CardOutcome(
                     card.custom_id, "written", paths=written
@@ -434,6 +506,9 @@ def process_generation(
 
     # Retry generations for the failed acceptance cards -- these run BEFORE
     # this generation's dependents (which live in later generations).
+    if not inline_retries:
+        return retry_pending
+
     _run_retries(
         retry_pending,
         index,
@@ -447,6 +522,7 @@ def process_generation(
         outcomes,
         blocked,
     )
+    return []
 
 
 def run_deck(
@@ -546,6 +622,120 @@ def _acceptance_output(result) -> Optional[str]:
     return result.output if result is not None else None
 
 
+def build_retry_cards(
+    pending: List[tuple],
+    attempt: int,
+    index: int,
+    total: int,
+    max_regenerations: int,
+    log: Callable[[str], None] = print,
+) -> List[MorphCard]:
+    """One retry card per still-pending card, logged as the retry is prepared.
+
+    ``pending`` is a list of ``(card, previous AcceptanceResult or None)``; the
+    retry card carries that error into its instruction (:func:`_retry_card`) and
+    is suffixed ``.r<attempt>``. Split out of :func:`_run_retries` so the
+    split-step path (:func:`cards.store.collect_generation`, which submits a
+    retry batch and PERSISTS it instead of polling it inline) builds exactly the
+    same retry cards the blocking loop does.
+    """
+    retry_cards: List[MorphCard] = []
+    for card, prev_result in pending:
+        log(
+            f"mrph> [generation {index}/{total}] retry "
+            f"{attempt}/{max_regenerations} for card {card.custom_id!r} "
+            f"(acceptance failed)"
+        )
+        retry_cards.append(_retry_card(card, attempt, prev_result))
+    return retry_cards
+
+
+def process_retry_batch(
+    retry_cards: List[MorphCard],
+    pending: List[tuple],
+    results: Optional[Dict[str, Optional[str]]],
+    attempt: int,
+    index: int,
+    total: int,
+    root: str,
+    log: Callable[[str], None],
+    acceptance_timeout: float,
+    max_regenerations: int,
+    outcomes: Dict[str, CardOutcome],
+    blocked: set,
+) -> List[tuple]:
+    """Judge one retry batch's results; return what is still pending after it.
+
+    ``retry_cards`` and ``pending`` are positionally paired (the output and the
+    input of :func:`build_retry_cards`). ``results`` is the collected
+    ``{variant_custom_id: text|None}`` map, or ``None`` when the whole retry
+    batch failed -- then every pending card fails terminally, carrying its last
+    real acceptance output, and nothing is left pending.
+
+    A card that passes is recorded ``"written"`` under its ORIGINAL custom_id
+    with the attempt count; a card that fails with retries left is returned in
+    the new pending list, paired with the fresh :class:`AcceptanceResult` that
+    becomes the next attempt's error context; a card that fails on the last
+    allowed attempt is
+    recorded ``"failed"`` and blocks its dependents. Mutates ``outcomes`` and
+    ``blocked`` in place.
+
+    Shared by the blocking loop (:func:`_run_retries`) and the persisted one
+    (:func:`cards.store.collect_generation`), so an outcome reads the same
+    whichever route produced it.
+    """
+    from cards.acceptance import verify_card
+
+    if results is None:
+        log(
+            f"mrph> [generation {index}/{total}] retry {attempt} batch "
+            f"failed; {len(pending)} card(s) failed"
+        )
+        for card, prev_result in pending:
+            outcomes[card.custom_id] = CardOutcome(
+                card.custom_id,
+                "failed",
+                attempts=1 + attempt,
+                acceptance_output=_acceptance_output(prev_result),
+            )
+            blocked.add(card.custom_id)
+        return []
+
+    next_pending: List[tuple] = []
+    for retry_card, (card, _prev) in zip(retry_cards, pending):
+        outcome = verify_card(retry_card, results, root, acceptance_timeout, log)
+        if outcome.passed:
+            outcomes[card.custom_id] = CardOutcome(
+                card.custom_id,
+                "written",
+                paths=outcome.paths,
+                attempts=1 + attempt,
+                winning_variant=outcome.winning_custom_id,
+            )
+            log(
+                f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                f"written after retry {attempt} (variant "
+                f"{outcome.winning_custom_id!r} passed): "
+                f"{', '.join(outcome.paths)}"
+            )
+        elif attempt < max_regenerations:
+            next_pending.append((card, outcome.result))
+        else:
+            outcomes[card.custom_id] = CardOutcome(
+                card.custom_id,
+                "failed",
+                attempts=1 + attempt,
+                acceptance_output=_acceptance_output(outcome.result),
+            )
+            blocked.add(card.custom_id)
+            log(
+                f"mrph> [generation {index}/{total}] {card.custom_id!r} "
+                f"failed acceptance after {attempt} retr"
+                f"{'y' if attempt == 1 else 'ies'}"
+            )
+    return next_pending
+
+
 def _run_retries(
     pending: List[tuple],
     index: int,
@@ -561,27 +751,22 @@ def _run_retries(
 ) -> None:
     """Regenerate cards that failed acceptance, up to ``max_regenerations`` times.
 
-    ``pending`` is a list of ``(card, verify_outcome)``. Each retry attempt
-    builds a retry card per still-pending card (instruction carrying the previous
-    attempt's error), submits them as one retry batch, and re-verifies. A card
-    that passes is recorded ``"written"`` under its ORIGINAL custom_id with the
-    attempt count; a card that exhausts its retries is recorded ``"failed"`` and
-    blocks its dependents. Mutates ``outcomes`` and ``blocked`` in place.
-    """
-    from cards.acceptance import verify_card
+    The BLOCKING retry loop: each attempt builds the retry cards, submits them as
+    one batch, polls it to completion and judges the results, until nothing is
+    pending or the limit is reached. This is ``/nightly``'s contract -- one
+    blocking pass does the whole deck -- and is deliberately NOT what the
+    split-step ``/collect`` path does (see
+    :func:`cards.store.collect_generation`: it persists the retry batch and
+    returns, so a second ``/collect`` picks it up instead of a second CLI session
+    submitting a second paid batch for the same card).
 
+    Mutates ``outcomes`` and ``blocked`` in place.
+    """
     attempt = 0
     while pending and attempt < max_regenerations:
         attempt += 1
-
-        retry_cards: List[MorphCard] = []
-        for card, prev_outcome in pending:
-            log(
-                f"mrph> [generation {index}/{total}] retry "
-                f"{attempt}/{max_regenerations} for card {card.custom_id!r} "
-                f"(acceptance failed)"
-            )
-            retry_cards.append(_retry_card(card, attempt, prev_outcome.result))
+        retry_cards = build_retry_cards(
+            pending, attempt, index, total, max_regenerations, log)
 
         requests: List[dict] = []
         for retry_card in retry_cards:
@@ -589,53 +774,6 @@ def _run_retries(
 
         results = _submit_poll_collect(requests, backend, poll_interval)
 
-        if results is None:
-            # The retry batch itself failed wholesale -- fail every pending card
-            # terminally, carrying its last real acceptance output.
-            log(
-                f"mrph> [generation {index}/{total}] retry {attempt} batch "
-                f"failed; {len(pending)} card(s) failed"
-            )
-            for card, prev_outcome in pending:
-                outcomes[card.custom_id] = CardOutcome(
-                    card.custom_id,
-                    "failed",
-                    attempts=1 + attempt,
-                    acceptance_output=_acceptance_output(prev_outcome.result),
-                )
-                blocked.add(card.custom_id)
-            return
-
-        next_pending: List[tuple] = []
-        for retry_card, (card, _prev) in zip(retry_cards, pending):
-            outcome = verify_card(retry_card, results, root, acceptance_timeout, log)
-            if outcome.passed:
-                outcomes[card.custom_id] = CardOutcome(
-                    card.custom_id,
-                    "written",
-                    paths=outcome.paths,
-                    attempts=1 + attempt,
-                    winning_variant=outcome.winning_custom_id,
-                )
-                log(
-                    f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                    f"written after retry {attempt} (variant "
-                    f"{outcome.winning_custom_id!r} passed): "
-                    f"{', '.join(outcome.paths)}"
-                )
-            elif attempt < max_regenerations:
-                next_pending.append((card, outcome))
-            else:
-                outcomes[card.custom_id] = CardOutcome(
-                    card.custom_id,
-                    "failed",
-                    attempts=1 + attempt,
-                    acceptance_output=_acceptance_output(outcome.result),
-                )
-                blocked.add(card.custom_id)
-                log(
-                    f"mrph> [generation {index}/{total}] {card.custom_id!r} "
-                    f"failed acceptance after {attempt} retr"
-                    f"{'y' if attempt == 1 else 'ies'}"
-                )
-        pending = next_pending
+        pending = process_retry_batch(
+            retry_cards, pending, results, attempt, index, total, root, log,
+            acceptance_timeout, max_regenerations, outcomes, blocked)

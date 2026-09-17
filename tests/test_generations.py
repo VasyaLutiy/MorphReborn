@@ -16,6 +16,8 @@ import unittest
 from cards.generations import (
     CardOutcome,
     DeckResult,
+    is_truncated_response,
+    response_to_file_body,
     run_deck,
     split_into_generations,
 )
@@ -393,6 +395,106 @@ class RunDeckTests(unittest.TestCase):
         self.assertIn("deck run: 2 generation(s)", rendered)
         self.assertIn("a: failed", rendered)
         self.assertIn("b: skipped (blocked by a)", rendered)
+
+
+class TruncatedResponseTests(unittest.TestCase):
+    """A cut-off answer is a corrupt response, not a file body.
+
+    Measured defect: a regeneration came back opening ```` ```python ```` and
+    ending with ``---`` instead of a closing fence. The extraction regex needs
+    the closing fence, matched nothing, and the "no fenced block -> verbatim"
+    fallback wrote the literal ```` ```python ```` line to disk, so the card died
+    of ``SyntaxError: invalid syntax`` three attempts running -- a paid batch
+    each -- without ever telling the executor what was wrong.
+    """
+
+    def test_an_unclosed_fence_is_truncated(self):
+        self.assertTrue(is_truncated_response("```python\nBROKEN = 1\n---"))
+        self.assertTrue(is_truncated_response("```python\nBROKEN = 1"))
+        # Two blocks, the second cut off: the file is still incomplete.
+        self.assertTrue(is_truncated_response(
+            "```python\nA = 1\n```\n```python\nB = 2"))
+
+    def test_a_closed_fence_and_a_bare_answer_are_not(self):
+        self.assertFalse(is_truncated_response(_code_block("OK = 1")))
+        self.assertFalse(is_truncated_response("OK = 1\n"))
+        self.assertFalse(is_truncated_response(""))
+        self.assertFalse(is_truncated_response(None))
+        # Prose that merely mentions a fence mid-line is not a delimiter.
+        self.assertFalse(is_truncated_response("write it inside a ``` block"))
+
+    def test_a_bare_answer_is_still_written_verbatim(self):
+        # The behaviour that must NOT change: a model answering with plain code.
+        self.assertEqual(response_to_file_body("OK = 1\n"), "OK = 1\n")
+
+
+class TruncatedResponseRunDeckTests(unittest.TestCase):
+    """The same defect through the deck loop, on both writer paths."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-cut-")
+        self.root = os.path.join(self.tmp, "miniproject")
+        shutil.copytree(MINIPROJECT, self.root, ignore=shutil.ignore_patterns("node_modules"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _exists(self, name):
+        return os.path.exists(os.path.join(self.root, name))
+
+    def _read(self, name):
+        with open(os.path.join(self.root, name), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_a_cut_off_answer_is_not_written_as_a_file(self):
+        # No acceptance command: the card fails as if the response were missing,
+        # rather than leaving a file that opens with ```python.
+        cards = [_card("t", "gen_t.py", context_slice=["util.py"])]
+        backend = FakeBatchBackend(scripts={"t": "```python\nBROKEN = 1\n---"})
+
+        result = run_deck(cards, backend, root=self.root, poll_interval=0,
+                          log=lambda _l: None)
+
+        self.assertEqual(result.outcomes["t"].status, "failed")
+        self.assertFalse(self._exists("gen_t.py"))
+
+    def test_one_cut_off_variant_does_not_beat_a_whole_one(self):
+        cards = [_card("m", "multi.py", context_slice=["util.py"], variants=2)]
+        backend = FakeBatchBackend(scripts={
+            "m.v1": "```python\nCUT = 1",          # cut off -> unusable
+            "m.v2": _code_block("WHOLE = 2"),
+        })
+
+        result = run_deck(cards, backend, root=self.root, poll_interval=0,
+                          log=lambda _l: None)
+
+        self.assertEqual(result.outcomes["m"].status, "written")
+        self.assertEqual(result.outcomes["m"].paths,
+                         [os.path.join(self.root, "multi.m.v2.py")])
+        self.assertFalse(self._exists("multi.m.v1.py"))
+
+    def test_a_cut_off_answer_is_retried_and_told_that_it_was_cut_off(self):
+        # With acceptance: the variant is rejected WITHOUT running acceptance
+        # (there is no file to run it against), and the regeneration's
+        # instruction says why -- the fact the three wasted attempts never had.
+        cards = [_card("t", "gen_t.py", context_slice=["util.py"])]
+        cards[0].acceptance = "grep -q PASS gen_t.py"
+        backend = FakeBatchBackend(scripts={
+            "t": "```python\nPASS = 1\n# ... cut off here",
+            "t.r1": _code_block("PASS = 1"),
+        })
+
+        result = run_deck(cards, backend, root=self.root, poll_interval=0,
+                          log=lambda _l: None)
+
+        self.assertEqual(result.outcomes["t"].status, "written")
+        self.assertEqual(result.outcomes["t"].attempts, 2)
+        self.assertEqual(self._read("gen_t.py"), "PASS = 1\n")
+
+        retry_text = "".join(message["content"]
+                             for request in backend.submissions[1]
+                             for message in request["messages"])
+        self.assertIn("cut off mid-file", retry_text)
 
 
 if __name__ == "__main__":

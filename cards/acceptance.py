@@ -35,9 +35,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from cards.generations import (
+    TRUNCATED_RESPONSE_MESSAGE,
     _output_path,
     _variant_ids,
     ensure_parent_dir,
+    is_truncated_response,
     response_to_file_body,
 )
 from cards.schema import MorphCard
@@ -272,7 +274,11 @@ def verify_card(
     """Best-of-N acceptance with a sandboxed rollback, for a card WITH acceptance.
 
     The target's original state is captured up front. Each variant custom_id is
-    tried IN ORDER (``None`` responses skipped): its body is written to the
+    tried IN ORDER (a ``None`` response is skipped, and so is one cut off inside
+    an unclosed code fence -- see :func:`cards.generations.is_truncated_response`
+    -- which is rejected without running acceptance, carrying
+    :data:`cards.generations.TRUNCATED_RESPONSE_MESSAGE` as the retry's error
+    context): its body is written to the
     *real* ``card.target`` -- acceptance must test the file where it will live --
     and ``card.acceptance`` is run. The first variant to pass WINS: the target
     keeps its winning bytes, a multi-variant card also gets the winner's suffixed
@@ -302,6 +308,25 @@ def verify_card(
     for variant_id in variant_ids:
         response = responses.get(variant_id)
         if response is None:
+            continue
+        if is_truncated_response(response):
+            # A cut-off answer is a corrupt response, not a file body: it opened
+            # a ``` fence and never closed it, so there is nothing to write and
+            # nothing to run acceptance against. Rejected like a missing
+            # response -- but with a stand-in result, so the retry's error
+            # context SAYS the answer was cut off instead of arriving empty.
+            log(f"mrph> variant {variant_id!r} was cut off mid-file "
+                f"(unclosed code fence) -- rejected without running acceptance")
+            if last_result is None:
+                # Only as a STAND-IN, and only while no variant has actually
+                # run: a real acceptance failure is better retry context than
+                # this note, so the note never displaces one.
+                last_result = AcceptanceResult(
+                    passed=False,
+                    exit_code=None,
+                    output=TRUNCATED_RESPONSE_MESSAGE,
+                    timed_out=False,
+                )
             continue
 
         attempts += 1

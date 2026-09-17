@@ -26,6 +26,20 @@ Two things live here:
   ``run_deck`` executed in memory (``/nightly``), and letting a run out of a
   phase ``"submitted"`` whose batch died with the CLI process.
 
+REGENERATIONS ARE PERSISTED, NOT POLLED INLINE. A card that fails acceptance is
+resubmitted; ``run_deck`` polls that retry batch inside the same call, which is
+right for ``/nightly`` (one blocking pass is its whole contract) and was wrong
+for ``/collect``, measurably so: one ``/collect`` sat silent for an hour across
+three sequential 20-minute retry batches; a second CLI session polling the same
+deck submitted its OWN retry for the same card, so four paid batches existed at
+once; and a process that died mid-retry orphaned a paid batch nobody could
+collect. So ``collect_generation`` submits ONE retry batch, records it in
+``state["retries"]`` (keyed by the card's ORIGINAL custom_id) and RETURNS. A
+later call finds that record and polls THAT batch -- never submits a
+replacement -- so ``/collect`` is idempotent: running it ten times while a
+regeneration is in flight costs nothing and changes nothing, and a fresh session
+picks the batch up from ``state.json`` after a restart.
+
 DESIGN NOTE (flagged for review): the split-step functions live in this module
 rather than a separate one -- they are the store's reason to exist, and they need
 nothing from ``processors`` or ``flows`` (the batch backend arrives as a
@@ -41,11 +55,14 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from cards.acceptance import AcceptanceResult
 from cards.compiler import compile_card
 from cards.deck import load_deck, validate_deck
 from cards.generations import (
     CardOutcome,
+    build_retry_cards,
     process_generation,
+    process_retry_batch,
     resolve_runnable,
     split_into_generations,
 )
@@ -261,6 +278,7 @@ class DeckStore:
             "batch_id": None,          # in-flight batch id (phase "submitted")
             "backend_label": None,     # which processor(s) the in-flight batch runs on
             "submitted_ids": [],       # runnable card ids in the in-flight batch
+            "retries": {},             # original custom_id -> in-flight retry dict
             "outcomes": {},            # custom_id -> outcome dict
         }
 
@@ -395,13 +413,19 @@ def recover_orphaned_local_batch(store: DeckStore) -> bool:
 
     Only a LOCAL batch is recoverable this way. A cloud batch id (OpenAI /
     Anthropic) names work that is genuinely still running on a provider's server
-    and collectable later, so it is never touched here.
+    and collectable later, so it is never touched here. That includes a local
+    REGENERATION batch (``state["retries"]``): its worker threads died with the
+    process exactly as a first-attempt batch's do, so the record is dropped too
+    and the card goes back to the attempt it was pending -- otherwise the deck
+    wedges on a batch that can never report.
 
     Returns ``True`` when something was recovered. The generation composition and
     every recorded outcome survive -- only the in-flight bookkeeping (phase,
-    batch id, backend label, submitted ids) is cleared, so the run resumes at the
-    same generation on the next ``/submit``. Callers must only invoke this when
-    the session holds no live backend for the batch.
+    batch id, backend label, submitted ids, retries) is cleared, so the run
+    resumes at the same generation on the next ``/submit``, which re-sends just
+    the cards of that generation that have no outcome yet (see
+    :func:`submit_generation`). Callers must only invoke this when the session
+    holds no live backend for the batch.
     """
     state = store.load_state()
     if state.get("phase") != PHASE_SUBMITTED:
@@ -414,6 +438,7 @@ def recover_orphaned_local_batch(store: DeckStore) -> bool:
     state["batch_id"] = None
     state["backend_label"] = None
     state["submitted_ids"] = []
+    state["retries"] = {}
     store.save_state(state)
     return True
 
@@ -444,12 +469,22 @@ class SubmitResult:
 class CollectResult:
     """What one :func:`collect_generation` call did.
 
-    ``in_progress`` true means the batch had not finished and nothing changed --
-    the caller reports it and the user re-runs ``/collect`` later. Otherwise
-    ``outcomes`` carries the :class:`CardOutcome` for every card in the collected
-    generation (runnable + any skipped while advancing), and ``phase`` is the new
-    run phase (``"idle"`` when a further generation remains, ``"done"`` when the
-    deck is finished).
+    ``in_progress`` true means the generation is not collected yet and the caller
+    should run ``/collect`` again. Two things look like that: the batch had not
+    finished (nothing changed at all), or a card failed acceptance and this call
+    submitted its regeneration (``retry_in_flight``), which IS a change -- the
+    passing cards' outcomes and the new batch id are persisted -- but not a
+    finished generation. Otherwise ``outcomes`` carries the
+    :class:`CardOutcome` for every card in the collected generation (runnable +
+    any skipped while advancing), and ``phase`` is the new run phase (``"idle"``
+    when a further generation remains, ``"done"`` when the deck is finished).
+
+    The ``retry_*`` fields describe the regeneration the run is waiting on (set
+    whenever ``retry_in_flight``), so the CLI can say WHICH cards are being
+    regenerated, on which attempt of how many, and in which batch.
+    ``retry_submitted`` separates the call that SENT that batch (this ``/collect``
+    just spent money and has news: those cards failed acceptance) from the calls
+    that merely found it still running (which spend and change nothing).
     """
 
     in_progress: bool
@@ -457,6 +492,12 @@ class CollectResult:
     total_generations: int
     phase: str
     outcomes: Dict[str, CardOutcome] = field(default_factory=dict)
+    retry_in_flight: bool = False
+    retry_submitted: bool = False
+    retry_attempt: int = 0
+    retry_limit: int = 0
+    retry_card_ids: List[str] = field(default_factory=list)
+    retry_batch_id: Optional[str] = None
 
 
 def _ensure_run_started(store: DeckStore, state: dict, cards: List[MorphCard]) -> None:
@@ -487,8 +528,9 @@ def submit_generation(
 
     On the first call of a run the generation composition is locked in from the
     backlog. Cards whose dependency already failed/was skipped are recorded as
-    ``skipped`` and the loop advances to the next generation that has runnable
-    cards; that generation is compiled (reading the fresh files earlier
+    ``skipped`` (and a card of this generation that already has an outcome is
+    left alone -- see the loop below) and the loop advances to the next
+    generation that has runnable cards; that generation is compiled (reading the fresh files earlier
     generations wrote) and submitted as one batch. The batch id and the runnable
     ids are saved and the phase moves to ``"submitted"``.
 
@@ -529,6 +571,13 @@ def submit_generation(
         for cid in outcomes:
             if cid not in before and outcomes[cid].status == STATUS_SKIPPED:
                 skipped_here.append((cid, outcomes[cid].reason))
+        # A card of THIS generation that already has an outcome is settled --
+        # written or failed -- and must not be sent again. It only happens after
+        # a recovery (:func:`recover_orphaned_local_batch` returns a lost local
+        # regeneration to pending while its generation-mates keep their
+        # outcomes); re-sending them would pay for morphs already on disk and
+        # overwrite accepted files.
+        runnable = [card for card in runnable if card.custom_id not in before]
         if runnable:
             break
         index += 1
@@ -569,6 +618,75 @@ def submit_generation(
         skipped=skipped_here)
 
 
+def _pending_from_retries(
+    retries: dict, by_id: Dict[str, MorphCard]
+) -> Tuple[List[tuple], int]:
+    """Rebuild a recorded regeneration into ``(pending, attempt)``.
+
+    ``pending`` is the ``(card, previous AcceptanceResult or None)`` shape
+    :func:`cards.generations.process_retry_batch` judges -- the card read back
+    from the backlog, the error context read back from the record (as a stand-in
+    :class:`AcceptanceResult`, since only its ``output`` is ever used: it is what
+    the NEXT attempt's instruction would quote). A recorded card that has since
+    left the backlog is dropped, the same way every other id read from state is
+    filtered through ``by_id``.
+
+    ``attempt`` is the attempt number the recorded batch IS (1 = first
+    regeneration). By construction every entry of one record shares it -- they
+    were submitted together -- so the maximum is that number and is also correct
+    for a record hand-edited into disagreement.
+    """
+    pending: List[tuple] = []
+    attempt = 0
+    for custom_id, entry in retries.items():
+        attempt = max(attempt, int(entry.get("attempt", 1)))
+        card = by_id.get(custom_id)
+        if card is None:
+            continue
+        output = entry.get("acceptance_output")
+        previous = None if output is None else AcceptanceResult(
+            passed=False, exit_code=None, output=output, timed_out=False)
+        pending.append((card, previous))
+    return pending, attempt
+
+
+def _record_retry(
+    store: DeckStore,
+    state: dict,
+    pending: List[tuple],
+    attempt: int,
+    batch_id: str,
+    outcomes: Dict[str, CardOutcome],
+) -> None:
+    """Persist a just-submitted regeneration batch as the run's in-flight work.
+
+    The phase stays ``"submitted"`` and ``generation_index`` does not move -- the
+    generation is not collected until every card of it is settled -- but
+    ``batch_id`` now points at the RETRY batch, so ``/deck`` names what is
+    actually in a queue, a restarted session polls the right thing, and
+    :func:`recover_orphaned_local_batch` sees a ``local-`` id and can free a
+    local retry that died with its process. ``submitted_ids`` is deliberately
+    left as the whole generation's runnable list: the cards that already passed
+    now have outcomes (so ``/deck`` shows them written), the regenerating ones do
+    not (so ``/deck`` shows them in flight), and the final ``CollectResult``
+    still reports the generation entire.
+    """
+    state["batch_id"] = batch_id
+    state["retries"] = {
+        card.custom_id: {
+            "attempt": attempt,
+            "batch_id": batch_id,
+            "backend_label": state.get("backend_label"),
+            # The previous attempt's acceptance output, so a regeneration that
+            # outlives the process still knows what to tell the executor.
+            "acceptance_output": previous.output if previous is not None else None,
+        }
+        for card, previous in pending
+    }
+    _store_outcomes(state, outcomes)
+    store.save_state(state)
+
+
 def collect_generation(
     store: DeckStore,
     backend,
@@ -581,15 +699,30 @@ def collect_generation(
 ) -> CollectResult:
     """Poll the in-flight batch once; if finished, process it and advance.
 
-    ``backend.status`` is polled a SINGLE time. If the batch is still running the
-    call returns immediately with ``in_progress`` true and changes nothing -- the
-    CLI reports it and the user re-runs ``/collect`` later (``LocalBatchBackend``
-    briefly blocks inside ``collect`` while its worker threads drain; that is
-    fine). Once the batch has ended, its results are handed to
-    :func:`cards.generations.process_generation` -- identical best-of-N,
-    rollback, and inline-retry semantics to ``run_deck`` -- the outcomes are
-    persisted, and the run advances to the next generation (phase ``"idle"``) or
-    finishes (phase ``"done"``).
+    ``backend.status`` is polled a SINGLE time, for whichever batch the run is
+    waiting on -- the generation's own, or a regeneration submitted by an earlier
+    ``/collect``. If it is still running the call returns immediately with
+    ``in_progress`` true and changes nothing; the CLI reports it and the user
+    re-runs ``/collect`` later (``LocalBatchBackend`` briefly blocks inside
+    ``collect`` while its worker threads drain; that is fine).
+
+    Once the batch has ended its results are judged -- a first batch by
+    :func:`cards.generations.process_generation` (identical best-of-N and
+    rollback semantics to ``run_deck``), a regeneration by
+    :func:`cards.generations.process_retry_batch` -- and then:
+
+    * every card settled: the outcomes are persisted and the run advances to the
+      next generation (phase ``"idle"``) or finishes (phase ``"done"``);
+    * a card failed acceptance with regenerations left: ONE retry batch is
+      submitted and RECORDED (:func:`_record_retry`), and the call returns with
+      ``in_progress`` and ``retry_in_flight`` true. It is NOT polled here -- that
+      is the difference from ``run_deck``, and the whole point: a second
+      ``/collect`` (in this session or a later one) finds the record and polls
+      that same batch instead of paying for a second one.
+
+    Attempt counting is unchanged: ``max_regenerations`` (default 2) allows at
+    most 3 attempts in total, and the final :class:`CardOutcome` is the one
+    ``run_deck`` would have recorded.
 
     Raises :class:`StoreError` if nothing is in flight (``phase !=
     "submitted"``). ``backend`` is duck-typed: ``status``, ``collect`` and (for
@@ -604,35 +737,78 @@ def collect_generation(
     batch_id = state["batch_id"]
     total = len(state["generations"])
     index = state.get("generation_index", 0)
+    retries = state.get("retries") or {}
 
     status = backend.status(batch_id)
     if status not in ("completed", "failed"):
+        # Nothing is written and nothing is submitted -- this is the call that
+        # must stay free, however many times a polling loop makes it.
         return CollectResult(
             in_progress=True, generation_number=index + 1,
-            total_generations=total, phase=PHASE_SUBMITTED)
+            total_generations=total, phase=PHASE_SUBMITTED,
+            retry_in_flight=bool(retries),
+            retry_attempt=max((int(entry.get("attempt", 1))
+                               for entry in retries.values()), default=0),
+            retry_limit=max_regenerations,
+            retry_card_ids=sorted(retries),
+            retry_batch_id=batch_id if retries else None)
 
     cards = store.load_cards()
     by_id = {card.custom_id: card for card in cards}
-    runnable = [by_id[cid] for cid in state.get("submitted_ids", []) if cid in by_id]
+    submitted_ids = [cid for cid in state.get("submitted_ids", []) if cid in by_id]
 
     outcomes = _outcomes_from_state(state)
     blocked = _blocked_from_outcomes(outcomes)
 
     results = None if status == "failed" else backend.collect(batch_id)
 
-    process_generation(
-        runnable, results, index + 1, total, root, backend, poll_interval, log,
-        verify, acceptance_timeout, max_regenerations, outcomes, blocked)
+    if retries:
+        pending, attempt = _pending_from_retries(retries, by_id)
+        retry_cards = build_retry_cards(
+            pending, attempt, index + 1, total, max_regenerations,
+            log=lambda _line: None)  # already logged when it was submitted
+        pending = process_retry_batch(
+            retry_cards, pending, results, attempt, index + 1, total, root, log,
+            acceptance_timeout, max_regenerations, outcomes, blocked)
+    else:
+        attempt = 0
+        pending = process_generation(
+            runnable=[by_id[cid] for cid in submitted_ids],
+            results=results, index=index + 1, total=total, root=root,
+            backend=backend, poll_interval=poll_interval, log=log, verify=verify,
+            acceptance_timeout=acceptance_timeout,
+            max_regenerations=max_regenerations, outcomes=outcomes,
+            blocked=blocked, inline_retries=False)
+
+    if pending:
+        # Submit the next regeneration, persist it, and stop. The generation
+        # stays in flight; /collect run again polls exactly this batch.
+        attempt += 1
+        next_cards = build_retry_cards(
+            pending, attempt, index + 1, total, max_regenerations, log)
+        requests: List[dict] = []
+        for retry_card in next_cards:
+            requests.extend(compile_card(retry_card, root))
+        retry_batch_id = backend.submit(requests)
+        _record_retry(store, state, pending, attempt, retry_batch_id, outcomes)
+        return CollectResult(
+            in_progress=True, generation_number=index + 1,
+            total_generations=total, phase=PHASE_SUBMITTED,
+            retry_in_flight=True, retry_submitted=True, retry_attempt=attempt,
+            retry_limit=max_regenerations,
+            retry_card_ids=[card.custom_id for card, _previous in pending],
+            retry_batch_id=retry_batch_id)
 
     next_index = index + 1
     state["phase"] = PHASE_DONE if next_index >= total else PHASE_IDLE
     state["generation_index"] = next_index
     state["batch_id"] = None
     state["submitted_ids"] = []
+    state["retries"] = {}
     _store_outcomes(state, outcomes)
     store.save_state(state)
 
-    reported = {card.custom_id: outcomes[card.custom_id] for card in runnable}
+    reported = {cid: outcomes[cid] for cid in submitted_ids if cid in outcomes}
     return CollectResult(
         in_progress=False, generation_number=index + 1, total_generations=total,
         phase=state["phase"], outcomes=reported)

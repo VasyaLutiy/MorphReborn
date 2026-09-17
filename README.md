@@ -217,7 +217,13 @@ batch executors, generation by generation. Five commands drive it:
   processor.
 - `/collect` — poll the in-flight batch; when it is ready, verify each card's
   acceptance (best-of-N, with failed cards regenerated before their dependents),
-  write the morphs, and advance to the next generation.
+  write the morphs, and advance to the next generation. A regeneration is a
+  batch of its own: `/collect` submits it, records it in `.morph/state.json` and
+  returns, so running `/collect` again polls *that* batch instead of paying for
+  a second one — however many times, from however many sessions. `/collect wait`
+  polls in a loop until the generation lands (across its regenerations),
+  printing what it is waiting for and for how long, instead of leaving you to
+  guess whether a 40-minute queue is slow or hung.
 - `/nightly` — run the entire deck in one blocking pass (submit → poll →
   collect, generation after generation) and print the run summary.
 
@@ -246,7 +252,7 @@ so `/submit` and `/collect` survive quitting and restarting the CLI — and so d
 a `/nightly` run, whose outcomes `/deck` reports afterwards. A *local* batch is
 the exception: it lives in the worker threads of the process that fired it, so if
 the CLI is restarted between `/submit` and `/collect` its cards are quietly
-returned to `pending` for the next `/submit`.
+returned to `pending` for the next `/submit` — a regeneration batch included.
 
 See [`documentation/batch-orchestrator.md`](./documentation/batch-orchestrator.md)
 for the design, [`documentation/NEW_PARADIGN.md`](./documentation/NEW_PARADIGN.md)
