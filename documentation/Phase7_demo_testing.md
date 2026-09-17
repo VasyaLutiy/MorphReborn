@@ -42,9 +42,35 @@ git config user.email demo@morph.local && git config user.name "Morph Demo"
 **запекайте заранее**, до начала презентации, и показывайте на нём результат и
 `git log`, а механику крутите на быстром контуре.
 
-> Быстрый контур требует stub-узлов — минимального OpenAI-совместимого сервера,
-> отдающего заготовленные ответы по маркеру в инструкции. См. «Открытые
-> зависимости» в конце.
+### Быстрый контур: поднять stub-узлы
+
+```bash
+python3 tests/stub_node.py --port 8080 --answers tests/stub_answers.json --name stub-a &
+python3 tests/stub_node.py --port 8081 --answers tests/stub_answers.json --name stub-b &
+```
+
+Это минимальный OpenAI-совместимый сервер: отдаёт заготовленный ответ по маркеру
+`[[STUB:<ключ>]]` в инструкции карты. Ответы лежат в `tests/stub_answers.json` —
+сценарий демо правит их, не трогая код сервера. Ключ вида `<ключ>@2` отвечает
+иначе на второй вызов: так показывается best-of-N и перегенерация.
+Добавьте `--log-dir /tmp/morph-prompts`, чтобы поймать скомпилированные промпты
+и показать, что именно уехало исполнителю.
+
+`.env` для этого контура:
+
+```
+MRPH_PROCESSORS=stub-a,stub-b
+MRPH_PROCESSOR_stub-a_TYPE=llama_cpp
+MRPH_PROCESSOR_stub-a_ENDPOINT_URI=http://127.0.0.1:8080/v1
+MRPH_PROCESSOR_stub-a_MODEL=stub-a
+MRPH_PROCESSOR_stub-b_TYPE=llama_cpp
+MRPH_PROCESSOR_stub-b_ENDPOINT_URI=http://127.0.0.1:8081/v1
+MRPH_PROCESSOR_stub-b_MODEL=stub-b
+```
+
+Карты демо ссылаются на готовые ключи: `cs-calc` (модуль плюс его тест),
+`cs-bad` (три файла, приёмка провалится), `cs-retry` (первая попытка красная,
+вторая зелёная), `cs-single` (один файл).
 
 ---
 
@@ -231,9 +257,9 @@ mrph> git: off for this run -- no branch, no commits (the morphs still land in t
 | `/collect` говорит «still in progress» | так и задумано: голый `/collect` — один опрос, ждёт `/collect wait` |
 | архив не коммитится | `.gitignore` без `!.morph/runs/`; см. такт 7 |
 
-## Открытые зависимости
+## Оснастка
 
-- **Stub-узлы для быстрого контура** пока живут вне репозитория. Без них
-  демонстрировать механику в реальном времени нельзя — только на боевом
-  провайдере с двадцатиминутным циклом. Нужно занести в репозиторий как
-  тестовую оснастку.
+Всё нужное лежит в репозитории: `tests/stub_node.py` (сервер),
+`tests/stub_answers.json` (ответы демо), `tests/test_stub_node.py` (17 тестов на
+саму оснастку). Никаких зависимостей сверх стандартной библиотеки; сервер пишет
+баннер и лог запросов в stderr, оставляя stdout под протокол.

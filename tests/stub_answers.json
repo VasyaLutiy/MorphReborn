@@ -1,0 +1,8 @@
+{
+  "__about__": "This file is data for tests/stub_node.py: a marker key -> the answer the node returns when a prompt carries [[STUB:<key>]]. A key written <key>@<n> answers the n-th call for that key, which is how the regeneration path is made reproducible. Keys starting with '__' are documentation and are never matched. Multi-target answers use the 'FILE: <path>' + fenced block form of cards.compiler.MULTI_TARGET_DIRECTIVE; a single-target answer is one bare fenced block, Morph 1.0's shape.",
+  "cs-calc": "FILE: pkg_demo/calc.py\n```python\n\"\"\"Arithmetic the demo card was asked for.\"\"\"\n\n\ndef add(a, b):\n    \"\"\"Return the sum of ``a`` and ``b``.\"\"\"\n    return a + b\n```\n\nFILE: tests/test_calc_demo.py\n```python\nimport unittest\n\nfrom pkg_demo.calc import add\n\n\nclass AddTests(unittest.TestCase):\n\n    def test_adds_two_numbers(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_adds_negative_numbers(self):\n        self.assertEqual(add(-2, -3), -5)\n```\n",
+  "cs-bad": "FILE: pkg_bad/one.py\n```python\nVALUE = 1\n```\n\nFILE: pkg_bad/two.py\n```python\nfrom pkg_bad.one import VALUE\n\nDOUBLED = VALUE * 2\n```\n\nFILE: pkg_bad/three.py\n```python\nfrom pkg_bad.two import DOUBLED\n\nTRIPLED = DOUBLED * 3\n```\n",
+  "cs-retry@1": "```python\n\"\"\"First attempt: the value is wrong, so acceptance fails and the card is regenerated.\"\"\"\n\nVALUE = 0\n```\n",
+  "cs-retry@2": "```python\n\"\"\"Second attempt, written after the failing acceptance came back in the prompt.\"\"\"\n\nVALUE = 999\n```\n",
+  "cs-single": "```python\n\"\"\"A single-target card's answer: one fenced block, no path markers.\"\"\"\n\n\ndef greet(name):\n    return f\"hello, {name}\"\n```\n"
+}
