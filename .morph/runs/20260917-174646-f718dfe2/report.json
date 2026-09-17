@@ -1,0 +1,79 @@
+{
+  "deck_id": "20260917-174646-f718dfe2",
+  "completed_at": "2026-09-17T19:15:28.818",
+  "branch": "morph/20260917-174646-f718dfe2",
+  "backend_label": "glm",
+  "generations": [
+    [
+      "collect-names-the-rejection",
+      "keep-the-failed-attempt-output",
+      "deck-clear-command",
+      "preflight-the-batch-slug",
+      "demo-script-truth"
+    ]
+  ],
+  "batch_ids": [
+    "batch-1789656408-u8i5RwDvOB3nCWXFGo44",
+    "batch-1789658588-lLBbiwNdDcQsg2cCvYLb",
+    "batch-1789660381-OjNyxTt1lpolqXRzaNt3"
+  ],
+  "outcomes": {
+    "preflight-the-batch-slug": {
+      "custom_id": "preflight-the-batch-slug",
+      "status": "written",
+      "paths": [
+        "./processors/batch.py",
+        "./tests/test_batch_slug_preflight.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "preflight-the-batch-slug",
+      "acceptance_output": null
+    },
+    "collect-names-the-rejection": {
+      "custom_id": "collect-names-the-rejection",
+      "status": "written",
+      "paths": [
+        "./cards/store.py",
+        "./tests/test_collect_rejection_reason.py"
+      ],
+      "reason": null,
+      "attempts": 2,
+      "winning_variant": "collect-names-the-rejection.r1.v1",
+      "acceptance_output": null
+    },
+    "keep-the-failed-attempt-output": {
+      "custom_id": "keep-the-failed-attempt-output",
+      "status": "written",
+      "paths": [
+        "./cards/generations.py",
+        "./tests/test_failed_attempt_diagnostics.py"
+      ],
+      "reason": null,
+      "attempts": 2,
+      "winning_variant": "keep-the-failed-attempt-output.r1.v1",
+      "acceptance_output": null
+    },
+    "deck-clear-command": {
+      "custom_id": "deck-clear-command",
+      "status": "written",
+      "paths": [
+        "./flows/morph.py",
+        "./tests/test_deck_clear.py"
+      ],
+      "reason": null,
+      "attempts": 2,
+      "winning_variant": "deck-clear-command.r1",
+      "acceptance_output": null
+    },
+    "demo-script-truth": {
+      "custom_id": "demo-script-truth",
+      "status": "failed",
+      "paths": [],
+      "reason": null,
+      "attempts": 3,
+      "winning_variant": null,
+      "acceptance_output": ""
+    }
+  }
+}
