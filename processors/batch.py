@@ -426,6 +426,13 @@ class OpenRouterBatchBackend(BatchBackend):
       array in the very same poll response, so ``collect`` makes exactly one
       request and never downloads an output file.
 
+    A batch the provider rejected carries the explanation on the batch object
+    itself -- ``{"error": {"message": "HTTP 400: invalid batch inference job:
+    ..."}}`` -- which ``status`` would reduce to a bare ``"failed"``;
+    :meth:`failure_reason` surfaces that message so an operator whose deck
+    reports every card failed can read WHY without curling the batch API by
+    hand.
+
     ``transport`` is the test seam, mirroring the other backends'
     ``client_factory``: a callable ``(method, url, payload) -> (status_code,
     parsed_json)``. The default one does real HTTP over ``urllib.request``.
@@ -542,6 +549,52 @@ class OpenRouterBatchBackend(BatchBackend):
         for entry in batch.get("results") or []:
             results[entry.get("custom_id")] = self._parse_result(entry)
         return results
+
+    def failure_reason(self, batch_id: str) -> Optional[str]:
+        """The provider's explanation for a rejected batch, or ``None``.
+
+        ``status`` reads only the ``status`` string, so a batch the provider
+        rejected -- GET answers with the batch object carrying e.g.
+        ``{"error": {"message": "HTTP 400: invalid batch inference job:
+        job-submission-count for account alex-79b5d6, in use: 16, quota: 16"}}``
+        -- normalizes to plain ``"failed"`` and the reason is dropped: every
+        card in the deck reports as failed with no why, and the operator has to
+        curl the batch API by hand to learn the deck was over a submission
+        quota. This returns the message the batch object carries, so the caller
+        can print it next to the failure; ``None`` means the object names no
+        error (a healthy or merely unfinished batch).
+
+        One ``_retrieve``, so the read-after-write grace window of
+        :data:`OPENROUTER_SUBMIT_GRACE_SECONDS` applies unchanged. Within it, a
+        404 for the id this instance just submitted returns ``None`` -- "not
+        visible yet" is not a failure and must never raise here, the batch may
+        still be on its way -- while a 404 outside the window, or any other
+        status code, still raises the same RuntimeError ``status`` would, body
+        and all, because an operator must read it.
+        """
+        try:
+            batch = self._retrieve(batch_id)
+        except _BatchNotVisibleYet:
+            return None
+        return self._error_message(batch)
+
+    @staticmethod
+    def _error_message(batch: dict) -> Optional[str]:
+        """A batch object -> the error message it carries, or ``None``.
+
+        The documented shape is ``{"error": {"message": ...}}``; anything else
+        (the key absent, ``null``, an empty message) is "no reason available"
+        and yields ``None`` rather than a stringified non-answer.
+        """
+        error = batch.get("error")
+        if not error:
+            return None
+        if isinstance(error, dict):
+            message = error.get("message")
+            return message or None
+        # Not the documented shape, but a non-empty error is still a reason:
+        # report it as text instead of discarding it.
+        return str(error)
 
     @staticmethod
     def _parse_result(entry: dict) -> Optional[str]:
