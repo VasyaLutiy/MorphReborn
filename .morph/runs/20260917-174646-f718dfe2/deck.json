@@ -1,0 +1,76 @@
+[
+  {
+    "custom_id": "collect-names-the-rejection",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "cards/store.py",
+        "tests/test_collect_rejection_reason.py"
+      ],
+      "context_slice": [
+        "processors/batch.py"
+      ],
+      "acceptance": "python3 -c \"import sys;s=open('cards/store.py').read();sys.exit(0 if s.count(chr(34)*3)>=69 else 1)\" && python3 -m pytest tests/test_collect_rejection_reason.py -q && python3 -m pytest -q",
+      "variants": 2
+    },
+    "instruction": "In collect_generation a batch the provider rejected becomes results = None and every card is recorded as failed without one word about why. The provider does explain itself: OpenRouterBatchBackend.failure_reason(batch_id) returns its message, for example 'HTTP 400: invalid batch inference job: job-submission-count for account alex-79b5d6, in use: 16, quota: 16'.\n\nWhen the polled status is 'failed', ask the backend for that message and pass it to log() as one line naming the batch, e.g. \"mrph> the provider rejected batch <id>: <message>\". The call must be optional and harmless: backends without failure_reason (the local, OpenAI and Anthropic ones) must keep working untouched, so reach for it with getattr and skip it when absent; an exception from it must never break collection. Do not change any function signature and do not change which cards are recorded as failed -- this adds a diagnosis, not a policy.\n\nAlso write a NEW self-contained pytest tests/test_collect_rejection_reason.py covering: the message reaches the log; a backend without failure_reason still collects a failed batch; a failure_reason that raises does not break collection. Build fixtures the way tests/test_store.py does.\n\nPreserve every existing docstring and comment in cards/store.py verbatim -- the file's explanatory prose is load-bearing and must come back untouched."
+  },
+  {
+    "custom_id": "keep-the-failed-attempt-output",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "cards/generations.py",
+        "tests/test_failed_attempt_diagnostics.py"
+      ],
+      "context_slice": [
+        "cards/store.py"
+      ],
+      "acceptance": "python3 -c \"import sys;s=open('cards/generations.py').read();sys.exit(0 if s.count(chr(34)*3)>=49 else 1)\" && python3 -m pytest tests/test_failed_attempt_diagnostics.py -q && python3 -m pytest -q",
+      "variants": 2
+    },
+    "instruction": "A card that failed acceptance twice and passed on its third attempt reports status 'written' with acceptance_output = None, so the evidence of WHY the earlier attempts failed is gone by the time anyone reads the run report. That diagnosis is exactly what an operator needs to fix a bad criterion.\n\nKeep it. Add a NEW optional field to CardOutcome -- name it earlier_failures: Optional[str] -- that carries the captured acceptance output of the LAST failed attempt of a card that was eventually accepted. Populate it where a retried card is finally recorded as written, reusing the existing _acceptance_output helper. The field must be additive: default None, serialized alongside the others, and absent from a card that passed on its first attempt. Do not rename or repurpose acceptance_output, and do not change any existing status semantics.\n\nAlso write a NEW self-contained pytest tests/test_failed_attempt_diagnostics.py covering: a card accepted on a retry carries the earlier failure's output; a card accepted on the first attempt has earlier_failures None; a card that failed for good still reports through acceptance_output as before.\n\nPreserve every existing docstring and comment in cards/generations.py verbatim."
+  },
+  {
+    "custom_id": "deck-clear-command",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "flows/morph.py",
+        "tests/test_deck_clear.py"
+      ],
+      "context_slice": [
+        "cards/store.py"
+      ],
+      "acceptance": "python3 -c \"import sys;s=open('flows/morph.py').read();sys.exit(0 if s.count(chr(34)*3)>=37 else 1)\" && python3 -m pytest tests/test_deck_clear.py -q && python3 -m pytest -q"
+    },
+    "instruction": "There is no way to empty the backlog from the CLI. '/deck reset' discards the run state but keeps every card pending, so an operator who wants a fresh deck has to delete .morph/deck.json by hand -- which is exactly what happened during a live session today.\n\nAdd '/deck clear' as a third argument alongside the existing '/deck reset' and '/deck runs', following their pattern exactly. It empties the backlog using the DeckStore.clear() method that already exists, and answers with one line saying what it did and that the run state is untouched. Refuse politely -- changing nothing -- when a run is in flight (phase 'submitted'), telling the operator to run '/deck reset' first: throwing away cards whose batch is still out there would strand the results. Update the '/deck' help line in the command list so the new argument is discoverable.\n\nAlso write a NEW self-contained pytest tests/test_deck_clear.py covering: the backlog is empty afterwards; an in-flight run is refused and the backlog survives; the help text names the new argument.\n\nPreserve every existing docstring and comment in flows/morph.py verbatim."
+  },
+  {
+    "custom_id": "preflight-the-batch-slug",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "processors/batch.py",
+        "tests/test_batch_slug_preflight.py"
+      ],
+      "context_slice": [
+        "processors/registry.py"
+      ],
+      "acceptance": "python3 -c \"import sys;s=open('processors/batch.py').read();sys.exit(0 if s.count(chr(34)*3)>=43 else 1)\" && python3 -m pytest tests/test_batch_slug_preflight.py -q && python3 -m pytest -q"
+    },
+    "instruction": "OpenRouter lists ':batch' slugs in its model catalogue that have no batch endpoint behind them. Submitting such a deck comes back as HTTP 400 with \"Model 'anthropic/claude-sonnet-5:batch' does not have a :batch endpoint.\" -- measured today on four Anthropic slugs. The whole generation dies for a reason that has nothing to do with the cards.\n\nMake that failure legible at the point of submission. In OpenRouterBatchBackend.submit, when the POST is rejected and the response body says the model has no batch endpoint, raise a RuntimeError whose message names the offending model slug and says plainly that this slug is listed in the catalogue but has no batch endpoint, so a different model must be configured. Every other submission failure must keep its current message and behaviour.\n\nAlso write a NEW self-contained pytest tests/test_batch_slug_preflight.py covering: the no-batch-endpoint rejection produces the new message naming the slug; an unrelated HTTP 400 keeps the old generic message; a successful submission is unaffected. Drive it through the constructor's transport=... seam as tests/test_batch_backends.py does, with your own fakes.\n\nPreserve every existing docstring and comment in processors/batch.py verbatim."
+  },
+  {
+    "custom_id": "demo-script-truth",
+    "meta": {
+      "intent": "patch",
+      "target": "documentation/Phase7_demo_testing.md",
+      "context_slice": [
+        "cards/generations.py"
+      ],
+      "acceptance": "python3 -c \"import sys;s=open('documentation/Phase7_demo_testing.md').read();sys.exit(0 if ('ls pkg_bad' not in s and len(s)>6000) else 1)\""
+    },
+    "instruction": "Two claims in this demo script are contradicted by real runs and must be corrected in place; everything else stays as it is, including the tone, the structure and the eight-beat scenario.\n\n1. Beat 6 tells the presenter to run 'ls pkg_bad' and says the directory is absent. It is not: cards/generations.py creates parent directories before writing and deliberately leaves them behind (see the 'Rollback note' in its docstring) -- an empty directory is harmless and removing it would race. Replace that command with checks that are actually true and stronger: 'git status --porcelain' is empty and no commit exists for the rejected card. Explain in one sentence that atomicity is about files and commits, not about directory entries, and that git does not track empty directories.\n\n2. The claim that provider queue time is about twenty minutes regardless of batch size is true only of one model. Measured 17.09.2026 on identical single-card work: one model returned a two-card generation in 6 minutes, z-ai/glm-5.3-flash took 37m54s and then 22m54s on the regeneration, and anthropic/claude-opus-5 was still queued past 100 minutes. Rewrite that paragraph and the corresponding row of the numbers table so the figure is a per-model range, not a constant, and keep the conclusion that a wide deck is nearly free in time, because the queue is charged per batch and not per card.\n\nReturn the whole file. Keep it in Russian, keep its Markdown structure, and do not touch any other section."
+  }
+]

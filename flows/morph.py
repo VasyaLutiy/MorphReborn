@@ -547,7 +547,7 @@ class MorphBot(ConsoleBot):
 /exit - Exit the application gracefully.
 
 Morph 2.0 batch orchestrator (see documentation/batch-orchestrator.md):
-/deck - Show the backlog, its generations and each card's status ("/deck reset" discards the run state, keeping the backlog; "/deck runs" lists the archived runs).
+/deck - Show the backlog, its generations and each card's status ("/deck reset" discards the run state, keeping the backlog; "/deck clear" empties the backlog, keeping the run state; "/deck runs" lists the archived runs).
 /card - Add a card: "/card" pastes one as JSON; "/card <goal>" decomposes a goal into cards.
 /submit - Compile and submit the current generation ("@id" pins a processor, "@all" the local pool).
 /collect - Fetch, verify and integrate the submitted generation, then advance ("/collect wait" polls until it lands, printing progress).
@@ -934,6 +934,33 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     chat_id=chat_id,
                     text="mrph> Run state discarded (.morph/state.json). The backlog "
                          "is kept; every card is pending again.")
+
+            # ``clear`` empties the BACKLOG the way ``reset`` empties the run
+            # state: until now the only way to start a fresh deck was to delete
+            # .morph/deck.json by hand, from outside the CLI that owns it. It
+            # answers with one line and returns (as ``runs`` does): the line
+            # already says what happened to each file, and a deck view of an
+            # empty backlog would repeat it at greater length. A run IN FLIGHT
+            # is refused rather than served -- the batch is out in a queue
+            # already and paid for, and its results can only land on cards
+            # that still exist, so clearing the backlog first would strand
+            # them; /deck reset returns the cards to pending without touching
+            # the batch, and the clear works once it has run.
+            if len(arguments) > 1 and arguments[1].lower() == "clear":
+                store = DeckStore(".")
+                if store.load_state().get("phase") == "submitted":
+                    await action["context"].bot.send_message(
+                        chat_id=chat_id,
+                        text="mrph> A generation is still in flight -- clearing the "
+                             "backlog now would strand its results. Run /deck reset "
+                             "first to return the cards to pending, then /deck clear.")
+                    return
+                store.clear()
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text="mrph> Backlog emptied (.morph/deck.json). The run state is "
+                         "untouched.")
+                return
             await action["context"].bot.send_message(chat_id=chat_id, text=self._deck_text())
 
         return transition

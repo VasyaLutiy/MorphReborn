@@ -124,6 +124,16 @@ class CardOutcome:
     verification); ``acceptance_output`` is the final failure's captured output
     (``None`` when the card passed or has no acceptance). A card without
     acceptance keeps ``attempts == 1`` and both others ``None``.
+
+    ``earlier_failures`` completes the picture for a card that was accepted only
+    after failed acceptance tries: it carries the captured acceptance output of
+    the LAST of those failed attempts, so the run report keeps the evidence of
+    WHY the earlier tries were rejected -- the diagnosis an operator needs to
+    fix a bad criterion. ``acceptance_output`` cannot hold it: it is set only
+    on a terminal failure, so a card that passed on its third attempt used to
+    report nothing about the first two. ``None`` for a card accepted on its
+    first attempt, for a card without acceptance, and when the last failed
+    attempt left no captured output at all.
     """
 
     custom_id: str
@@ -133,6 +143,11 @@ class CardOutcome:
     attempts: int = 1
     winning_variant: Optional[str] = None
     acceptance_output: Optional[str] = None
+    # The captured acceptance output of the LAST failed attempt of a card that
+    # was eventually accepted on a retry -- the diagnosis behind the success,
+    # which ``acceptance_output`` (set only on a terminal failure) drops. None
+    # unless a retry succeeded after a failure that produced captured output.
+    earlier_failures: Optional[str] = None
 
     def __str__(self) -> str:
         if self.status == "written":
@@ -923,6 +938,12 @@ def process_retry_batch(
     included: a card accepted on its third attempt becomes a commit exactly as
     one accepted on its first does, and the hook is handed the ORIGINAL card, not
     the regenerated stand-in whose instruction carries an error message.
+
+    A card accepted on a retry also records ``earlier_failures`` on its outcome:
+    :func:`_acceptance_output` of the pending pair's result -- the captured
+    output of the failed attempt this retry replaces, which is the card's LAST
+    failed attempt, kept because ``acceptance_output`` reports it only on a
+    terminal failure.
     """
     from cards.acceptance import verify_card
 
@@ -942,7 +963,7 @@ def process_retry_batch(
         return []
 
     next_pending: List[tuple] = []
-    for retry_card, (card, _prev) in zip(retry_cards, pending):
+    for retry_card, (card, prev_result) in zip(retry_cards, pending):
         outcome = verify_card(retry_card, results, root, acceptance_timeout, log)
         if outcome.passed:
             outcomes[card.custom_id] = CardOutcome(
@@ -951,6 +972,11 @@ def process_retry_batch(
                 paths=outcome.paths,
                 attempts=1 + attempt,
                 winning_variant=outcome.winning_custom_id,
+                # ``prev_result`` is the attempt this retry just replaced -- the
+                # card's LAST failed one -- and its captured output is the
+                # evidence of why the earlier tries were rejected, which
+                # ``acceptance_output`` reports only on a terminal failure.
+                earlier_failures=_acceptance_output(prev_result),
             )
             log(
                 f"mrph> [generation {index}/{total}] {card.custom_id!r} "
