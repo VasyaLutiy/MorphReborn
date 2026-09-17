@@ -34,6 +34,7 @@ import abc
 import io
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -316,6 +317,20 @@ _ERROR_BODY_LIMIT = 500
 # cards had already passed.
 OPENROUTER_SUBMIT_GRACE_SECONDS = 60.0
 
+# How long one HTTP call to the batch API may take before it is abandoned.
+# ``urlopen``'s single ``timeout`` covers the connect AND every socket read, so
+# one number bounds the whole call. Without it a hung connection blocks FOREVER:
+# ``urlopen`` inherits Python's default socket timeout, which is ``None`` --
+# and the block happens inside a ``/collect`` that prints nothing while it waits,
+# so the operator sees a deck that is simply never collected, with no error, no
+# traceback and no log line to act on.
+#
+# Two minutes, not ten seconds: submit POSTs the whole compiled deck inline and
+# a completed poll returns every result inline (see the class docstring), so
+# these are genuinely large bodies on a slow link. The number bounds a wedged
+# socket, it does not police latency.
+OPENROUTER_HTTP_TIMEOUT_SECONDS = 120.0
+
 
 class _BatchNotVisibleYet(RuntimeError):
     """Internal: a 404 for a just-submitted id, inside the grace period above.
@@ -342,6 +357,14 @@ def _default_openrouter_transport(api_key: Optional[str]) -> Callable[[str, str,
     A 4xx/5xx is returned as ``(status, body)`` rather than raised -- the
     backend turns it into an error message naming the status code, and an error
     body is exactly the part an operator needs to read.
+
+    A TIMEOUT is the one transport-level failure translated here (see
+    :data:`OPENROUTER_HTTP_TIMEOUT_SECONDS`). It arrives in two shapes --
+    ``socket.timeout`` raised out of a read, or wrapped in a
+    ``urllib.error.URLError`` when the connect is what expired -- and both are
+    re-raised as a ``RuntimeError`` naming the seconds, the method and the URL,
+    because "the batch API did not answer in 120s" is something an operator can
+    act on and a bare socket traceback is not.
     """
 
     def transport(method: str, url: str, payload: Optional[str]) -> Tuple[int, dict]:
@@ -350,10 +373,22 @@ def _default_openrouter_transport(api_key: Optional[str]) -> Callable[[str, str,
         request.add_header("Authorization", f"Bearer {api_key}")
         request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request) as response:
+            with urllib.request.urlopen(
+                    request, timeout=OPENROUTER_HTTP_TIMEOUT_SECONDS) as response:
                 return response.status, _parse_json(response.read())
         except urllib.error.HTTPError as error:
+            # Checked before URLError: HTTPError subclasses it, and an HTTP
+            # error status is an ANSWER, not a transport failure.
             return error.code, _parse_json(error.read())
+        except (socket.timeout, urllib.error.URLError) as error:
+            if isinstance(error, socket.timeout) or isinstance(
+                    getattr(error, "reason", None), socket.timeout):
+                raise RuntimeError(
+                    f"OpenRouter batch request timed out after "
+                    f"{OPENROUTER_HTTP_TIMEOUT_SECONDS:.0f}s ({method} {url}); "
+                    f"the batch may still exist -- re-run /collect before "
+                    f"re-submitting") from error
+            raise
 
     return transport
 

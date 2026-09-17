@@ -8,11 +8,14 @@ fake registry of fake processors. The suite must pass in an environment where
 ``processors/batch.py``).
 """
 
+import io
 import json
 import os
 import shutil
+import socket
 import tempfile
 import unittest
+import urllib.error
 from types import SimpleNamespace
 from unittest import mock
 
@@ -20,12 +23,14 @@ from cards.compiler import compile_deck, serialize_openai
 from cards.schema import MorphCard
 from cards.store import DeckStore, recover_orphaned_local_batch
 from processors.batch import (
+    OPENROUTER_HTTP_TIMEOUT_SECONDS,
     OPENROUTER_SUBMIT_GRACE_SECONDS,
     AnthropicBatchBackend,
     BatchNotReady,
     LocalBatchBackend,
     OpenAIBatchBackend,
     OpenRouterBatchBackend,
+    _default_openrouter_transport,
 )
 from processors.registry import ProcessorRegistry
 
@@ -372,11 +377,12 @@ class OpenRouterBatchBackendTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        def fake_urlopen(request):
+        def fake_urlopen(request, timeout=None):
             captured["headers"] = dict(request.header_items())
             captured["url"] = request.full_url
             captured["method"] = request.get_method()
             captured["data"] = request.data
+            captured["timeout"] = timeout
             return _Response()
 
         backend = OpenRouterBatchBackend(
@@ -390,6 +396,7 @@ class OpenRouterBatchBackendTests(unittest.TestCase):
         self.assertEqual(headers["content-type"], "application/json")
         self.assertEqual(captured["method"], "POST")
         self.assertEqual(captured["url"], "https://openrouter.ai/api/beta/batches")
+        self.assertEqual(captured["timeout"], OPENROUTER_HTTP_TIMEOUT_SECONDS)
 
     def test_submit_accepts_200_as_well_as_202(self):
         transport = _FakeTransport([(200, _batch_object("validating"))])
@@ -579,6 +586,107 @@ class OpenRouterBatchBackendTests(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, BatchNotReady)
         self.assertIn("500", str(ctx.exception))
         self.assertIn("internal error", str(ctx.exception))
+
+
+class _FakeHTTPResponse:
+    """The context-manager shape ``urllib.request.urlopen`` returns."""
+
+    def __init__(self, status=200, body=b'{"id": "batch-1"}'):
+        self.status = status
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class OpenRouterTransportTimeoutTests(unittest.TestCase):
+    """The real transport must never be able to block forever.
+
+    ``urlopen`` with no ``timeout`` inherits Python's default socket timeout of
+    ``None``: a hung connection wedges the calling thread silently, inside a
+    ``/collect`` that prints nothing while it waits. These tests pin the timeout
+    to the ``urlopen`` call itself -- no network is touched, ``urlopen`` is
+    replaced wholesale.
+    """
+
+    def test_the_timeout_reaches_urlopen(self):
+        transport = _default_openrouter_transport("sk-or-xxx")
+
+        with mock.patch("processors.batch.urllib.request.urlopen") as urlopen:
+            urlopen.return_value = _FakeHTTPResponse()
+            status_code, body = transport(
+                "POST", "https://openrouter.ai/api/beta/batches", '{"x": 1}')
+
+        self.assertEqual((status_code, body), (200, {"id": "batch-1"}))
+        self.assertEqual(
+            urlopen.call_args[1]["timeout"], OPENROUTER_HTTP_TIMEOUT_SECONDS)
+
+    def test_the_timeout_reaches_urlopen_on_a_poll_too(self):
+        # The GET path carries no payload; it must be bounded all the same --
+        # polling is where a batch run spends nearly all of its wall time.
+        transport = _default_openrouter_transport("sk-or-xxx")
+
+        with mock.patch("processors.batch.urllib.request.urlopen") as urlopen:
+            urlopen.return_value = _FakeHTTPResponse(body=b'{"status": "completed"}')
+            transport("GET", "https://openrouter.ai/api/beta/batches/b1", None)
+
+        self.assertEqual(
+            urlopen.call_args[1]["timeout"], OPENROUTER_HTTP_TIMEOUT_SECONDS)
+
+    def test_a_read_timeout_becomes_a_readable_error(self):
+        transport = _default_openrouter_transport("sk-or-xxx")
+
+        with mock.patch("processors.batch.urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = socket.timeout("timed out")
+            with self.assertRaises(RuntimeError) as ctx:
+                transport("GET", "https://openrouter.ai/api/beta/batches/b1", None)
+
+        message = str(ctx.exception)
+        self.assertIn("timed out after 120s", message)
+        self.assertIn("GET https://openrouter.ai/api/beta/batches/b1", message)
+
+    def test_a_connect_timeout_becomes_a_readable_error(self):
+        # A connect that expires arrives wrapped in URLError, not raw.
+        transport = _default_openrouter_transport("sk-or-xxx")
+
+        with mock.patch("processors.batch.urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = urllib.error.URLError(socket.timeout("timed out"))
+            with self.assertRaises(RuntimeError) as ctx:
+                transport("POST", "https://openrouter.ai/api/beta/batches", "{}")
+
+        self.assertIn("timed out after 120s", str(ctx.exception))
+
+    def test_a_non_timeout_transport_error_is_left_alone(self):
+        # DNS failures and refused connections are not this change's business:
+        # they already fail fast and name their own cause.
+        transport = _default_openrouter_transport("sk-or-xxx")
+
+        with mock.patch("processors.batch.urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = urllib.error.URLError("name resolution failed")
+            with self.assertRaises(urllib.error.URLError):
+                transport("GET", "https://openrouter.ai/api/beta/batches/b1", None)
+
+    def test_an_http_error_is_still_returned_not_raised(self):
+        # HTTPError subclasses URLError; the new except clause must not swallow
+        # the 4xx/5xx path that turns a status code into a readable message.
+        transport = _default_openrouter_transport("sk-or-xxx")
+        error = urllib.error.HTTPError(
+            "https://openrouter.ai/api/beta/batches", 429, "Too Many Requests",
+            {}, io.BytesIO(b'{"error": {"message": "rate limited"}}'))
+
+        with mock.patch("processors.batch.urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = error
+            status_code, body = transport(
+                "POST", "https://openrouter.ai/api/beta/batches", "{}")
+
+        self.assertEqual(status_code, 429)
+        self.assertEqual(body["error"]["message"], "rate limited")
 
 
 class OpenRouterOrphanRecoveryTests(unittest.TestCase):
