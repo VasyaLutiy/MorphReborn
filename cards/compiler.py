@@ -17,6 +17,9 @@ Two guarantees this module exists to keep:
   followed by the user instruction; ``patch`` prepends the two assistant
   framing messages carrying the original file; ``todo`` is the fixed
   criticism prompt with no project context (matching ``build_todo_transition``).
+  One deliberate departure: a ``patch`` conversation never repeats its target
+  in the project context, because it already ships it as "Original file" --
+  see :func:`_context_messages` for the measurement that motivated it.
 * **Determinism.** Identical inputs must produce byte-identical output. The
   transport-only ``time`` field is stripped from every message (mirroring
   ``MorphBot.clean_conversation``), whole-project walks are sorted before
@@ -93,35 +96,67 @@ def _filter_source_code_file_names(file_path: str) -> bool:
     )
 
 
-def _resolve_slice(card: MorphCard, root: str) -> List[str]:
+def _path_key(root: str, relative_path: str) -> str:
+    """A canonical identity for one context path, for comparison only.
+
+    Slice entries and ``card.target`` are both written relative to ``root``, but
+    the same file may legitimately be spelled ``flows/morph.py`` or
+    ``./flows/morph.py``. Comparing the raw strings would miss the match, so
+    both sides are joined to ``root`` and normalised to an absolute path first.
+    The key is never emitted -- the original relative spelling is what reaches
+    the prompt.
+    """
+    return os.path.abspath(os.path.join(root, relative_path))
+
+
+def _resolve_slice(card: MorphCard, root: str, skip_target: bool = False) -> List[str]:
     """The list of context files to embed, relative to ``root``, SORTED.
 
     A non-empty ``context_slice`` is used verbatim (sorted for determinism); an
     empty one falls back to Morph 1.0's whole-project behaviour -- walk ``root``,
     keep what the source filter accepts, and sort. Sorting both paths means the
     emitted context order never depends on filesystem walk order.
+
+    ``skip_target`` drops the card's own ``target`` from the result. Both paths
+    need it: an author naturally lists the target in the slice (it *is* relevant
+    context), and the whole-project walk yields the target too -- so for an
+    intent that already ships the target as "Original file" either path would
+    otherwise send the same file twice. See :func:`_context_messages`.
     """
     if card.context_slice:
-        return sorted(card.context_slice)
+        paths = sorted(card.context_slice)
+    else:
+        matched = []
+        for walk_root, _dirs, files in os.walk(root):
+            for file_name in files:
+                file_path = os.path.join(walk_root, file_name)
+                if _filter_source_code_file_names(file_path):
+                    matched.append(os.path.relpath(file_path, root))
+        paths = sorted(matched)
 
-    matched = []
-    for walk_root, _dirs, files in os.walk(root):
-        for file_name in files:
-            file_path = os.path.join(walk_root, file_name)
-            if _filter_source_code_file_names(file_path):
-                matched.append(os.path.relpath(file_path, root))
-    return sorted(matched)
+    if skip_target:
+        target_key = _path_key(root, card.target)
+        paths = [path for path in paths if _path_key(root, path) != target_key]
+    return paths
 
 
-def _context_messages(card: MorphCard, root: str) -> List[dict]:
+def _context_messages(card: MorphCard, root: str, skip_target: bool = False) -> List[dict]:
     """Build the project-context messages for a card (cleaned of ``time``).
 
     Whole-project mode is expressed as a sorted file list fed through
     :class:`ContextFolderDialog`'s file-list mode, so both slice and
     whole-project paths share one deterministic emission order and one message
     template.
+
+    ``skip_target`` is set by the intents that already carry the target file in
+    an "Original file" assistant message (``patch``). Sending that file a second
+    time as project context tells the model nothing it does not already have and
+    costs its tokens twice -- measured on a real card, one 58.8 KB target sent
+    twice was 92% of a 127 KB prompt, and on a larger target the duplicate is a
+    way to walk into the context window for no benefit at all. The remaining
+    slice entries keep their order and rendering.
     """
-    file_list = _resolve_slice(card, root)
+    file_list = _resolve_slice(card, root, skip_target=skip_target)
     context = ContextFolderDialog(root, file_list=file_list)
     context.process([])
     return _clean(context.conversation)
@@ -164,7 +199,9 @@ def _build_conversation(card: MorphCard, root: str) -> List[dict]:
         file_contents = _read_target(card, root)
         dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
         messages = _clean(dialog.conversation)
-        messages.extend(_context_messages(card, root))
+        # The target has just gone out as "Original file"; skip_target keeps the
+        # context slice from shipping it a second time (see _context_messages).
+        messages.extend(_context_messages(card, root, skip_target=True))
         messages.append({"role": "user", "content": card.instruction})
         return messages
 

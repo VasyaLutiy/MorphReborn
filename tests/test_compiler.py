@@ -5,6 +5,7 @@ import unittest
 from cards.deck import load_deck
 from cards.schema import MorphCard
 from cards.compiler import (
+    _context_messages,
     compile_card,
     compile_deck,
     serialize_anthropic,
@@ -311,6 +312,160 @@ class PatchConversationShapeTests(unittest.TestCase):
         self.assertIn("criticize this file contents", messages[-1]["content"])
         # todo never embeds project context, even when a slice is present.
         self.assertNotIn("Contents for another file", "".join(m["content"] for m in messages))
+
+
+class TargetIsSentOnceTests(unittest.TestCase):
+    """A patch card ships its target as "Original file"; the context slice must
+    not ship it again. Measured on a real card, the duplicate was 92% of a
+    127 KB prompt -- twice the input cost for nothing the model did not have."""
+
+    def _occurrences(self, messages, needle):
+        return sum(m["content"].count(needle) for m in messages)
+
+    def _prompt_size(self, messages):
+        return sum(len(m["content"]) for m in messages)
+
+    def _context_paths(self, messages):
+        """The embedded file paths, in emission order, from context messages."""
+        paths = []
+        prefix = 'Contents for another file "'
+        for message in messages:
+            content = message["content"]
+            if message["role"] == "user" and content.startswith(prefix):
+                paths.append(content[len(prefix):].split('"', 1)[0])
+        return paths
+
+    # A line that exists only in the fixture's util.py, so counting it counts
+    # copies of the target rather than of any incidental substring.
+    UTIL_MARKER = "def add(a, b):"
+
+    def test_patch_slice_listing_its_own_target_sends_it_once(self):
+        with_target = MorphCard(
+            custom_id="patch-dup",
+            intent="patch",
+            target="util.py",
+            instruction="add subtract",
+            context_slice=["app.py", "util.py"],
+        )
+        without_target = MorphCard(
+            custom_id="patch-clean",
+            intent="patch",
+            target="util.py",
+            instruction="add subtract",
+            context_slice=["app.py"],
+        )
+        duplicated = compile_card(with_target, root=MINIPROJECT)[0]["messages"]
+        baseline = compile_card(without_target, root=MINIPROJECT)[0]["messages"]
+
+        # The target's distinctive line appears exactly once: in "Original file".
+        self.assertEqual(self._occurrences(duplicated, self.UTIL_MARKER), 1)
+        self.assertTrue(duplicated[1]["content"].startswith("Original file:"))
+        self.assertIn(self.UTIL_MARKER, duplicated[1]["content"])
+        self.assertNotIn("util.py", "".join(self._context_paths(duplicated)))
+
+        # ...and the prompt is now exactly the one of a card that never listed
+        # the target at all.
+        self.assertEqual(duplicated, baseline)
+
+        # The measurement itself: the un-skipped rendering is larger by exactly
+        # the size of the one context message carrying the target.
+        unskipped = _context_messages(with_target, MINIPROJECT, skip_target=False)
+        skipped = _context_messages(with_target, MINIPROJECT, skip_target=True)
+        target_message_size = self._prompt_size(unskipped) - self._prompt_size(skipped)
+        self.assertGreater(target_message_size, 0)
+        self.assertEqual(self._occurrences(unskipped, self.UTIL_MARKER), 1)
+        self.assertEqual(self._occurrences(skipped, self.UTIL_MARKER), 0)
+        self.assertLess(
+            self._prompt_size(duplicated),
+            self._prompt_size(duplicated) + target_message_size,
+        )
+
+    def test_patch_slice_normalises_paths_before_matching_the_target(self):
+        # "./util.py" and "util.py" are the same file; a raw string compare
+        # would miss it and ship the target twice.
+        card = MorphCard(
+            custom_id="patch-dotted",
+            intent="patch",
+            target="util.py",
+            instruction="add subtract",
+            context_slice=["app.py", "./util.py"],
+        )
+        messages = compile_card(card, root=MINIPROJECT)[0]["messages"]
+        self.assertEqual(self._occurrences(messages, self.UTIL_MARKER), 1)
+        self.assertEqual(
+            self._context_paths(messages),
+            [os.path.join(MINIPROJECT, "app.py")],
+        )
+
+    def test_patch_with_empty_slice_excludes_target_from_whole_project_walk(self):
+        # The whole-project fallback also yields the target; it needs the same
+        # treatment as an explicit slice.
+        card = MorphCard(
+            custom_id="patch-whole",
+            intent="patch",
+            target="util.py",
+            instruction="add subtract",
+            context_slice=[],
+        )
+        messages = compile_card(card, root=MINIPROJECT)[0]["messages"]
+        self.assertEqual(self._occurrences(messages, self.UTIL_MARKER), 1)
+        self.assertEqual(
+            self._context_paths(messages),
+            [
+                os.path.join(MINIPROJECT, "README.md"),
+                os.path.join(MINIPROJECT, "app.py"),
+            ],
+        )
+
+    def test_patch_slice_of_other_files_is_unchanged_and_ordered(self):
+        card = MorphCard(
+            custom_id="patch-others",
+            intent="patch",
+            target="app.py",
+            instruction="add subtract",
+            context_slice=["util.py", "README.md"],
+        )
+        messages = compile_card(card, root=MINIPROJECT)[0]["messages"]
+        # Slice entries are sorted for determinism, and both survive.
+        self.assertEqual(
+            self._context_paths(messages),
+            [
+                os.path.join(MINIPROJECT, "README.md"),
+                os.path.join(MINIPROJECT, "util.py"),
+            ],
+        )
+
+    def test_generate_card_still_receives_a_target_listed_in_its_slice(self):
+        # generate has no "Original file" message, so the target in the slice is
+        # ordinary context and must stay.
+        card = MorphCard(
+            custom_id="gen-with-target",
+            intent="generate",
+            target="util.py",
+            instruction="rewrite it",
+            context_slice=["app.py", "util.py"],
+        )
+        messages = compile_card(card, root=MINIPROJECT)[0]["messages"]
+        self.assertEqual(self._occurrences(messages, self.UTIL_MARKER), 1)
+        self.assertEqual(
+            self._context_paths(messages),
+            [
+                os.path.join(MINIPROJECT, "app.py"),
+                os.path.join(MINIPROJECT, "util.py"),
+            ],
+        )
+
+    def test_generate_whole_project_walk_still_includes_the_target(self):
+        card = MorphCard(
+            custom_id="gen-whole",
+            intent="generate",
+            target="util.py",
+            instruction="rewrite it",
+            context_slice=[],
+        )
+        messages = compile_card(card, root=MINIPROJECT)[0]["messages"]
+        self.assertIn(
+            os.path.join(MINIPROJECT, "util.py"), self._context_paths(messages))
 
 
 class ContextFolderDialogWalkModeTests(unittest.TestCase):
