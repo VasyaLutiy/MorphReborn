@@ -15,9 +15,11 @@ import unittest
 
 from cards.generations import (
     CardOutcome,
+    CorruptResponse,
     DeckResult,
     is_truncated_response,
     response_to_file_body,
+    response_to_files,
     run_deck,
     split_into_generations,
 )
@@ -495,6 +497,150 @@ class TruncatedResponseRunDeckTests(unittest.TestCase):
                              for request in backend.submissions[1]
                              for message in request["messages"])
         self.assertIn("cut off mid-file", retry_text)
+
+
+def _file_block(path, body):
+    """One file of a multi-file answer, in the format the directive asks for."""
+    return f"FILE: {path}\n```python\n{body}\n```\n"
+
+
+class ResponseToFilesTests(unittest.TestCase):
+    """Splitting one answer into the set of files a changeset card declared.
+
+    The card declares the paths; the answer only says which of them each body
+    belongs to. Anything that does not line up is a CORRUPT response -- the
+    treatment an unterminated fence already gets -- because the alternatives
+    are a half-written changeset or a file nobody asked for.
+    """
+
+    def test_markers_parse_into_a_path_to_body_map(self):
+        response = _file_block("a.py", "A = 1") + _file_block("pkg/b.py", "B = 2")
+        self.assertEqual(response_to_files(response, ["a.py", "pkg/b.py"]),
+                         {"a.py": "A = 1\n", "pkg/b.py": "B = 2\n"})
+
+    def test_answer_order_need_not_match_the_card_order(self):
+        response = _file_block("b.py", "B = 2") + _file_block("a.py", "A = 1")
+        self.assertEqual(response_to_files(response, ["a.py", "b.py"]),
+                         {"a.py": "A = 1\n", "b.py": "B = 2\n"})
+
+    def test_preamble_before_the_first_marker_is_dropped(self):
+        response = "Sure, here are the two files:\n\n" + \
+            _file_block("a.py", "A = 1") + _file_block("b.py", "B = 2")
+        self.assertEqual(sorted(response_to_files(response, ["a.py", "b.py"])),
+                         ["a.py", "b.py"])
+
+    def test_a_path_spelled_differently_still_matches_the_declared_target(self):
+        response = _file_block("./a.py", "A = 1") + _file_block("`b.py`", "B = 2")
+        parsed = response_to_files(response, ["a.py", "b.py"])
+        # The CARD's spelling is what comes back -- it is what reaches disk.
+        self.assertEqual(sorted(parsed), ["a.py", "b.py"])
+
+    def test_a_file_line_inside_a_fence_is_body_content_not_a_marker(self):
+        body = 'FILE: not_a_marker.py\nHEADER = "FILE:"'
+        response = _file_block("a.py", body)
+        self.assertEqual(response_to_files(response, ["a.py"]), {"a.py": body + "\n"})
+
+    def test_no_markers_keeps_todays_single_file_behaviour(self):
+        self.assertEqual(response_to_files(_code_block("A = 1"), ["a.py"]),
+                         {"a.py": "A = 1\n"})
+        # ... including the "bare code, no fence" fallback.
+        self.assertEqual(response_to_files("A = 1", ["a.py"]), {"a.py": "A = 1"})
+
+    def test_no_markers_is_corrupt_for_a_card_that_writes_a_set(self):
+        with self.assertRaises(CorruptResponse) as ctx:
+            response_to_files(_code_block("A = 1"), ["a.py", "b.py"])
+        self.assertIn("a.py, b.py", str(ctx.exception))
+
+    def test_a_declared_target_missing_from_the_answer_is_corrupt(self):
+        with self.assertRaises(CorruptResponse) as ctx:
+            response_to_files(_file_block("a.py", "A = 1"), ["a.py", "b.py"])
+        self.assertIn("b.py", str(ctx.exception))
+
+    def test_a_path_the_card_never_declared_is_corrupt(self):
+        with self.assertRaises(CorruptResponse) as ctx:
+            response_to_files(
+                _file_block("a.py", "A = 1") + _file_block("sneaky.py", "X = 1"),
+                ["a.py", "b.py"])
+        self.assertIn("sneaky.py", str(ctx.exception))
+
+    def test_the_same_path_returned_twice_is_corrupt(self):
+        with self.assertRaises(CorruptResponse) as ctx:
+            response_to_files(
+                _file_block("a.py", "A = 1") + _file_block("a.py", "A = 2"),
+                ["a.py"])
+        self.assertIn("more than once", str(ctx.exception))
+
+
+class ChangesetWriteTests(unittest.TestCase):
+    """A card with several targets, run WITHOUT an acceptance command."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-changeset-")
+        self.root = os.path.join(self.tmp, "miniproject")
+        shutil.copytree(MINIPROJECT, self.root,
+                        ignore=shutil.ignore_patterns("node_modules"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _read(self, name):
+        with open(os.path.join(self.root, name), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _changeset_card(self, targets, **kwargs):
+        return MorphCard(
+            custom_id="set",
+            intent="generate",
+            targets=targets,
+            instruction="do it",
+            context_slice=["util.py"],
+            **kwargs
+        )
+
+    def test_three_targets_are_all_written(self):
+        card = self._changeset_card(["one.py", "two.py", "pkg/three.py"])
+        backend = FakeBatchBackend(scripts={
+            "set": (_file_block("one.py", "ONE = 1")
+                    + _file_block("two.py", "TWO = 2")
+                    + _file_block("pkg/three.py", "THREE = 3")),
+        })
+
+        result = run_deck([card], backend, root=self.root, poll_interval=0,
+                          log=lambda _l: None)
+
+        self.assertEqual(result.outcomes["set"].status, "written")
+        self.assertEqual(self._read("one.py"), "ONE = 1\n")
+        self.assertEqual(self._read("two.py"), "TWO = 2\n")
+        self.assertEqual(self._read(os.path.join("pkg", "three.py")), "THREE = 3\n")
+        self.assertEqual(result.outcomes["set"].paths,
+                         [os.path.join(self.root, "one.py"),
+                          os.path.join(self.root, "two.py"),
+                          os.path.join(self.root, "pkg", "three.py")])
+
+    def test_a_response_missing_a_target_writes_nothing_at_all(self):
+        card = self._changeset_card(["one.py", "two.py"])
+        backend = FakeBatchBackend(scripts={"set": _file_block("one.py", "ONE = 1")})
+
+        result = run_deck([card], backend, root=self.root, poll_interval=0,
+                          log=lambda _l: None)
+
+        self.assertEqual(result.outcomes["set"].status, "failed")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "one.py")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "two.py")))
+
+    def test_multi_target_variants_get_no_suffixed_copies(self):
+        card = self._changeset_card(["one.py", "two.py"], variants=2)
+        both = _file_block("one.py", "ONE = 1") + _file_block("two.py", "TWO = 2")
+        backend = FakeBatchBackend(scripts={"set.v1": both, "set.v2": both})
+
+        result = run_deck([card], backend, root=self.root, poll_interval=0,
+                          log=lambda _l: None)
+
+        self.assertEqual(result.outcomes["set"].paths,
+                         [os.path.join(self.root, "one.py"),
+                          os.path.join(self.root, "two.py")])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "one.set.v1.py")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "one.set.v2.py")))
 
 
 if __name__ == "__main__":

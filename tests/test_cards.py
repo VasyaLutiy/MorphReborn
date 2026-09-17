@@ -303,5 +303,84 @@ class DeckLoadingTests(unittest.TestCase):
             os.remove(path)
 
 
+class ChangesetCardTests(unittest.TestCase):
+    """Phase 7: a card may name a SET of files instead of a single target.
+
+    The point of the form is that a change touching a module AND its test is
+    ONE card -- the shape every fix this project shipped by hand needed and no
+    single-target card could express.
+    """
+
+    def test_targets_list_is_accepted_and_target_is_its_first_entry(self):
+        card = MorphCard.from_dict({
+            "custom_id": "changeset",
+            "meta": {"intent": "patch",
+                     "targets": ["cards/schema.py", "tests/test_cards.py"]},
+            "instruction": "x",
+        })
+        self.assertEqual(card.targets, ["cards/schema.py", "tests/test_cards.py"])
+        self.assertEqual(card.target, "cards/schema.py")
+
+    def test_single_target_card_still_exposes_a_one_entry_targets_list(self):
+        # The whole point of the accessor: no consumer branches on the form.
+        card = MorphCard.from_dict({
+            "custom_id": "single",
+            "meta": {"intent": "generate", "target": "a.py"},
+            "instruction": "x",
+        })
+        self.assertEqual(card.target, "a.py")
+        self.assertEqual(card.targets, ["a.py"])
+
+    def test_card_with_both_target_and_targets_rejected(self):
+        with self.assertRaises(CardError) as ctx:
+            MorphCard.from_dict({
+                "custom_id": "both",
+                "meta": {"intent": "generate", "target": "a.py",
+                         "targets": ["a.py", "b.py"]},
+                "instruction": "x",
+            })
+        message = str(ctx.exception)
+        self.assertIn("'both'", message)   # the message names the card
+        self.assertIn("not both", message)  # ... and says what is wrong
+
+    def test_direct_construction_with_both_forms_rejected(self):
+        with self.assertRaises(CardError):
+            MorphCard(custom_id="both", intent="generate", target="a.py",
+                      targets=["a.py"], instruction="x")
+
+    def test_card_with_neither_form_rejected(self):
+        with self.assertRaises(CardError) as ctx:
+            MorphCard.from_dict({
+                "custom_id": "neither",
+                "meta": {"intent": "generate"},
+                "instruction": "x",
+            })
+        self.assertIn("target", str(ctx.exception))
+
+    def test_targets_paths_are_validated_like_target(self):
+        for bad in ("a.py", ["a.py", 7], ["a.py", ""]):
+            with self.assertRaises(CardError):
+                MorphCard(custom_id="bad", intent="generate", targets=bad,
+                          instruction="x")
+
+    def test_targets_may_not_name_the_same_path_twice(self):
+        # Including under two spellings of the one file: the writer would not
+        # know which body wins, and neither would the parser.
+        for duplicated in (["a.py", "a.py"], ["a.py", "./a.py"]):
+            with self.assertRaises(CardError) as ctx:
+                MorphCard(custom_id="dup", intent="generate",
+                          targets=duplicated, instruction="x")
+            self.assertIn("twice", str(ctx.exception))
+
+    def test_validate_is_idempotent_after_the_form_is_settled(self):
+        # __post_init__ leaves both attributes set; re-validating a live card
+        # (which store/round-trip paths may do) must not read that as "both".
+        card = MorphCard(custom_id="changeset", intent="generate",
+                         targets=["a.py", "b.py"], instruction="x")
+        card.validate()
+        card.validate()
+        self.assertEqual(card.targets, ["a.py", "b.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

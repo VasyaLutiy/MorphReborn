@@ -29,6 +29,7 @@ import tempfile
 import time
 import unittest
 
+from cards.acceptance import run_acceptance
 from cards.generations import run_deck
 from cards.store import (
     DeckStore,
@@ -693,6 +694,134 @@ class LocalBatchRestartTests(_E2EBase):
         self.assertEqual(collected.outcomes["card-a"].status, "written")
         self.assertTrue(self._exists("gen_a.py"))
 
+
+
+def _file_block(path, body):
+    """One file of a multi-file answer, in the format the directive asks for."""
+    return f"FILE: {path}\n```python\n{body}\n```\n"
+
+
+# The module a changeset card patches, and the test it creates in the same card
+# -- the pair that no single-target card could ever produce.
+_PARITY_MODULE = '''def is_even(number):
+    return number % 2 == 0
+
+
+def is_odd(number):
+    return not is_even(number)'''
+
+_PARITY_TEST = '''import unittest
+
+from parity import is_even, is_odd
+
+
+class ParityTests(unittest.TestCase):
+    def test_is_even(self):
+        self.assertTrue(is_even(2))
+        self.assertFalse(is_even(3))
+
+    def test_is_odd(self):
+        self.assertTrue(is_odd(3))
+
+
+if __name__ == "__main__":
+    unittest.main()'''
+
+# The same test as a WRONG answer would write it: it demands a function the
+# module in the same answer does not define, so the card's own acceptance --
+# which RUNS this file -- catches it.
+_PARITY_TEST_BROKEN = _PARITY_TEST.replace(
+    "from parity import is_even, is_odd",
+    "from parity import is_even, is_odd, is_prime",
+)
+
+
+class ChangesetCardE2ETests(_E2EBase):
+    """Phase 7, end to end: one card writes a module AND the test that proves it.
+
+    This is the shape the project could not express until now. Every fix we
+    shipped by hand had to touch a module and its test together, so none of them
+    could be a card at all -- and a card whose acceptance runs a test it is not
+    allowed to write can only ever be failed by it. Here the acceptance command
+    runs the very test file the card produced.
+    """
+
+    # PYTHONPATH=. so the freshly written test can import the freshly written
+    # module; running the file directly keeps the check stdlib-only.
+    ACCEPTANCE = "PYTHONPATH=. python3 tests/test_parity.py"
+
+    def _add_changeset(self, custom_id, targets, **meta):
+        instruction = meta.pop("instruction", "do it")
+        self.store.add_card({
+            "custom_id": custom_id,
+            "meta": {"intent": meta.pop("intent", "patch"), "targets": targets, **meta},
+            "instruction": instruction,
+        })
+
+    def _deck(self, test_body):
+        """The 2-card deck, and a backend scripted to answer both cards."""
+        self._add("gen-parity", "parity.py", context_slice=["util.py"],
+                  instruction="write a parity helper")
+        self._add_changeset(
+            "cover-parity",
+            ["parity.py", "tests/test_parity.py"],
+            depends_on=["gen-parity"],
+            context_slice=[],
+            acceptance=self.ACCEPTANCE,
+            instruction="add is_odd next to is_even, and the test that covers both",
+        )
+        return _FakeBatchBackend(scripts={
+            "gen-parity": _code_block("def is_even(number):\n    return number % 2 == 0"),
+            "cover-parity": (_file_block("parity.py", _PARITY_MODULE)
+                             + _file_block("tests/test_parity.py", test_body)),
+        })
+
+    def test_one_card_writes_a_module_and_its_test_verified_by_that_test(self):
+        backend = self._deck(_PARITY_TEST)
+
+        result = run_deck(self.store.load_cards(), backend, root=self.root,
+                          poll_interval=0, log=lambda _l: None)
+        record_run(self.store, result, backend_label="fake")
+
+        self.assertEqual(result.outcomes["gen-parity"].status, "written")
+        self.assertEqual(result.outcomes["cover-parity"].status, "written")
+        self.assertEqual(result.outcomes["cover-parity"].paths, [
+            os.path.join(self.root, "parity.py"),
+            os.path.join(self.root, "tests", "test_parity.py"),
+        ])
+        # Both files are on disk, and the command that judged them was the test
+        # file the same card had just written.
+        self.assertIn("def is_odd", self._read("parity.py"))
+        self.assertIn("class ParityTests",
+                      self._read(os.path.join("tests", "test_parity.py")))
+        self.assertTrue(run_acceptance(self.ACCEPTANCE, self.root).passed)
+
+        # The second generation's prompt: the existing target shipped once as
+        # "Original file", the file being CREATED not shipped at all, and the
+        # directive naming both.
+        prompt = "".join(message["content"]
+                         for request in backend.submissions[1]
+                         for message in request["messages"])
+        self.assertEqual(prompt.count("Let's update the parity.py file provided."), 1)
+        self.assertNotIn("Let's update the tests/test_parity.py file provided.", prompt)
+        self.assertIn("- tests/test_parity.py", prompt)
+
+        view = build_deck_status(DeckStore(project_root=self.root))
+        self.assertEqual(dict(view.card_status),
+                         {"gen-parity": "written", "cover-parity": "written"})
+
+    def test_a_changeset_whose_acceptance_fails_leaves_neither_file_behind(self):
+        backend = self._deck(_PARITY_TEST_BROKEN)
+
+        result = run_deck(self.store.load_cards(), backend, root=self.root,
+                          poll_interval=0, log=lambda _l: None,
+                          max_regenerations=0)
+
+        self.assertEqual(result.outcomes["cover-parity"].status, "failed")
+        # The module is back to what generation 1 wrote -- the changeset's own
+        # version of it is gone -- and the test file it created never survives.
+        self.assertNotIn("def is_odd", self._read("parity.py"))
+        self.assertFalse(self._exists(os.path.join("tests", "test_parity.py")))
 
 
 if __name__ == "__main__":

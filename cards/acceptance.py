@@ -16,10 +16,14 @@ Two responsibilities live here:
   by :func:`clip_output`, head and tail both kept -- as the error context a
   retry generation feeds back to the executor.
 * :func:`verify_card` -- the best-of-N + rollback protocol
-  (:class:`VerifyOutcome`): capture the target's original state, try each
-  variant in order at the *real* target path, keep the first that passes (plus
-  its suffixed variant file for a multi-variant card), roll every rejected
-  write back, and hand :mod:`cards.generations` the winner or the last failure.
+  (:class:`VerifyOutcome`): capture the original state of every file the card
+  writes, try each variant in order at the *real* target paths, keep the first
+  that passes (plus its suffixed variant file for a multi-variant single-target
+  card), roll every rejected write back, and hand :mod:`cards.generations` the
+  winner or the last failure. A *changeset* card (several ``targets``) is the
+  Phase 7 extension of exactly that protocol: its files are snapshotted,
+  written and rolled back as ONE set, so either all of a card's files survive
+  or none do.
 
 Constraint (see the development plan): ``cards`` must not import from ``flows``
 or ``processors``. The response-to-file helper and the variant/output-path
@@ -36,11 +40,13 @@ from typing import Callable, Dict, List, Optional
 
 from cards.generations import (
     TRUNCATED_RESPONSE_MESSAGE,
+    CorruptResponse,
     _output_path,
     _variant_ids,
     ensure_parent_dir,
     is_truncated_response,
-    response_to_file_body,
+    response_to_files,
+    target_paths,
 )
 from cards.schema import MorphCard
 
@@ -224,8 +230,9 @@ class VerifyOutcome:
 
     ``passed`` marks that some variant cleared acceptance. ``winning_custom_id``
     is that variant's batch custom_id (``None`` on failure); ``paths`` lists the
-    files kept for it (the real target, plus its suffixed variant file for a
-    multi-variant card). ``attempts`` is how many variants were actually run
+    files kept for it (every real target the card writes, plus -- for a
+    multi-variant single-target card -- its suffixed variant file).
+    ``attempts`` is how many variants were actually run
     (``None`` responses are skipped). ``result`` is the winning
     :class:`AcceptanceResult`, or -- on failure -- the last failing one, whose
     ``output`` becomes the retry's error context (``None`` only when every
@@ -247,6 +254,17 @@ def _capture_original(path: str) -> Optional[bytes]:
     return None
 
 
+def _capture_originals(paths: List[str]) -> List[tuple]:
+    """Snapshot every file a card writes, in the card's order.
+
+    Returns ``[(path, bytes or None), ...]`` -- ``None`` where the file does not
+    exist yet, which is an ordinary state for a changeset card: patching a
+    module while CREATING its test is the very case single-target cards could
+    not express.
+    """
+    return [(path, _capture_original(path)) for path in paths]
+
+
 def _restore_original(path: str, original: Optional[bytes]) -> None:
     """Put the target back the way :func:`_capture_original` found it.
 
@@ -264,6 +282,29 @@ def _restore_original(path: str, original: Optional[bytes]) -> None:
             handle.write(original)
 
 
+def _restore_originals(snapshots: List[tuple]) -> None:
+    """Put every snapshotted file back the way :func:`_capture_originals` found it.
+
+    All of them, unconditionally: a card's files are accepted or rolled back as
+    one set, so a variant that fails halfway through the set still leaves the
+    tree exactly as it was -- ``git status`` clean, nothing for a human to undo.
+    """
+    for path, original in snapshots:
+        _restore_original(path, original)
+
+
+def _rejection_result(reason: str) -> AcceptanceResult:
+    """A stand-in result for a variant rejected BEFORE acceptance could run.
+
+    Used only while no variant has actually run: the retry's error context then
+    SAYS what was wrong with the answer instead of arriving empty. A real
+    acceptance failure is better context than any of these notes, so a
+    :func:`verify_card` caller never lets one displace a real result.
+    """
+    return AcceptanceResult(passed=False, exit_code=None, output=reason,
+                            timed_out=False)
+
+
 def verify_card(
     card: MorphCard,
     responses: Dict[str, Optional[str]],
@@ -273,33 +314,44 @@ def verify_card(
 ) -> VerifyOutcome:
     """Best-of-N acceptance with a sandboxed rollback, for a card WITH acceptance.
 
-    The target's original state is captured up front. Each variant custom_id is
-    tried IN ORDER (a ``None`` response is skipped, and so is one cut off inside
-    an unclosed code fence -- see :func:`cards.generations.is_truncated_response`
-    -- which is rejected without running acceptance, carrying
-    :data:`cards.generations.TRUNCATED_RESPONSE_MESSAGE` as the retry's error
-    context): its body is written to the
-    *real* ``card.target`` -- acceptance must test the file where it will live --
-    and ``card.acceptance`` is run. The first variant to pass WINS: the target
-    keeps its winning bytes, a multi-variant card also gets the winner's suffixed
-    file (naming as in :mod:`cards.generations`) while every losing variant's
-    suffixed file is removed, and a passed :class:`VerifyOutcome` is returned.
+    The original state of EVERY file the card writes (``card.targets`` -- one
+    entry for a single-target card) is captured up front. Each variant custom_id
+    is tried IN ORDER; a variant whose response is unusable is skipped without
+    running acceptance, carrying its reason as the retry's error context:
+    ``None`` (a failed request, no context), an answer cut off inside an
+    unclosed code fence (:func:`cards.generations.is_truncated_response`,
+    carrying :data:`cards.generations.TRUNCATED_RESPONSE_MESSAGE`), or one that
+    does not carry this card's files -- a declared file missing, or a file the
+    card never declared (:class:`cards.generations.CorruptResponse`).
+
+    A usable variant has its whole set of bodies written to the *real* target
+    paths -- acceptance must test the files where they will live -- and
+    ``card.acceptance``, the card's ONE command, is run once over the set. The
+    first variant to pass WINS: the targets keep its bytes and a passed
+    :class:`VerifyOutcome` is returned. A multi-variant SINGLE-target card also
+    gets the winner's suffixed file (naming as in :mod:`cards.generations`)
+    while every losing variant's suffixed file is removed; a multi-target card
+    deliberately gets no suffixed copies at all -- N variants times M files is
+    debris, and the winning set is already at the real paths.
 
     Each write is also stamped with an mtime no other write has used, so an
-    acceptance command that imports the target cannot be answered by bytecode
+    acceptance command that imports a target cannot be answered by bytecode
     cached for an earlier variant of the same byte size -- the stale-``.pyc``
     trap documented above :func:`_stamp_distinct_mtime`.
 
-    A failing variant is rolled back to the captured original before the next is
-    tried. If every variant fails (or every response was ``None``), the original
-    state is restored and a failed :class:`VerifyOutcome` is returned carrying
-    the last failure's :class:`AcceptanceResult` as the retry's error context.
+    Rollback is over the whole set, always: a failing variant's files are ALL
+    put back before the next is tried, a file that did not exist is deleted
+    again, and if every variant fails (or every response was ``None``) the tree
+    is left exactly as it was found, with a failed :class:`VerifyOutcome`
+    carrying the last failure's :class:`AcceptanceResult` as the retry's error
+    context. Either all of a card's files survive or none of them do; there is
+    no state in between for a human to clean up.
 
     Callers must only invoke this for a card that has an ``acceptance`` command;
     a card without one keeps Phase 3 behaviour and never reaches the verifier.
     """
-    target_path = os.path.join(root, card.target)
-    original = _capture_original(target_path)
+    card_paths = target_paths(card, root)
+    snapshots = _capture_originals(card_paths)
 
     variant_ids = _variant_ids(card)
     attempts = 0
@@ -318,27 +370,32 @@ def verify_card(
             log(f"mrph> variant {variant_id!r} was cut off mid-file "
                 f"(unclosed code fence) -- rejected without running acceptance")
             if last_result is None:
-                # Only as a STAND-IN, and only while no variant has actually
-                # run: a real acceptance failure is better retry context than
-                # this note, so the note never displaces one.
-                last_result = AcceptanceResult(
-                    passed=False,
-                    exit_code=None,
-                    output=TRUNCATED_RESPONSE_MESSAGE,
-                    timed_out=False,
-                )
+                last_result = _rejection_result(TRUNCATED_RESPONSE_MESSAGE)
+            continue
+
+        try:
+            bodies = response_to_files(response, card.targets)
+        except CorruptResponse as error:
+            # The answer is not this card's changeset: a declared file is
+            # missing from it, or it names one the card never asked for.
+            # Rejected like a cut-off answer -- writing part of a set, or a
+            # file nobody declared, is worse than paying for one retry.
+            log(f"mrph> variant {variant_id!r} did not return this card's "
+                f"files -- rejected without running acceptance ({error})")
+            if last_result is None:
+                last_result = _rejection_result(str(error))
             continue
 
         attempts += 1
-        body = response_to_file_body(response)
-        # The target may name a package that does not exist yet; create it
-        # before the first variant lands (idempotent for the ones after it).
-        ensure_parent_dir(target_path)
-        with open(target_path, "w", encoding="utf-8") as handle:
-            handle.write(body)
-        # Distinct mtime per variant: belt to run_acceptance's braces against a
-        # .pyc cached for an earlier, same-sized variant (see the note above).
-        _stamp_distinct_mtime(target_path)
+        for target, target_path in zip(card.targets, card_paths):
+            # A target may name a package that does not exist yet; create it
+            # before the first variant lands (idempotent for the ones after it).
+            ensure_parent_dir(target_path)
+            with open(target_path, "w", encoding="utf-8") as handle:
+                handle.write(bodies[target])
+            # Distinct mtime per write: belt to run_acceptance's braces against
+            # a .pyc cached for an earlier, same-sized variant (see above).
+            _stamp_distinct_mtime(target_path)
 
         result = run_acceptance(card.acceptance, root, timeout)
         last_result = result
@@ -349,15 +406,15 @@ def verify_card(
         )
 
         if result.passed:
-            paths = [target_path]
-            if card.variants > 1:
+            paths = list(card_paths)
+            if card.variants > 1 and len(card.targets) == 1:
                 # Keep the winner's suffixed file too, and clear any losing
                 # suffixed files (from this or an earlier attempt) so only the
                 # winner survives alongside the real target.
                 winning_path = _output_path(card, variant_id, root)
                 ensure_parent_dir(winning_path)
                 with open(winning_path, "w", encoding="utf-8") as handle:
-                    handle.write(body)
+                    handle.write(bodies[card.target])
                 paths.append(winning_path)
                 for other_id in variant_ids:
                     if other_id == variant_id:
@@ -373,12 +430,12 @@ def verify_card(
                 result=result,
             )
 
-        # Reject: undo this variant's write before trying the next.
-        _restore_original(target_path, original)
+        # Reject: undo this variant's writes -- all of them -- before the next.
+        _restore_originals(snapshots)
 
-    # No variant passed (or all responses were None): leave the target as we
+    # No variant passed (or all responses were None): leave every target as we
     # found it and hand back the last failure as retry context.
-    _restore_original(target_path, original)
+    _restore_originals(snapshots)
     return VerifyOutcome(
         passed=False,
         winning_custom_id=None,

@@ -20,6 +20,11 @@ Two guarantees this module exists to keep:
   One deliberate departure: a ``patch`` conversation never repeats its target
   in the project context, because it already ships it as "Original file" --
   see :func:`_context_messages` for the measurement that motivated it.
+  A card that writes a SET of files (``targets``) extends -- never rewrites --
+  that shape: one framing pair per existing target, and the output directive
+  of :func:`_output_directive` appended to the closing user message. A
+  single-target card compiles byte for byte as it always did, which the golden
+  files in ``tests/golden`` hold to.
 * **Determinism.** Identical inputs must produce byte-identical output. The
   transport-only ``time`` field is stripped from every message (mirroring
   ``MorphBot.clean_conversation``), whole-project walks are sorted before
@@ -49,6 +54,44 @@ TODO_INSTRUCTION = (
     "Please, criticize this file contents and add \"TODO:\" comments, saying, "
     "what can be improved."
 )
+
+
+# What a multi-target card appends to its closing user message. WHY it is
+# generated rather than left to the card author: a changeset card is worthless
+# unless the answer can be split back into files, so the ONE format the parser
+# understands (:func:`cards.generations.response_to_files`) has to be stated in
+# every such prompt -- and a format restated by hand in every card is a format
+# that drifts card by card until the parser rejects the answer.
+MULTI_TARGET_DIRECTIVE = (
+    "\n\n---\n"
+    "This card writes SEVERAL files. Return each of them as a path line "
+    "followed by one fenced block holding the COMPLETE file body:\n"
+    "\n"
+    "FILE: <path>\n"
+    "```python\n"
+    "<complete file body>\n"
+    "```\n"
+    "\n"
+    "(the fence tag may name the file's own language). One such pair per file, "
+    "in this exact order:\n"
+    "{files}\n"
+    "Use exactly these paths, give every one of them in full -- no diffs, no "
+    "elisions -- and return no file this list does not name: an answer that "
+    "misses a file or invents one is discarded whole and the card is retried."
+)
+
+
+def _output_directive(card: MorphCard) -> str:
+    """The multi-file output convention for ``card``, or ``""`` for one target.
+
+    Appended to the closing user message, so the executor is told how to return
+    a set of files in the same breath as what to put in them. Empty for a
+    single-target card -- its prompt must stay byte-identical to Morph 1.0's.
+    """
+    if len(card.targets) < 2:
+        return ""
+    files = "\n".join(f"- {target}" for target in card.targets)
+    return MULTI_TARGET_DIRECTIVE.format(files=files)
 
 
 def _filter_source_code_file_names(file_path: str) -> bool:
@@ -117,10 +160,11 @@ def _resolve_slice(card: MorphCard, root: str, skip_target: bool = False) -> Lis
     keep what the source filter accepts, and sort. Sorting both paths means the
     emitted context order never depends on filesystem walk order.
 
-    ``skip_target`` drops the card's own ``target`` from the result. Both paths
+    ``skip_target`` drops EVERY path the card writes (``card.targets``, which
+    is the single ``target`` for a one-file card) from the result. Both paths
     need it: an author naturally lists the target in the slice (it *is* relevant
     context), and the whole-project walk yields the target too -- so for an
-    intent that already ships the target as "Original file" either path would
+    intent that already ships the targets as "Original file" either path would
     otherwise send the same file twice. See :func:`_context_messages`.
     """
     if card.context_slice:
@@ -135,8 +179,8 @@ def _resolve_slice(card: MorphCard, root: str, skip_target: bool = False) -> Lis
         paths = sorted(matched)
 
     if skip_target:
-        target_key = _path_key(root, card.target)
-        paths = [path for path in paths if _path_key(root, path) != target_key]
+        target_keys = {_path_key(root, target) for target in card.targets}
+        paths = [path for path in paths if _path_key(root, path) not in target_keys]
     return paths
 
 
@@ -148,8 +192,8 @@ def _context_messages(card: MorphCard, root: str, skip_target: bool = False) -> 
     whole-project paths share one deterministic emission order and one message
     template.
 
-    ``skip_target`` is set by the intents that already carry the target file in
-    an "Original file" assistant message (``patch``). Sending that file a second
+    ``skip_target`` is set by the intents that already carry the target files in
+    an "Original file" assistant message (``patch``). Sending such a file a second
     time as project context tells the model nothing it does not already have and
     costs its tokens twice -- measured on a real card, one 58.8 KB target sent
     twice was 92% of a 127 KB prompt, and on a larger target the duplicate is a
@@ -174,11 +218,34 @@ def _clean(conversation: List[dict]) -> List[dict]:
     return conversation
 
 
-def _read_target(card: MorphCard, root: str) -> str:
-    """Read the ``patch``/``todo`` target file, relative to ``root``."""
-    target_path = os.path.join(root, card.target)
-    with open(target_path, "r", encoding="utf-8") as handle:
+def _read_file(root: str, relative_path: str) -> str:
+    """Read one file relative to ``root``."""
+    with open(os.path.join(root, relative_path), "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+def _original_file_messages(card: MorphCard, root: str) -> List[dict]:
+    """The assistant framing pair for every target the card ALREADY has on disk.
+
+    One pair per target, in the card's order: a message naming the path ("Let's
+    update the X file provided.") and the message carrying its bytes. For a
+    single-target card this is exactly the two messages ``flows/morph.py``
+    builds, byte for byte.
+
+    A target that does not exist yet is simply not sent: a changeset card
+    routinely patches one module while CREATING its test, and there is no
+    original to show for the second. (For a single-target ``patch`` card this
+    replaces a bare ``FileNotFoundError`` with a prompt that asks for the file
+    from scratch -- which is what such a card meant.)
+    """
+    dialog = LLMDialog()
+    for target in card.targets:
+        if not os.path.exists(os.path.join(root, target)):
+            continue
+        dialog.assign("assistant", f"Let's update the {target} file provided.")
+        file_contents = _read_file(root, target)
+        dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
+    return _clean(dialog.conversation)
 
 
 def _build_conversation(card: MorphCard, root: str) -> List[dict]:
@@ -187,31 +254,30 @@ def _build_conversation(card: MorphCard, root: str) -> List[dict]:
     The three intents mirror ``flows/morph.py`` message-for-message; see the
     module docstring. The returned messages carry only ``role``/``content``
     (no ``time``), so they are ready to serialize.
+
+    The closing user message carries the card's instruction plus -- for a card
+    that writes a SET of files -- the output directive that tells the executor
+    how to return them (:func:`_output_directive`, empty for one target).
     """
+    directive = _output_directive(card)
+
     if card.intent == "generate":
         messages = _context_messages(card, root)
-        messages.append({"role": "user", "content": card.instruction})
+        messages.append({"role": "user", "content": card.instruction + directive})
         return messages
 
     if card.intent == "patch":
-        dialog = LLMDialog()
-        dialog.assign("assistant", f"Let's update the {card.target} file provided.")
-        file_contents = _read_target(card, root)
-        dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
-        messages = _clean(dialog.conversation)
-        # The target has just gone out as "Original file"; skip_target keeps the
-        # context slice from shipping it a second time (see _context_messages).
+        messages = _original_file_messages(card, root)
+        # The targets have just gone out as "Original file"; skip_target keeps
+        # the context slice from shipping them again (see _context_messages).
         messages.extend(_context_messages(card, root, skip_target=True))
-        messages.append({"role": "user", "content": card.instruction})
+        messages.append({"role": "user", "content": card.instruction + directive})
         return messages
 
     if card.intent == "todo":
-        dialog = LLMDialog()
-        dialog.assign("assistant", f"Let's update the {card.target} file provided.")
-        file_contents = _read_target(card, root)
-        dialog.assign("assistant", f"Original file:\n\n---\n{file_contents}\n---\n")
-        dialog.assign("user", TODO_INSTRUCTION)
-        return _clean(dialog.conversation)
+        messages = _original_file_messages(card, root)
+        messages.append({"role": "user", "content": TODO_INSTRUCTION + directive})
+        return messages
 
     # MorphCard.validate() guarantees intent is one of the above; this guards
     # against a future intent being added to the schema without a compiler arm.

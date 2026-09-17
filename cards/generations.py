@@ -41,6 +41,11 @@ split-step ``/collect`` (:func:`cards.store.collect_generation`) uses the first
 two and PERSISTS the batch between them, so a regeneration survives a restart and
 a second CLI session cannot pay for the same retry twice.
 
+Phase 7 adds the *changeset* card: a card may name a SET of ``targets``, and
+one response then carries several files (:func:`response_to_files`). Splitting
+the answer lives here, next to the single-file splitter it extends; writing the
+set atomically -- all of it or none -- is :mod:`cards.acceptance`'s job.
+
 Known simplification, still in force: ``flows.morph``'s ``append_if_plain`` /
 ``todo`` append semantics are *not* reproduced. A response with no fenced code
 block is written verbatim in mode ``'w'`` (never appended). Per-card backend
@@ -224,6 +229,151 @@ def is_truncated_response(response: Optional[str]) -> bool:
     return len(_FENCE_MARKER.findall(response)) % 2 == 1
 
 
+# The line that opens one file in a multi-file answer, as
+# ``cards.compiler.MULTI_TARGET_DIRECTIVE`` asks for it: ``FILE: <path>``.
+_FILE_MARKER_PREFIX = "FILE:"
+
+
+class CorruptResponse(ValueError):
+    """The answer cannot be turned into the files this card declared.
+
+    Carries, as its message, the text the executor is shown on the next attempt
+    -- exactly the role :data:`TRUNCATED_RESPONSE_MESSAGE` plays for an answer
+    cut off mid-fence. Raised by :func:`response_to_files`; every caller treats
+    it the way it treats a missing response: the variant is unusable, nothing is
+    written, and the card is regenerated with the reason.
+    """
+
+
+# The three ways a multi-file answer can fail to match its card, written AT the
+# executor: they are pasted into the next attempt's instruction.
+MISSING_FILES_MESSAGE = (
+    "The previous answer did not return every file this card writes -- missing: "
+    "{missing}. This card writes exactly: {declared}. Answer again with ALL of "
+    "them, each as a 'FILE: <path>' line followed by a fenced block holding the "
+    "complete file body."
+)
+
+UNDECLARED_FILE_MESSAGE = (
+    "The previous answer returned a file this card does not write: {path}. "
+    "This card writes exactly: {declared}. Answer again with those files and no "
+    "others, each as a 'FILE: <path>' line followed by a fenced block holding "
+    "the complete file body."
+)
+
+DUPLICATE_FILE_MESSAGE = (
+    "The previous answer returned {path} more than once, so there is no telling "
+    "which body was meant. Answer again with exactly one 'FILE: <path>' block "
+    "per file, for: {declared}."
+)
+
+
+def _path_list(paths: List[str]) -> str:
+    """Render a list of paths for an executor-facing message."""
+    return ", ".join(paths)
+
+
+def _target_key(path: str) -> str:
+    """A canonical identity for one declared/answered path, for comparison only.
+
+    ``cards/schema.py`` and ``./cards/schema.py`` are the same file, and a model
+    handed a list of paths will spell one of them either way. The key is never
+    written anywhere: the CARD's spelling is what reaches disk.
+    """
+    return os.path.normpath(path.strip())
+
+
+def _split_file_sections(response: str):
+    """Split a response on its ``FILE: <path>`` marker lines, or ``None``.
+
+    Returns ``[(answered path, the text under it), ...]`` in answer order, or
+    ``None`` when the response carries no marker at all (Morph 1.0's shape --
+    one file, no markers). Anything before the first marker is preamble and is
+    dropped.
+
+    A marker counts only at the start of a line and OUTSIDE a fenced block: a
+    ``FILE:`` line inside a file body is that file's content, not the start of
+    the next one. The fence parity this tracks is the same one
+    :func:`is_truncated_response` counts.
+    """
+    sections = []
+    current = None
+    in_fence = False
+    for line in response.split("\n"):
+        if line.startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith(_FILE_MARKER_PREFIX):
+            # Models wrap a path in backticks or quotes as readily as not.
+            answered = line[len(_FILE_MARKER_PREFIX):].strip().strip("`\"' ")
+            current = (answered, [])
+            sections.append(current)
+            continue
+        if current is not None:
+            current[1].append(line)
+    if not sections:
+        return None
+    return [(answered, "\n".join(lines)) for answered, lines in sections]
+
+
+def response_to_files(response: str, targets: List[str]) -> Dict[str, str]:
+    """Split one response into ``{declared target: file body}``.
+
+    Which shape an answer is in, the ANSWER decides -- not the card:
+
+    * **No ``FILE:`` marker** -- Morph 1.0's shape, unchanged: the whole
+      response is one file body (:func:`response_to_file_body`), which a
+      single-target card writes to its one target. A card that writes a SET has
+      nothing to split here, so for it that answer is corrupt.
+    * **``FILE: <path>`` markers** -- each followed by that file's body, the
+      format ``cards.compiler.MULTI_TARGET_DIRECTIVE`` asks for. Bodies go
+      through the same fenced-block extraction as a single-file answer.
+
+    Raises :class:`CorruptResponse` -- the treatment an unterminated fence
+    already gets, so the card fails verification and is regenerated with the
+    reason -- when the answer does not match the card: a declared target is
+    MISSING from it, it names a path the card never declared, or it returns the
+    same path twice. Each alternative is worse than paying for one retry:
+    a half-written changeset, or a file nobody asked for landing in the tree.
+
+    The returned keys are the CARD's own target spellings, never the model's.
+    """
+    declared = _path_list(targets)
+    sections = _split_file_sections(response)
+
+    if sections is None:
+        if len(targets) > 1:
+            raise CorruptResponse(
+                MISSING_FILES_MESSAGE.format(missing=declared, declared=declared))
+        return {targets[0]: response_to_file_body(response)}
+
+    by_key = {_target_key(target): target for target in targets}
+    bodies: Dict[str, str] = {}
+    for answered, section in sections:
+        target = by_key.get(_target_key(answered))
+        if target is None:
+            raise CorruptResponse(
+                UNDECLARED_FILE_MESSAGE.format(path=answered, declared=declared))
+        if target in bodies:
+            raise CorruptResponse(
+                DUPLICATE_FILE_MESSAGE.format(path=answered, declared=declared))
+        bodies[target] = response_to_file_body(section)
+
+    missing = [target for target in targets if target not in bodies]
+    if missing:
+        raise CorruptResponse(MISSING_FILES_MESSAGE.format(
+            missing=_path_list(missing), declared=declared))
+    return bodies
+
+
+def target_paths(card: MorphCard, root: str) -> List[str]:
+    """The real paths a card writes, relative to ``root``, in the card's order.
+
+    One entry for a single-target card. Public so :mod:`cards.acceptance`
+    snapshots, writes and rolls back exactly the set the card declared.
+    """
+    return [os.path.join(root, target) for target in card.targets]
+
+
 def _variant_ids(card: MorphCard) -> List[str]:
     """The batch custom_ids a card compiles to, matching :func:`compile_card`."""
     if card.variants == 1:
@@ -237,6 +387,11 @@ def _output_path(card: MorphCard, variant_custom_id: str, root: str) -> str:
     A single-variant card writes its ``target``; a multi-variant card writes
     ``<stem>.<variant_custom_id><ext>`` (the ``variant_custom_id`` already
     carries the ``.vN`` suffix), mirroring ``flows.morph.output_file_name``.
+
+    For SINGLE-target cards only. A card that writes a set of files gets no
+    suffixed per-variant copies -- N variants times M files is a pile of
+    ``.v2`` debris nobody reads, and the winning set lands at the real paths
+    anyway; see :func:`cards.acceptance.verify_card`.
     """
     if card.variants == 1:
         return os.path.join(root, card.target)
@@ -306,8 +461,16 @@ def _write_variants(
     A ``None`` response is a failed variant and is skipped; so is a response cut
     off inside an unclosed code fence (:func:`is_truncated_response`) -- it is a
     corrupt response, not a file body, and writing it verbatim used to put the
-    literal ```` ```python ```` line on disk. Returns the paths written; an empty
-    list means every variant response was missing or cut off.
+    literal ```` ```python ```` line on disk -- and so is one that does not carry
+    the card's files (:class:`CorruptResponse`), which would otherwise leave a
+    half-written changeset behind. Returns the paths written; an empty list means
+    every variant response was missing or corrupt.
+
+    A card that writes a SET of files has no suffixed per-variant copies to write
+    (see :func:`_output_path`), so the FIRST surviving variant's set is written
+    and the rest are dropped: without an acceptance command there is nothing to
+    judge the others by, and letting each in turn write over the same real paths
+    would just crown the last one silently.
     """
     written: List[str] = []
     for variant_id in _variant_ids(card):
@@ -318,12 +481,21 @@ def _write_variants(
             log(f"mrph> variant {variant_id!r} was cut off mid-file "
                 f"(unclosed code fence) -- discarded")
             continue
-        body = response_to_file_body(response)
-        path = _output_path(card, variant_id, root)
-        ensure_parent_dir(path)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(body)
-        written.append(path)
+        try:
+            bodies = response_to_files(response, card.targets)
+        except CorruptResponse as error:
+            log(f"mrph> variant {variant_id!r} did not return this card's "
+                f"files -- discarded ({error})")
+            continue
+        single = len(card.targets) == 1
+        for target, real_path in zip(card.targets, target_paths(card, root)):
+            path = _output_path(card, variant_id, root) if single else real_path
+            ensure_parent_dir(path)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(bodies[target])
+            written.append(path)
+        if not single:
+            break
     return written
 
 
@@ -347,7 +519,7 @@ def _retry_card(card: MorphCard, attempt: int, result) -> MorphCard:
     return MorphCard(
         custom_id=f"{card.custom_id}.r{attempt}",
         intent=card.intent,
-        target=card.target,
+        targets=list(card.targets),
         instruction=card.instruction + error_block,
         context_slice=list(card.context_slice),
         acceptance=card.acceptance,

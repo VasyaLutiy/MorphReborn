@@ -3,7 +3,8 @@ The morph card: the JCL of an LLM batch job.
 
 A *morph card* is the unit of specification the orchestrator compiles and the
 executor consumes -- see ``documentation/batch-orchestrator.md`` ("The morph
-card: JCL for LLM jobs"). Each card names a single output ``target``, the
+card: JCL for LLM jobs"). Each card names its output -- a single ``target``,
+or the ``targets`` a *changeset* card writes as one atomic set -- the
 ``instruction`` that produces it, the ``context_slice`` of files its executor
 must see, and the machine-checkable ``acceptance`` criterion that verifies it.
 
@@ -20,6 +21,7 @@ offending ``custom_id`` (when known) and field, so a broken deck reports *what*
 is wrong rather than surfacing a bare ``KeyError``/``TypeError``.
 """
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -38,6 +40,7 @@ VALID_INTENTS = ("generate", "patch", "todo")
 _META_FIELDS = (
     "intent",
     "target",
+    "targets",
     "context_slice",
     "acceptance",
     "model",
@@ -74,7 +77,8 @@ class MorphCard:
 
     custom_id: str
     intent: str
-    target: str
+    target: Optional[str] = None
+    targets: List[str] = field(default_factory=list)
     instruction: str = ""
     context_slice: List[str] = field(default_factory=list)
     acceptance: Optional[str] = None
@@ -84,9 +88,52 @@ class MorphCard:
     depends_on: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self._resolve_target_form()
         self.validate()
 
     # -- validation -----------------------------------------------------------
+
+    def _resolve_target_form(self) -> None:
+        """Settle the two ways a card may name its output into ONE accessor.
+
+        A card names exactly one of ``target`` (one file -- the original form)
+        and ``targets`` (the set of files a *changeset* card writes atomically,
+        Phase 7 of ``documentation/DEVELOPMENT_PLAN.md``). Whichever the author
+        wrote, afterwards :attr:`targets` is always a non-empty list and
+        :attr:`target` is its FIRST entry -- so no consumer downstream has to
+        branch on the authored form: it reads ``targets`` to write files, and
+        ``target`` for the single-file case and for the messages that name one
+        file ("Let's update the X file provided.").
+
+        This runs ONCE, from :meth:`__post_init__`, because the *authored* form
+        is what it judges: after it, both attributes are set and agree, which is
+        what :meth:`validate` -- callable any number of times -- checks instead.
+        """
+        cid = self.custom_id if isinstance(self.custom_id, str) else None
+        has_target = self.target is not None
+        has_targets = bool(self.targets)
+
+        if has_target and has_targets:
+            raise _err(
+                cid,
+                "a card names either 'target' (one file) or 'targets' (a set of "
+                "files written atomically), not both",
+            )
+        if not has_target and not has_targets:
+            raise _err(
+                cid,
+                "target is required (or 'targets' for a card that writes a set "
+                "of files)",
+            )
+
+        if has_target:
+            self.targets = [self.target]
+        elif isinstance(self.targets, list) and self.targets:
+            # validate() re-checks the element types; take the first only when
+            # it is usable as the display target, so a malformed list still
+            # reaches the proper message below instead of dying here.
+            first = self.targets[0]
+            self.target = first if isinstance(first, str) else None
 
     def validate(self) -> None:
         """Raise :class:`CardError` if any field is malformed."""
@@ -110,9 +157,24 @@ class MorphCard:
                 f"{{{', '.join(VALID_INTENTS)}}}, got {self.intent!r}",
             )
 
-        # target: required, non-empty.
-        if not isinstance(self.target, str) or not self.target:
+        # target / targets: settled by _resolve_target_form at construction --
+        # targets is the whole set, target its first entry. Every path is
+        # validated the same way the single target always was.
+        _require_str_list(cid, "targets", self.targets)
+        # The first path answers for the single-file form too, so a card that
+        # wrote target: "" still gets the message it always got.
+        if not isinstance(self.target, str) or not self.target or not self.targets:
             raise _err(cid, "target is required and must be a non-empty string")
+        for path in self.targets:
+            if not path:
+                raise _err(cid, "targets must contain only non-empty paths")
+        # Compared normalised, because ``a.py`` and ``./a.py`` are one file: the
+        # same path twice cannot be written twice atomically, and the response
+        # parser (which matches answered paths to declared ones the same way)
+        # would have no way to tell the two apart.
+        normalised = [os.path.normpath(path) for path in self.targets]
+        if len(set(normalised)) != len(normalised):
+            raise _err(cid, "targets must not name the same path twice")
 
         # instruction: required for generate/patch; may be empty for todo
         # (the todo instruction is fixed elsewhere).
@@ -210,11 +272,14 @@ class MorphCard:
         kwargs = {
             "custom_id": custom_id,
             "intent": source.get("intent"),
-            "target": source.get("target"),
             "instruction": instruction,
         }
-        # Only pass optional fields when present so dataclass defaults apply.
+        # Only pass optional fields when present so dataclass defaults apply --
+        # "target" and "targets" among them, since a card gives exactly one and
+        # passing the other as None/[] would look like the author wrote it.
         for key in (
+            "target",
+            "targets",
             "context_slice",
             "acceptance",
             "model",
@@ -227,8 +292,6 @@ class MorphCard:
 
         if kwargs["intent"] is None:
             raise _err(custom_id, "intent is required")
-        if kwargs["target"] is None:
-            raise _err(custom_id, "target is required")
 
         return cls(**kwargs)
 

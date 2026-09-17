@@ -113,7 +113,12 @@ def card_to_dict(card: MorphCard) -> dict:
     non-default meta values are emitted, so a round-tripped backlog stays as
     clean as a hand-written one (defaults are reapplied on load).
     """
-    meta: Dict[str, object] = {"intent": card.intent, "target": card.target}
+    # One key or the other, never both: the schema accepts exactly one form,
+    # and a changeset card must round-trip through the backlog as a changeset.
+    if len(card.targets) > 1:
+        meta: Dict[str, object] = {"intent": card.intent, "targets": list(card.targets)}
+    else:
+        meta = {"intent": card.intent, "target": card.target}
     if card.context_slice:
         meta["context_slice"] = list(card.context_slice)
     if card.acceptance is not None:

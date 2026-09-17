@@ -134,6 +134,17 @@ class DeckStoreBacklogTests(unittest.TestCase):
         rebuilt = MorphCard.from_dict(card_to_dict(card))
         self.assertEqual(rebuilt, card)
 
+    def test_a_changeset_card_round_trips_as_a_changeset(self):
+        # The backlog is where a card waits between CLI sessions: a card that
+        # writes a SET must not come back as a single-target one.
+        card = MorphCard(custom_id="x", intent="patch",
+                         targets=["x.py", "tests/test_x.py"],
+                         instruction="fix", acceptance="pytest -q")
+        as_dict = card_to_dict(card)
+        self.assertEqual(as_dict["meta"]["targets"], ["x.py", "tests/test_x.py"])
+        self.assertNotIn("target", as_dict["meta"])
+        self.assertEqual(MorphCard.from_dict(as_dict), card)
+
 
 class DeckStoreStateTests(unittest.TestCase):
     def setUp(self):

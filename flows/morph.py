@@ -45,6 +45,10 @@ A morph card is a JSON object with these fields:
   custom_id      - unique id, characters [A-Za-z0-9._-]; names the job and its output file
   intent         - one of "generate", "patch", "todo"
   target         - the single file this card writes
+  targets        - INSTEAD of "target": the list of files this card writes as ONE
+                   atomic set (a module AND its test, say). Use it whenever a change
+                   only makes sense applied to several files together -- the set is
+                   accepted or rolled back whole. Give exactly one of target/targets
   context_slice  - list of files the executor must see; use paths that EXIST in the
                    project OR are the "target" of an EARLIER card in this deck;
                    [] means "the whole project"
@@ -59,6 +63,7 @@ RULES:
   - Output ONLY a JSON array of card objects -- no commentary. A single fenced
     ```json code block wrapping the array is acceptable.
   - Every "acceptance" value must be a real, runnable shell command.
+  - A card names exactly one of "target" and "targets", never both.
   - Every "context_slice" path must already exist in the project OR be the target
     of another card in this array.
   - Use depends_on so no card reads a file another card in the same generation is

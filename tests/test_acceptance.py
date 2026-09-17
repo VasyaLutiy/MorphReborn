@@ -462,5 +462,158 @@ class BytecodeCacheTrapTests(unittest.TestCase):
             self.assertIn("a + b", handle.read())
 
 
+def _file_block(path, body):
+    """One file of a multi-file answer, in the format the directive asks for."""
+    return f"FILE: {path}\n```python\n{body}\n```\n"
+
+
+class ChangesetAtomicityTests(unittest.TestCase):
+    """Phase 7: a card's files are accepted or rolled back as ONE set.
+
+    The limitation this closes was measured, not theorised: every fix this
+    project shipped by hand had to touch a module AND its test, so none of them
+    could be expressed as a card. What makes the set safe to attempt is that a
+    failure leaves nothing behind -- no half-written changeset for a human to
+    find with ``git status`` and undo by hand.
+    """
+
+    ORIGINAL = "ORIGINAL = 1\n"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="morph-changeset-")
+        self.root = self.tmp
+        with open(os.path.join(self.root, "existing.py"), "w", encoding="utf-8") as handle:
+            handle.write(self.ORIGINAL)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _files_on_disk(self):
+        """Every FILE under the root, relative -- directories deliberately not.
+
+        A directory created for a rejected write is left in place on purpose
+        (see ``cards.generations.ensure_parent_dir``); an empty one is harmless.
+        """
+        found = set()
+        for walk_root, _dirs, files in os.walk(self.root):
+            for name in files:
+                found.add(os.path.relpath(os.path.join(walk_root, name), self.root))
+        return found
+
+    def _read(self, name):
+        with open(os.path.join(self.root, name), encoding="utf-8") as handle:
+            return handle.read()
+
+    def _card(self, targets, acceptance, variants=1):
+        return MorphCard(
+            custom_id="set",
+            intent="generate",
+            targets=targets,
+            instruction="do it",
+            variants=variants,
+            acceptance=acceptance,
+        )
+
+    def _three_file_answer(self, marker="PASS"):
+        return (_file_block("existing.py", f"{marker} = 1")
+                + _file_block("fresh.py", f"{marker} = 2")
+                + _file_block("pkg/deep.py", f"{marker} = 3"))
+
+    def test_three_targets_all_written_when_acceptance_passes(self):
+        card = self._card(
+            ["existing.py", "fresh.py", "pkg/deep.py"],
+            "grep -q PASS existing.py && grep -q PASS fresh.py "
+            "&& grep -q PASS pkg/deep.py")
+
+        outcome = verify_card(card, {"set": self._three_file_answer()},
+                              self.root, 30.0, log=lambda _msg: None)
+
+        self.assertTrue(outcome.passed)
+        self.assertEqual(outcome.winning_custom_id, "set")
+        self.assertEqual(outcome.paths, [
+            os.path.join(self.root, "existing.py"),
+            os.path.join(self.root, "fresh.py"),
+            os.path.join(self.root, "pkg", "deep.py"),
+        ])
+        self.assertEqual(self._read("existing.py"), "PASS = 1\n")
+        self.assertEqual(self._read("fresh.py"), "PASS = 2\n")
+        self.assertEqual(self._read(os.path.join("pkg", "deep.py")), "PASS = 3\n")
+
+    def test_a_failing_acceptance_leaves_none_of_the_three_behind(self):
+        before = self._files_on_disk()
+        card = self._card(["existing.py", "fresh.py", "pkg/deep.py"],
+                          "grep -q NEVER_PRESENT existing.py")
+
+        outcome = verify_card(card, {"set": self._three_file_answer()},
+                              self.root, 30.0, log=lambda _msg: None)
+
+        self.assertFalse(outcome.passed)
+        self.assertEqual(outcome.attempts, 1)
+        # The file that existed is back to its original bytes; the two that did
+        # not exist are gone again. Nothing at all is left to clean up.
+        self.assertEqual(self._read("existing.py"), self.ORIGINAL)
+        self.assertEqual(self._files_on_disk(), before)
+
+    def test_the_whole_set_is_written_before_acceptance_runs(self):
+        # The card's ONE acceptance command judges the SET: a command that only
+        # passes when every file is present proves they all land first.
+        card = self._card(["existing.py", "fresh.py", "pkg/deep.py"],
+                          "test -f fresh.py && test -f pkg/deep.py "
+                          "&& grep -q PASS existing.py")
+
+        outcome = verify_card(card, {"set": self._three_file_answer()},
+                              self.root, 30.0, log=lambda _msg: None)
+
+        self.assertTrue(outcome.passed)
+
+    def test_a_response_missing_a_declared_target_writes_nothing(self):
+        before = self._files_on_disk()
+        card = self._card(["existing.py", "fresh.py"], "true")
+
+        outcome = verify_card(card, {"set": _file_block("existing.py", "PASS = 1")},
+                              self.root, 30.0, log=lambda _msg: None)
+
+        # Corrupt, not a partial write: acceptance never ran (a `true` command
+        # would have passed), and the tree is untouched.
+        self.assertFalse(outcome.passed)
+        self.assertEqual(outcome.attempts, 0)
+        self.assertEqual(self._files_on_disk(), before)
+        self.assertEqual(self._read("existing.py"), self.ORIGINAL)
+        self.assertIn("fresh.py", outcome.result.output)
+
+    def test_a_response_naming_an_undeclared_path_writes_nothing(self):
+        before = self._files_on_disk()
+        card = self._card(["existing.py"], "true")
+
+        answer = (_file_block("existing.py", "PASS = 1")
+                  + _file_block("somewhere_else.py", "SNEAKY = 1"))
+        outcome = verify_card(card, {"set": answer}, self.root, 30.0,
+                              log=lambda _msg: None)
+
+        self.assertFalse(outcome.passed)
+        self.assertEqual(outcome.attempts, 0)
+        self.assertEqual(self._files_on_disk(), before)
+        self.assertIn("somewhere_else.py", outcome.result.output)
+
+    def test_best_of_n_keeps_the_first_passing_set_and_no_suffixed_copies(self):
+        card = self._card(["existing.py", "fresh.py"], "grep -q PASS existing.py",
+                          variants=2)
+        losing = (_file_block("existing.py", "NOPE = 1")
+                  + _file_block("fresh.py", "LOSER = 2"))
+        winning = (_file_block("existing.py", "PASS = 1")
+                   + _file_block("fresh.py", "WINNER = 2"))
+
+        outcome = verify_card(card, {"set.v1": losing, "set.v2": winning},
+                              self.root, 30.0, log=lambda _msg: None)
+
+        self.assertTrue(outcome.passed)
+        self.assertEqual(outcome.winning_custom_id, "set.v2")
+        self.assertEqual(outcome.attempts, 2)
+        self.assertEqual(self._read("fresh.py"), "WINNER = 2\n")
+        # No per-variant debris: N variants times M files helps nobody.
+        self.assertEqual(self._files_on_disk(), {"existing.py", "fresh.py"})
+
+
 if __name__ == "__main__":
     unittest.main()
