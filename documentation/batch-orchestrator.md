@@ -120,9 +120,25 @@ Field notes:
   into cheap **best-of-N**: the orchestrator picks the variant that passes
   acceptance, or diffs survivors for the engineer.
 - **`generation` / `depends_on`** — batch requests cannot see each other's
-  output, so any job that reads a file another job writes must wait for the
-  next generation. The orchestrator enforces this with a topological sort;
-  cards with unmet dependencies stay in the deck for generation N+1.
+  output, so any job that reads or writes a file another job writes must wait
+  for the next generation. `depends_on` declares that ordering and a
+  topological sort applies it; cards with unmet dependencies stay in the deck
+  for generation N+1.
+
+  The declaration alone is not the guarantee, and treating it as one was this
+  design's one silent failure mode: two cards of a generation writing the same
+  file produced a lost update — the second write replaced the first, both cards
+  reported success, and the run was green. The invariant is therefore *derived*
+  rather than trusted (`cards/hazards.py`): a card's write set is its
+  `targets`, its read set its `context_slice`, and every run is preflighted
+  against them. A missing edge between a reader and a writer is added
+  automatically (the reader serializes into the next generation); two cards
+  writing one file refuse the run, because there is no correct automatic answer
+  to which of them should win. A second, independent check runs at acceptance
+  time: each card records what it was compiled from, and an answer written
+  against files that have since changed is discarded unread and regenerated
+  from the current tree, which also covers what no deck check can know — a
+  human editing the project while a batch sits in a provider's queue.
 
 ## The generation cycle: nightly builds for code generation
 

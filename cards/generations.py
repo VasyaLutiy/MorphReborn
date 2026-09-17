@@ -58,7 +58,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from cards.compiler import compile_card
+from cards.compiler import CompiledInputs, compile_card
 from cards.schema import MorphCard
 
 
@@ -115,7 +115,10 @@ class CardOutcome:
     (every variant response was ``None``, or the whole batch failed, or -- for a
     card with acceptance -- verification failed through the last retry), or
     ``"skipped"`` (a dependency failed or was itself skipped; ``reason`` names
-    the blocking dependency).
+    the blocking dependency). ``reason`` also names the cause of a failure that
+    is not the executor's doing: :data:`REASON_STALE` when the card's inputs
+    changed under it while its generation was being judged, and
+    :data:`REASON_COMPILE` when the card could not be compiled at all.
 
     Phase 4 adds three fields, meaningful only for a card with an ``acceptance``
     command: ``attempts`` is the number of generation-level tries (1 = original
@@ -554,6 +557,20 @@ def _write_variants(
     return written
 
 
+def _acceptance_ran(result) -> bool:
+    """Whether a command actually RAN for this attempt.
+
+    ``exit_code is None`` without a timeout is this codebase's mark of a
+    stand-in result -- an answer rejected before acceptance could be run at all
+    (cut off mid-file, not this card's changeset, or compiled from files that
+    have since changed). Everything a retry says about the previous attempt, in
+    the log and in the prompt, turns on this distinction: "your code failed the
+    tests" and "your answer was never read" are different messages, and only one
+    of them is true at a time.
+    """
+    return result is not None and (result.exit_code is not None or result.timed_out)
+
+
 def _retry_card(card: MorphCard, attempt: int, result) -> MorphCard:
     """A copy of ``card`` for retry ``attempt``, its instruction carrying the error.
 
@@ -564,12 +581,29 @@ def _retry_card(card: MorphCard, attempt: int, result) -> MorphCard:
     all-``None`` responses) so the executor can see what went wrong.
     """
     output = result.output if result is not None else ""
+    # A stand-in result (``exit_code is None`` without a timeout) is one where
+    # acceptance never RAN: the answer was rejected before it could be tested --
+    # cut off mid-file, not this card's changeset, or compiled from files that
+    # have since changed. Framing that as "your code failed the tests" is a lie
+    # the executor then acts on, "fixing" code nothing found fault with, so the
+    # two cases get the two sentences they deserve.
+    ran = _acceptance_ran(result)
+    header = (
+        f"A previous attempt failed its acceptance check (`{card.acceptance}`):"
+        if ran else
+        "A previous attempt was discarded before acceptance could run:"
+    )
+    closing = (
+        "Please fix the issues and produce the complete corrected file."
+        if ran else
+        "Produce the complete file again, from the context given above."
+    )
     error_block = (
         "\n\n---\n"
-        f"A previous attempt failed its acceptance check (`{card.acceptance}`):\n"
+        f"{header}\n"
         f"{output}\n"
         "---\n"
-        "Please fix the issues and produce the complete corrected file."
+        f"{closing}"
     )
     return MorphCard(
         custom_id=f"{card.custom_id}.r{attempt}",
@@ -583,6 +617,150 @@ def _retry_card(card: MorphCard, attempt: int, result) -> MorphCard:
         generation=card.generation,
         depends_on=list(card.depends_on),
     )
+
+
+# -- the stale-inputs guard --------------------------------------------------
+#
+# The runtime half of :mod:`cards.hazards`. A generation is compiled as one
+# batch and then judged card by card into the SAME working tree, so a file card
+# N was compiled from may already have been rewritten by card N-1 by the time
+# card N's answer is judged. Accepting it then overwrites accepted work with a
+# morph that never saw it -- silently, with both cards reporting ``written``.
+# The deck check refuses a deck that PLANS such a collision; this catches what a
+# deck cannot know: a hand edit during the hour a batch sits in a queue, a
+# retry landing next to a sibling, a slice made stale by a card the author did
+# not think of. The answer is discarded UNREAD and the card is regenerated from
+# the current files, which is the one repair that cannot lose anything.
+
+# ``CardOutcome.reason`` values for the two failures that are not the executor's
+# fault. Constants because the CLI and the run report match on them.
+REASON_STALE = "stale-context"
+REASON_COMPILE = "compile-failed"
+
+
+def _stale_message(paths: List[str]) -> str:
+    """What a stale card carries into its retry, in the executor's own terms.
+
+    It must read as an instruction to the model, not as an operator's log line:
+    this text lands in the retry prompt, and a model told "your answer failed"
+    when nothing of the sort happened will "fix" code that was never wrong.
+    """
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        "The project files this card was compiled from changed after the batch "
+        "was submitted -- another card of the same generation rewrote them, or "
+        "they were edited by hand:\n"
+        f"{listed}\n"
+        "The previous answer was therefore written against a version of the "
+        "project that no longer exists and was discarded WITHOUT being read or "
+        "tested. Nothing is known to be wrong with it. This attempt is compiled "
+        "from the current files; produce the complete file(s) again on that "
+        "basis."
+    )
+
+
+def _stale_result(paths: List[str]):
+    """The stand-in :class:`cards.acceptance.AcceptanceResult` for a stale card.
+
+    ``exit_code`` ``None`` with ``timed_out`` false is this codebase's mark of a
+    result where nothing ran (see ``cards.acceptance._rejection_result``), which
+    is what :func:`_retry_card` reads to frame the retry honestly.
+    """
+    from cards.acceptance import AcceptanceResult
+
+    return AcceptanceResult(passed=False, exit_code=None,
+                            output=_stale_message(paths), timed_out=False)
+
+
+def _stale_inputs(
+    card: MorphCard,
+    inputs: Optional[Dict[str, CompiledInputs]],
+    root: str,
+) -> List[str]:
+    """The card's compiled-from files that have changed since, or ``[]``.
+
+    ``inputs`` is the per-card capture taken at compile time. It is optional at
+    every call site: a caller that has none (an older ``.morph/state.json``, a
+    test driving the loop directly) gets the pre-guard behaviour rather than a
+    failure, because this guard exists to prevent silent loss and must not
+    become a new way to lose a run.
+    """
+    if not inputs:
+        return []
+    captured = inputs.get(card.custom_id)
+    if captured is None:
+        return []
+    return captured.changed(root)
+
+
+def compile_for_batch(
+    cards: List[MorphCard], root: str
+) -> Tuple[List[dict], Dict[str, CompiledInputs], List[MorphCard], List[Tuple[str, str]]]:
+    """Compile cards into batch requests, capturing what each one READ.
+
+    Returns ``(requests, inputs, compiled, failures)``: the request dicts to
+    submit, the per-card :class:`cards.compiler.CompiledInputs` the staleness
+    guard will check against, the cards that compiled, and ``(custom_id,
+    error)`` for those that did not.
+
+    WHY a card is allowed to fail here instead of the run dying. Compiling reads
+    the project: a slice naming a file that is not there raises (deliberately --
+    ``ContextFolderDialog`` refuses to silently drop context), and so does an
+    unreadable file or a bad encoding. That exception used to leave
+    :func:`run_deck` through the top, which meant ONE mistyped path in one card
+    of generation three aborted a nightly run that had already accepted,
+    committed and paid for two generations -- with no outcome recorded for
+    anything and no archive. A card that cannot be compiled is a card that
+    failed; the rest of its generation is not implicated and goes to the
+    provider as usual.
+
+    The inputs are captured BEFORE the card is compiled, so the record can only
+    be of a state at or before what the executor was shown -- erring, if the
+    tree moves under a compile, towards declaring a card stale (one wasted
+    regeneration) rather than towards missing that it is (a silent overwrite).
+    """
+    requests: List[dict] = []
+    inputs: Dict[str, CompiledInputs] = {}
+    compiled: List[MorphCard] = []
+    failures: List[Tuple[str, str]] = []
+    for card in cards:
+        try:
+            captured = CompiledInputs.capture(card, root)
+            card_requests = compile_card(card, root)
+        except Exception as error:  # noqa: BLE001 -- see the docstring
+            failures.append((card.custom_id, f"{type(error).__name__}: {error}"))
+            continue
+        inputs[card.custom_id] = captured
+        requests.extend(card_requests)
+        compiled.append(card)
+    return requests, inputs, compiled, failures
+
+
+def _compile_generation(
+    runnable: List[MorphCard],
+    root: str,
+    index: int,
+    total: int,
+    outcomes: Dict[str, CardOutcome],
+    blocked: set,
+    log: Callable[[str], None],
+) -> Tuple[List[dict], Dict[str, CompiledInputs], List[MorphCard]]:
+    """:func:`compile_for_batch` plus the bookkeeping for what did not compile.
+
+    Each failure is logged, recorded as a ``"failed"`` outcome carrying the
+    compiler's own message, and blocked so its dependents are skipped rather
+    than compiled against a file that will never be written.
+    """
+    requests, inputs, compiled, failures = compile_for_batch(runnable, root)
+    for custom_id, error in failures:
+        log(
+            f"mrph> [generation {index}/{total}] {custom_id!r} could not be "
+            f"compiled and was NOT submitted: {error}"
+        )
+        outcomes[custom_id] = CardOutcome(
+            custom_id, "failed", reason=REASON_COMPILE, acceptance_output=error)
+        blocked.add(custom_id)
+    return requests, inputs, compiled
 
 
 def resolve_runnable(
@@ -640,6 +818,7 @@ def process_generation(
     inline_retries: bool = True,
     on_accepted: Optional[AcceptedHook] = None,
     batch_ids: Optional[List[str]] = None,
+    inputs: Optional[Dict[str, CompiledInputs]] = None,
 ) -> List[tuple]:
     """Turn one generation's collected ``results`` into outcomes (with retries).
 
@@ -670,6 +849,14 @@ def process_generation(
     the moment its files are final -- that is where the run's git layer turns a
     card into a commit. ``batch_ids``, when given, is the list an inline retry
     batch's id is appended to: the run's receipt of everything it submitted.
+
+    ``inputs`` is what each card was compiled FROM
+    (:class:`cards.compiler.CompiledInputs`, captured at submit time). A card
+    whose inputs have changed since is not judged at all: its answer was written
+    against a project that no longer exists, so it is discarded unread and
+    regenerated from the current files -- see the stale-inputs guard above.
+    Omitting ``inputs`` disables that check and restores the previous behaviour
+    exactly.
     """
     from cards.acceptance import verify_card
 
@@ -691,6 +878,30 @@ def process_generation(
     retry_pending: List[tuple] = []
 
     for card in runnable:
+        moved = _stale_inputs(card, inputs, root)
+        if moved:
+            log(
+                f"mrph> [generation {index}/{total}] {card.custom_id!r} was "
+                f"compiled from file(s) that changed while this generation was "
+                f"being judged ({', '.join(moved)}) -- its answer is discarded "
+                f"UNREAD, nothing is written"
+            )
+            if verify and card.acceptance and max_regenerations > 0:
+                retry_pending.append((card, _stale_result(moved)))
+            else:
+                # Nothing to regenerate with (no acceptance, or no retries
+                # left): fail the card rather than write a morph that never saw
+                # the file it is about to replace. A failed card blocks its
+                # dependents, which is the correct cascade -- they would have
+                # been compiled from this card's output.
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id,
+                    "failed",
+                    reason=REASON_STALE,
+                    acceptance_output=_stale_message(moved),
+                )
+                blocked.add(card.custom_id)
+            continue
         if verify and card.acceptance:
             outcome = verify_card(card, results, root, acceptance_timeout, log)
             if outcome.passed:
@@ -804,6 +1015,15 @@ def run_deck(
     responses to judge) fails every card it carried terminally -- no retry. A
     failed or skipped card's transitive dependents are skipped.
 
+    Two failures are the machine's own, not the executor's, and both are
+    recorded under :attr:`CardOutcome.reason`. A card that cannot be COMPILED
+    (:func:`compile_for_batch`) never reaches the provider and fails alone --
+    the rest of its generation is submitted as usual. A card whose declared
+    inputs CHANGED between compiling and judging (the stale-inputs guard above)
+    has its answer discarded unread: it is regenerated from the current files
+    when it has acceptance and a retry left, and fails otherwise, rather than
+    overwriting whatever moved under it.
+
     ``on_accepted`` (see :data:`AcceptedHook`) fires as each card is accepted, so
     a blocking ``/nightly`` pass produces the same per-card commits, in the same
     order, as the split-step route -- the hook is the ONLY thing the two paths
@@ -839,9 +1059,10 @@ def run_deck(
 
         # Compile only now -- generation N-1's morphs are already on disk, so a
         # dependent card's context slice sees the fresh files.
-        requests: List[dict] = []
-        for card in runnable:
-            requests.extend(compile_card(card, root))
+        requests, inputs, runnable = _compile_generation(
+            runnable, root, index, total, outcomes, blocked, log)
+        if not runnable:
+            continue
 
         batch_id, results = _submit_poll_collect(requests, backend, poll_interval)
         batch_ids.append(batch_id)
@@ -863,6 +1084,7 @@ def run_deck(
             inline_retries=True,
             on_accepted=on_accepted,
             batch_ids=batch_ids,
+            inputs=inputs,
         )
 
     return DeckResult(outcomes=outcomes, generations=composition, batch_ids=batch_ids)
@@ -892,10 +1114,12 @@ def build_retry_cards(
     """
     retry_cards: List[MorphCard] = []
     for card, prev_result in pending:
+        why = ("acceptance failed" if _acceptance_ran(prev_result)
+               else "previous answer discarded unread")
         log(
             f"mrph> [generation {index}/{total}] retry "
             f"{attempt}/{max_regenerations} for card {card.custom_id!r} "
-            f"(acceptance failed)"
+            f"({why})"
         )
         retry_cards.append(_retry_card(card, attempt, prev_result))
     return retry_cards
@@ -915,6 +1139,7 @@ def process_retry_batch(
     outcomes: Dict[str, CardOutcome],
     blocked: set,
     on_accepted: Optional[AcceptedHook] = None,
+    inputs: Optional[Dict[str, CompiledInputs]] = None,
 ) -> List[tuple]:
     """Judge one retry batch's results; return what is still pending after it.
 
@@ -964,6 +1189,29 @@ def process_retry_batch(
 
     next_pending: List[tuple] = []
     for retry_card, (card, prev_result) in zip(retry_cards, pending):
+        # Keyed by the RETRY card's id: a retry is compiled on its own, from the
+        # tree as it stood when the retry batch went out, and several retries
+        # travel in one batch and are judged into the same tree -- the very
+        # situation the guard is for.
+        moved = _stale_inputs(retry_card, inputs, root)
+        if moved:
+            log(
+                f"mrph> [generation {index}/{total}] {card.custom_id!r} was "
+                f"compiled from file(s) that changed while retry {attempt} was "
+                f"being judged ({', '.join(moved)}) -- discarded UNREAD"
+            )
+            if attempt < max_regenerations:
+                next_pending.append((card, _stale_result(moved)))
+            else:
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id,
+                    "failed",
+                    attempts=1 + attempt,
+                    reason=REASON_STALE,
+                    acceptance_output=_stale_message(moved),
+                )
+                blocked.add(card.custom_id)
+            continue
         outcome = verify_card(retry_card, results, root, acceptance_timeout, log)
         if outcome.passed:
             outcomes[card.custom_id] = CardOutcome(
@@ -1037,9 +1285,30 @@ def _run_retries(
         retry_cards = build_retry_cards(
             pending, attempt, index, total, max_regenerations, log)
 
-        requests: List[dict] = []
-        for retry_card in retry_cards:
-            requests.extend(compile_card(retry_card, root))
+        requests, inputs, compiled, failures = compile_for_batch(retry_cards, root)
+        if failures:
+            # A retry that will not compile is the original card failing, with
+            # the compiler's message as its diagnosis: it never reaches the
+            # provider, so there is nothing to judge and nothing to retry.
+            errors = dict(failures)
+            for custom_id, error in failures:
+                log(f"mrph> [generation {index}/{total}] retry for {custom_id!r} "
+                    f"could not be compiled: {error}")
+            settled = []
+            for retry_card, pair in zip(retry_cards, pending):
+                error = errors.get(retry_card.custom_id)
+                if error is None:
+                    settled.append(pair)
+                    continue
+                card, _previous = pair
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id, "failed", attempts=attempt,
+                    reason=REASON_COMPILE, acceptance_output=error)
+                blocked.add(card.custom_id)
+            retry_cards = compiled
+            pending = settled
+            if not pending:
+                return
 
         batch_id, results = _submit_poll_collect(requests, backend, poll_interval)
         if batch_ids is not None:
@@ -1047,4 +1316,5 @@ def _run_retries(
 
         pending = process_retry_batch(
             retry_cards, pending, results, attempt, index, total, root, log,
-            acceptance_timeout, max_regenerations, outcomes, blocked, on_accepted)
+            acceptance_timeout, max_regenerations, outcomes, blocked, on_accepted,
+            inputs=inputs)

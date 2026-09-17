@@ -777,6 +777,7 @@ class _FakeBot:
 
     report_unexpected = staticmethod(MorphBot.report_unexpected)
     git_notes = staticmethod(MorphBot.git_notes)
+    deck_notes = staticmethod(MorphBot.deck_notes)
     split_run_flags = staticmethod(MorphBot.split_run_flags)
 
     def __init__(self, backend):

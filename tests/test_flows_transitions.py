@@ -92,6 +92,7 @@ class _StubMorphBot:
     # run opened, the commit each accepted card became) out of the log they
     # otherwise discard.
     git_notes = staticmethod(MorphBot.git_notes)
+    deck_notes = staticmethod(MorphBot.deck_notes)
     split_run_flags = staticmethod(MorphBot.split_run_flags)
 
     def __init__(self, backend, label="fake-processor"):

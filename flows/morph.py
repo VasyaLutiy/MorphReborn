@@ -18,11 +18,18 @@ from settings import load_settings, load_registry
 
 from cards.schema import CardError
 from cards.deck import DeckError
+from cards.hazards import (
+    HazardError,
+    errors as hazard_errors,
+    find_hazards,
+    format_hazards,
+)
 from cards.generations import ensure_parent_dir, is_truncated_response, run_deck
 from cards.store import (
     DeckStore,
     StoreError,
     begin_run,
+    preflight_deck,
     build_deck_status,
     collect_generation,
     list_runs,
@@ -69,8 +76,18 @@ RULES:
   - A card names exactly one of "target" and "targets", never both.
   - Every "context_slice" path must already exist in the project OR be the target
     of another card in this array.
+  - NO TWO CARDS MAY WRITE THE SAME FILE unless one depends_on the other. Batch
+    requests cannot see each other, so the second write would silently replace the
+    first. Changes to one file belong in ONE card; files that change together
+    belong in one card's "targets".
   - Use depends_on so no card reads a file another card in the same generation is
-    still writing (dependent changes serialize into later generations).
+    still writing (dependent changes serialize into later generations). That
+    includes reading it implicitly: an EMPTY "context_slice" means the whole
+    project, so such a card reads every other card's target as it was BEFORE the
+    batch. Name the slice when the deck has more than one card.
+  - These two rules are checked mechanically before the deck runs
+    (cards/hazards.py): a missing depends_on edge is added for you, but two cards
+    writing one file refuse the run. Getting it right here saves a generation.
   - Use the flat card shape, e.g.:
     {{"custom_id":"gen-foo","intent":"generate","target":"foo.py",
       "context_slice":["bar.py"],"acceptance":"pytest tests/test_foo.py -q",
@@ -268,6 +285,19 @@ class MorphBot(ConsoleBot):
         prefix keeps that one channel open without reopening the rest.
         """
         return [line for line in lines if line.startswith("mrph> git:")]
+
+    @staticmethod
+    def deck_notes(lines):
+        """The deck-ownership lines a store call logged, for the chat.
+
+        The sibling of :meth:`git_notes`, and for the same reason: the run
+        preflight (:func:`cards.store.preflight_deck`) reports things no result
+        object carries -- a dependency edge it added to the backlog, a card
+        reading a sibling's target through an empty slice. Both are facts about
+        the deck the operator wrote, and both are invisible in the run summary.
+        """
+        return [line for line in lines
+                if line.startswith(("mrph> deck repair:", "mrph> deck warning:"))]
 
     @staticmethod
     def resolve_processor_ids(registry, spec):
@@ -547,7 +577,7 @@ class MorphBot(ConsoleBot):
 /exit - Exit the application gracefully.
 
 Morph 2.0 batch orchestrator (see documentation/batch-orchestrator.md):
-/deck - Show the backlog, its generations and each card's status ("/deck reset" discards the run state, keeping the backlog; "/deck clear" empties the backlog, keeping the run state; "/deck runs" lists the archived runs).
+/deck - Show the backlog, its generations and each card's status ("/deck check" reports file ownership -- which cards of one generation contend for one file; "/deck reset" discards the run state, keeping the backlog; "/deck clear" empties the backlog, keeping the run state; "/deck runs" lists the archived runs).
 /card - Add a card: "/card" pastes one as JSON; "/card <goal>" decomposes a goal into cards.
 /submit - Compile and submit the current generation ("@id" pins a processor, "@all" the local pool).
 /collect - Fetch, verify and integrate the submitted generation, then advance ("/collect wait" polls until it lands, printing progress).
@@ -857,7 +887,8 @@ every slot is busy. /settings shows what is idle, busy or queued.
             if retries:
                 attempt = max(int(entry.get("attempt", 1)) for entry in retries.values())
                 lines.append(f"    that batch is regeneration {attempt} of "
-                             f"{', '.join(sorted(retries))} (acceptance failed)")
+                             f"{', '.join(sorted(retries))} (the previous "
+                             f"attempt was rejected)")
         lines.append("  generations:")
         for number, generation in enumerate(view.generations, start=1):
             marker = ""
@@ -876,6 +907,65 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 elif outcome.status == "skipped" and outcome.reason:
                     detail = f" (dependency {outcome.reason})"
             lines.append(f"    {custom_id:24} {status}{detail}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _hazard_lines(custom_ids=None):
+        """File-ownership lines for the current backlog, for the ``/card`` reply.
+
+        Reported, never refused. There is no command to EDIT a card yet, so a
+        ``/card`` that refused the add would leave an operator holding a deck
+        they cannot fix from inside the CLI -- and the add is not where the
+        damage would be done anyway: the run preflight is, and it repairs what
+        it can and refuses the rest before anything is paid for. What this owes
+        the operator is to say so at the moment the deck acquires the problem,
+        while the two cards are still in their head.
+
+        ``custom_ids`` narrows the report to the hazards involving those cards
+        (the ones just added); ``None`` reports the whole deck.
+        """
+        hazards = find_hazards(DeckStore(".").load_cards())
+        if custom_ids is not None:
+            wanted = set(custom_ids)
+            hazards = [hazard for hazard in hazards
+                       if hazard.left in wanted or hazard.right in wanted]
+        if not hazards:
+            return []
+        lines = ["mrph> file ownership:", format_hazards(hazards)]
+        if hazard_errors(hazards):
+            lines.append("    The run will add the missing depends_on edge where "
+                         "one exists and refuse the deck where none does -- "
+                         "\"/deck check\" shows the whole picture.")
+        return lines
+
+    @staticmethod
+    def _deck_check_text():
+        """Render ``/deck check``: what two cards of one generation do to one file.
+
+        The question the deck view cannot answer. Generations say WHEN each card
+        runs; this says whether the cards that run together can. See
+        ``cards/hazards.py`` for what each kind means.
+        """
+        cards = DeckStore(".").load_cards()
+        if not cards:
+            return "mrph> The deck is empty -- nothing to check."
+        hazards = find_hazards(cards)
+        if not hazards:
+            return (f"mrph> {len(cards)} card(s), no file-ownership hazards: no "
+                    f"two cards of one generation write the same file, and none "
+                    f"reads a file another writes.")
+        fatal = hazard_errors(hazards)
+        lines = [f"mrph> {len(hazards)} file-ownership hazard(s) in {len(cards)} "
+                 f"card(s):", format_hazards(hazards)]
+        if fatal:
+            lines.append(f"  {len(fatal)} of these stop a run. /submit and "
+                         f"/nightly add a missing depends_on edge themselves "
+                         f"(and save it to the backlog); a pair that WRITES one "
+                         f"file has to be split by hand.")
+        else:
+            lines.append("  None of these stop a run -- they are the reads a "
+                         "whole-project slice makes implicitly, and the failure "
+                         "cascades a missing edge leaves open.")
         return "\n".join(lines)
 
     @staticmethod
@@ -909,19 +999,26 @@ every slot is busy. /settings shows what is idle, busy or queued.
         return "\n".join(lines)
 
     def build_deck_transition(self):
-        """``/deck`` shows the backlog; ``/deck reset`` and ``/deck runs`` do more.
+        """``/deck`` shows the backlog; reset/clear/runs/check do more.
 
         The reset is the only way out of a run the user wants to abandon (a deck
         already ``done``, or a batch that cannot be collected any more): the
         backlog stays, every card goes back to ``pending``. ``runs`` lists the
         archived runs instead of the backlog -- the history the backlog view
-        cannot show, since ``deck.json`` only ever holds the current one. Any
+        cannot show, since ``deck.json`` only ever holds the current one.
+        ``check`` reports file ownership (:func:`cards.hazards.find_hazards`):
+        which cards of one generation contend for one file -- the one deck
+        property the generation view cannot show. Any
         other argument to ``/deck`` is ignored -- bare ``/deck`` is a status view
         and stays one.
         """
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
             arguments = (action.get("text") or "").split()
+            if len(arguments) > 1 and arguments[1].lower() == "check":
+                await action["context"].bot.send_message(
+                    chat_id=chat_id, text=self._deck_check_text())
+                return
             if len(arguments) > 1 and arguments[1].lower() == "runs":
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=self._runs_text())
@@ -1000,8 +1097,10 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 return
             await action["context"].bot.send_message(
                 chat_id=chat_id,
-                text=f"mrph> Added card \"{card.custom_id}\" -> {card.target} "
-                     f"({card.intent}).")
+                text="\n".join(
+                    [f"mrph> Added card \"{card.custom_id}\" -> {card.target} "
+                     f"({card.intent})."]
+                    + self._hazard_lines([card.custom_id])))
             await action["context"].bot.send_message(chat_id=chat_id, text=self._deck_text())
             await nested_transition(action)
 
@@ -1060,6 +1159,10 @@ every slot is busy. /settings shows what is idle, busy or queued.
             lines = [f"mrph> Added {len(added)} card(s) from the decomposition:"]
             for card in added:
                 lines.append(f"    {card.custom_id} -> {card.target} ({card.intent})")
+            # A decomposition is where ownership mistakes are MADE -- one goal
+            # becoming twenty cards is exactly when two of them quietly take the
+            # same file -- so the reply names them next to the cards themselves.
+            lines += self._hazard_lines([card.custom_id for card in added])
             await action["context"].bot.send_message(chat_id=chat_id, text="\n".join(lines))
             await action["context"].bot.send_message(chat_id=chat_id, text=self._deck_text())
             await nested_transition(action)
@@ -1126,6 +1229,17 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     chat_id=chat_id, text=f"mrph> {error}")
                 await nested_transition(action)
                 return
+            except HazardError as error:
+                # Refused BEFORE a branch was opened or a batch was paid for:
+                # two cards of one generation cannot share a file. The message
+                # is the full report, one line per offending pair.
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text=f"mrph> The deck was not submitted -- {error}\n"
+                         f"mrph> Fix the cards (/deck check lists them) and "
+                         f"/submit again. Nothing was sent.")
+                await nested_transition(action)
+                return
             except (CardError, DeckError) as error:
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=f"mrph> Backlog is invalid: {error}")
@@ -1146,7 +1260,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
 
             if result.submitted:
                 self._active_backend = backend
-                lines = self.git_notes(notes) + [
+                lines = self.deck_notes(notes) + self.git_notes(notes) + [
                     f"mrph> Submitted generation {result.generation_number}/"
                     f"{result.total_generations} on \"{label}\" (batch {result.batch_id}):",
                     f"    cards: {', '.join(result.card_ids)}",
@@ -1157,7 +1271,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 text = "\n".join(lines)
             else:
                 self._active_backend = None
-                lines = self.git_notes(notes) + [
+                lines = self.deck_notes(notes) + self.git_notes(notes) + [
                     "mrph> Nothing to submit -- the deck run is complete."]
                 for custom_id, dependency in result.skipped:
                     lines.append(f"    skipped {custom_id} (dependency {dependency})")
@@ -1338,14 +1452,30 @@ every slot is busy. /settings shows what is idle, busy or queued.
             # opened here, and the commit hook built from what it returns.
             notes = []
             try:
+                # File ownership first: a deck whose cards contend for a file is
+                # refused here, before a branch exists and before a token is
+                # paid for -- and the repairable half of it (a card reading what
+                # a sibling writes) is repaired into the backlog on the way
+                # through, so the run executes the deck as saved.
+                cards = preflight_deck(store, cards, log=notes.append)
                 run_state = begin_run(store, cards, root=".", use_git=use_git,
                                       backend_label=label, log=notes.append)
+            except HazardError as error:
+                await action["context"].bot.send_message(
+                    chat_id=chat_id,
+                    text="\n".join(self.deck_notes(notes) + [
+                        f"mrph> The deck was not run -- {error}",
+                        "mrph> Fix the cards (/deck check lists them) and "
+                        "/nightly again. Nothing was sent and no branch was "
+                        "opened."]))
+                await nested_transition(action)
+                return
             except StoreError as error:
                 await action["context"].bot.send_message(
                     chat_id=chat_id, text=f"mrph> {error}")
                 await nested_transition(action)
                 return
-            git_lines = self.git_notes(notes)
+            git_lines = self.deck_notes(notes) + self.git_notes(notes)
 
             await action["context"].bot.send_message(
                 chat_id=chat_id,

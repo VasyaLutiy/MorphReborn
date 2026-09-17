@@ -72,15 +72,25 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from cards import repo
 from cards.acceptance import AcceptanceResult
-from cards.compiler import compile_card
+from cards.compiler import CompiledInputs
 from cards.deck import load_deck, validate_deck
 from cards.generations import (
     CardOutcome,
+    REASON_COMPILE,
     build_retry_cards,
+    compile_for_batch,
     process_generation,
     process_retry_batch,
     resolve_runnable,
     split_into_generations,
+)
+from cards.hazards import (
+    check_deck,
+    errors as hazard_errors,
+    find_hazards,
+    repair_deck,
+    repairable,
+    warnings as hazard_warnings,
 )
 from cards.schema import MorphCard
 
@@ -185,6 +195,24 @@ def _outcome_from_dict(data: dict) -> CardOutcome:
         winning_variant=data.get("winning_variant"),
         acceptance_output=data.get("acceptance_output"),
     )
+
+
+def _inputs_to_state(state: dict, inputs: Dict[str, CompiledInputs]) -> None:
+    """Persist what the batch now in flight was compiled from."""
+    state["inputs"] = {custom_id: captured.to_dict()
+                       for custom_id, captured in inputs.items()}
+
+
+def _inputs_from_state(state: dict) -> Dict[str, CompiledInputs]:
+    """Read back :func:`_inputs_to_state`.
+
+    A state file written before this record existed simply has none, and the
+    staleness check is then skipped for that generation rather than failing it:
+    an in-flight batch from an older version must still be collectable.
+    """
+    stored = state.get("inputs") or {}
+    return {custom_id: CompiledInputs.from_dict(data)
+            for custom_id, data in stored.items()}
 
 
 def _outcomes_from_state(state: dict) -> Dict[str, CardOutcome]:
@@ -318,6 +346,10 @@ class DeckStore:
             "backend_label": None,     # which processor(s) the in-flight batch runs on
             "submitted_ids": [],       # runnable card ids in the in-flight batch
             "retries": {},             # original custom_id -> in-flight retry dict
+            # What each request of the IN-FLIGHT batch was compiled from:
+            # (variant-less) custom_id -> CompiledInputs.to_dict(). Collection
+            # checks it before believing an answer; see _inputs_from_state.
+            "inputs": {},
             "outcomes": {},            # custom_id -> outcome dict
             "deck_id": None,           # this run's id; names its branch and archive
             "branch": None,            # the git branch the run owns, or None
@@ -618,6 +650,63 @@ def make_card_committer(
     return commit
 
 
+def preflight_deck(
+    store: DeckStore,
+    cards: List[MorphCard],
+    log: Callable[[str], None] = print,
+    strict: bool = False,
+) -> List[MorphCard]:
+    """Check file ownership before a run spends anything; repair what it can.
+
+    The gate every route into a run passes through. It runs
+    :func:`cards.hazards.find_hazards` over the deck as it stands and then:
+
+    * **repairs** the read/write hazards (:func:`cards.hazards.repair_deck`) by
+      adding the missing ``depends_on`` edges, which serialize a reader after
+      the card that writes what it reads. Each edge is logged and the repaired
+      deck is SAVED to the backlog -- the deck as executed has to be the deck on
+      disk, or the composition locked into the run state would describe cards
+      that ``.morph/deck.json`` does not contain, and the run archive would
+      record a deck that never ran;
+    * **refuses** the deck if anything is left that cannot be repaired -- two
+      cards of one generation writing one file, or a pair whose serialization
+      would close a cycle -- by raising :class:`cards.hazards.HazardError`
+      (a :class:`cards.deck.DeckError`, so every caller already reports it);
+    * **warns**, on the way out, about the hazards that are real but not fatal:
+      an empty slice reading a sibling's target, a cross-generation read with no
+      edge to carry the failure cascade. ``strict`` turns those into refusals
+      too, for an operator who wants the machine hard-line.
+
+    Returns the cards to run -- the repaired list when anything was repaired,
+    the input list otherwise. Raises before anything is opened, submitted,
+    written or repaired, so a refused deck costs nothing and comes back exactly
+    as its author left it: a run that will not start must not also have edited
+    the backlog on its way to saying so.
+    """
+    hazards = find_hazards(cards)
+    fixable = set(repairable(hazards))
+    blocking = [hazard for hazard in hazard_errors(hazards)
+                if hazard not in fixable]
+    if blocking or (strict and hazard_warnings(hazards)):
+        # Refused as authored. check_deck raises with the whole report -- the
+        # repairable hazards included, because an operator fixing a deck wants
+        # everything that is wrong with it, not the subset that stopped it.
+        check_deck(cards, strict=strict)
+
+    repaired, edges = repair_deck(cards, hazards)
+    if edges:
+        for hazard in edges:
+            log(f"mrph> deck repair: {hazard.right!r} now depends on "
+                f"{hazard.left!r} -- it reads {', '.join(hazard.paths)}, which "
+                f"{hazard.left!r} writes. They run in consecutive generations.")
+        store._save_cards(repaired)
+        log(f"mrph> deck repair: {len(edges)} dependency edge(s) added to the "
+            f"backlog; the deck runs in the repaired order.")
+    for hazard in check_deck(repaired, strict=strict):
+        log(f"mrph> deck warning: {hazard.message()}")
+    return repaired
+
+
 def begin_run(
     store: DeckStore,
     cards: List[MorphCard],
@@ -635,8 +724,16 @@ def begin_run(
     and returns it so the caller can build the commit hook from it.
 
     Raises :class:`StoreError` on a dirty working tree (see :func:`_open_branch`);
-    nothing is written when it does.
+    nothing is written when it does. Raises
+    :class:`cards.hazards.HazardError` on a deck whose cards contend for a file
+    -- checked here as well as in :func:`preflight_deck`, because this function
+    is a public way into a run and a gate with a way around it is not a gate.
+    Callers that want the repairable hazards REPAIRED (every CLI route does)
+    call :func:`preflight_deck` first and pass its cards here -- and the check
+    below then passes silently, which is why it does not log the warnings a
+    second time: the caller that repaired the deck has already reported them.
     """
+    check_deck(cards)
     state = DeckStore._default_state()
     state["generations"] = [
         [card.custom_id for card in generation]
@@ -933,6 +1030,9 @@ def recover_orphaned_local_batch(store: DeckStore) -> bool:
     state["backend_label"] = None
     state["submitted_ids"] = []
     state["retries"] = {}
+    # Including what that batch was compiled from: nothing is in flight to check
+    # it against any more, and the re-send writes its own record.
+    state["inputs"] = {}
     store.save_state(state)
     return True
 
@@ -1001,7 +1101,7 @@ def _ensure_run_started(
     root: str = ".",
     use_git: bool = True,
     log: Callable[[str], None] = print,
-) -> None:
+) -> List[MorphCard]:
     """Lock in the generation composition on the first submit of a fresh run.
 
     The composition is computed once, from the backlog as it stands at the first
@@ -1015,10 +1115,17 @@ def _ensure_run_started(
     neither -- which is why ``use_git`` is only ever consulted here, and why
     opting out halfway through a run is not a thing that can happen.
 
-    Raises :class:`StoreError` on a dirty working tree, before anything has been
-    compiled, submitted or saved.
+    Raises :class:`StoreError` on a dirty working tree, and
+    :class:`cards.hazards.HazardError` on a deck whose cards contend for a file
+    -- both before anything has been compiled, submitted or saved.
+
+    Returns the cards the run is to use: the first submit passes the backlog
+    through :func:`preflight_deck`, which may add dependency edges, and the
+    composition is then locked in from THAT deck. A later submit finds a
+    composition already there and returns the cards it was given untouched.
     """
     if not state.get("generations"):
+        cards = preflight_deck(store, cards, log=log)
         state["generations"] = [
             [card.custom_id for card in generation]
             for generation in split_into_generations(cards)
@@ -1028,6 +1135,7 @@ def _ensure_run_started(
         state["batch_ids"] = []
         state["deck_id"] = _unique_deck_id(store, cards)
         state["branch"] = _open_branch(root, state["deck_id"], use_git, log)
+    return cards
 
 
 def submit_generation(
@@ -1069,7 +1177,8 @@ def submit_generation(
             "the deck run is complete; run /deck reset before submitting again")
 
     cards = store.load_cards()
-    _ensure_run_started(store, state, cards, root=root, use_git=use_git, log=log)
+    cards = _ensure_run_started(
+        store, state, cards, root=root, use_git=use_git, log=log)
     # Persist the run's identity the moment it has one. Waiting until the batch
     # is away would leave a branch that exists on disk and nowhere in the state
     # file if compiling or submitting then failed -- and the next /submit would
@@ -1128,9 +1237,38 @@ def submit_generation(
         f"mrph> [generation {index + 1}/{total}] submitting "
         f"{len(runnable)} card(s): {', '.join(ids)}"
     )
-    requests: List[dict] = []
-    for card in runnable:
-        requests.extend(compile_card(card, root))
+    # Compiling reads the project and can fail on one card (a slice naming a
+    # file that is not there is the ordinary case). That card fails; the rest of
+    # the generation still goes out. See ``cards.generations.compile_for_batch``
+    # for why this is not allowed to take the run with it.
+    requests, inputs, compiled, failures = compile_for_batch(runnable, root)
+    for custom_id, error in failures:
+        log(f"mrph> [generation {index + 1}/{total}] {custom_id!r} could not be "
+            f"compiled and was NOT submitted: {error}")
+        outcomes[custom_id] = CardOutcome(
+            custom_id, "failed", reason=REASON_COMPILE, acceptance_output=error)
+        blocked.add(custom_id)
+
+    if not compiled:
+        # Nothing survived compilation: the generation is settled without a
+        # batch. Advance so the next /submit moves on (the failures block their
+        # dependents, which resolve_runnable will skip) and finish the run if
+        # this was the last generation -- an empty batch must never be sent.
+        state["generation_index"] = index + 1
+        state["phase"] = PHASE_DONE if index + 1 >= total else PHASE_IDLE
+        state["batch_id"] = None
+        state["submitted_ids"] = []
+        state["inputs"] = {}
+        _store_outcomes(state, outcomes)
+        if state["phase"] == PHASE_DONE:
+            archive_run(store, state, cards, root=root, log=log)
+        store.save_state(state)
+        return SubmitResult(
+            submitted=False, done=state["phase"] == PHASE_DONE,
+            generation_number=index + 1, total_generations=total, batch_id=None,
+            skipped=skipped_here)
+
+    ids = [card.custom_id for card in compiled]
     batch_id = backend.submit(requests)
 
     state["phase"] = PHASE_SUBMITTED
@@ -1139,6 +1277,7 @@ def submit_generation(
     state["backend_label"] = backend_label
     state["submitted_ids"] = ids
     state["batch_ids"] = list(state.get("batch_ids") or []) + [batch_id]
+    _inputs_to_state(state, inputs)
     _store_outcomes(state, outcomes)
     store.save_state(state)
 
@@ -1175,7 +1314,8 @@ def _pending_from_retries(
             continue
         output = entry.get("acceptance_output")
         previous = None if output is None else AcceptanceResult(
-            passed=False, exit_code=None, output=output, timed_out=False)
+            passed=False, exit_code=entry.get("exit_code"), output=output,
+            timed_out=bool(entry.get("timed_out")))
         pending.append((card, previous))
     return pending, attempt
 
@@ -1187,6 +1327,7 @@ def _record_retry(
     attempt: int,
     batch_id: str,
     outcomes: Dict[str, CardOutcome],
+    inputs: Optional[Dict[str, CompiledInputs]] = None,
 ) -> None:
     """Persist a just-submitted regeneration batch as the run's in-flight work.
 
@@ -1211,9 +1352,19 @@ def _record_retry(
             # The previous attempt's acceptance output, so a regeneration that
             # outlives the process still knows what to tell the executor.
             "acceptance_output": previous.output if previous is not None else None,
+            # ...and whether a command actually RAN for it. Without this a
+            # failure read back after a restart cannot be told from an answer
+            # that was rejected unread, and the next attempt's prompt would
+            # blame the executor for a test that was never executed
+            # (``cards.generations._retry_card``).
+            "exit_code": previous.exit_code if previous is not None else None,
+            "timed_out": bool(previous.timed_out) if previous is not None else False,
         }
         for card, previous in pending
     }
+    # The retry batch is now the in-flight one, so its compiled inputs replace
+    # the generation's: state["inputs"] always describes what is in a queue.
+    _inputs_to_state(state, inputs or {})
     _store_outcomes(state, outcomes)
     store.save_state(state)
 
@@ -1345,6 +1496,11 @@ def collect_generation(
     # the run state, so it exists only for a run that opened a branch.
     on_accepted = make_card_committer(root, state, log)
 
+    # What the batch being collected was compiled from, so an answer written
+    # against files that have since changed is discarded unread instead of
+    # overwriting whatever changed them (``cards.generations`` stale guard).
+    inputs = _inputs_from_state(state)
+
     if retries:
         pending, attempt = _pending_from_retries(retries, by_id)
         retry_cards = build_retry_cards(
@@ -1352,7 +1508,8 @@ def collect_generation(
             log=lambda _line: None)  # already logged when it was submitted
         pending = process_retry_batch(
             retry_cards, pending, results, attempt, index + 1, total, root, log,
-            acceptance_timeout, max_regenerations, outcomes, blocked, on_accepted)
+            acceptance_timeout, max_regenerations, outcomes, blocked, on_accepted,
+            inputs=inputs)
     else:
         attempt = 0
         pending = process_generation(
@@ -1361,7 +1518,8 @@ def collect_generation(
             backend=backend, poll_interval=poll_interval, log=log, verify=verify,
             acceptance_timeout=acceptance_timeout,
             max_regenerations=max_regenerations, outcomes=outcomes,
-            blocked=blocked, inline_retries=False, on_accepted=on_accepted)
+            blocked=blocked, inline_retries=False, on_accepted=on_accepted,
+            inputs=inputs)
 
     if pending:
         # Submit the next regeneration, persist it, and stop. The generation
@@ -1369,11 +1527,32 @@ def collect_generation(
         attempt += 1
         next_cards = build_retry_cards(
             pending, attempt, index + 1, total, max_regenerations, log)
-        requests: List[dict] = []
-        for retry_card in next_cards:
-            requests.extend(compile_card(retry_card, root))
+        requests, retry_inputs, _compiled, failures = compile_for_batch(
+            next_cards, root)
+        if failures:
+            # A retry that will not compile never reaches the provider, so there
+            # is nothing left to judge for that card: it fails here, carrying
+            # the compiler's message as its diagnosis.
+            errors = dict(failures)
+            kept: List[tuple] = []
+            for retry_card, pair in zip(next_cards, pending):
+                error = errors.get(retry_card.custom_id)
+                if error is None:
+                    kept.append(pair)
+                    continue
+                card, _previous = pair
+                log(f"mrph> [generation {index + 1}/{total}] retry for "
+                    f"{card.custom_id!r} could not be compiled: {error}")
+                outcomes[card.custom_id] = CardOutcome(
+                    card.custom_id, "failed", attempts=attempt,
+                    reason=REASON_COMPILE, acceptance_output=error)
+                blocked.add(card.custom_id)
+            pending = kept
+
+    if pending:
         retry_batch_id = backend.submit(requests)
-        _record_retry(store, state, pending, attempt, retry_batch_id, outcomes)
+        _record_retry(store, state, pending, attempt, retry_batch_id, outcomes,
+                      retry_inputs)
         return CollectResult(
             in_progress=True, generation_number=index + 1,
             total_generations=total, phase=PHASE_SUBMITTED,
@@ -1388,6 +1567,9 @@ def collect_generation(
     state["batch_id"] = None
     state["submitted_ids"] = []
     state["retries"] = {}
+    # Nothing is in flight any more, so nothing is waiting to be checked
+    # against a compile; the next submit writes its own record.
+    state["inputs"] = {}
     _store_outcomes(state, outcomes)
     if state["phase"] == PHASE_DONE:
         archive_run(store, state, cards, root=root, log=log)

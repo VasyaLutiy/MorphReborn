@@ -38,9 +38,11 @@ filter is therefore duplicated below rather than imported; it mirrors
 """
 
 import copy
+import hashlib
 import json
 import os
-from typing import List
+from dataclasses import dataclass, field
+from typing import Dict, List
 
 from cards.schema import MorphCard
 from context_folder_dialog import ContextFolderDialog
@@ -182,6 +184,149 @@ def _resolve_slice(card: MorphCard, root: str, skip_target: bool = False) -> Lis
         target_keys = {_path_key(root, target) for target in card.targets}
         paths = [path for path in paths if _path_key(root, path) not in target_keys]
     return paths
+
+
+# -- what one compilation actually read ---------------------------------------
+#
+# WHY a card's inputs are captured and re-checked, and not merely compiled.
+# A generation's cards are compiled TOGETHER, from the tree as it stands before
+# the batch goes out -- and then verified ONE BY ONE, into that same tree
+# (:func:`cards.acceptance.verify_card` writes at the real target paths, because
+# acceptance must test the files where they will live). So by the time card N is
+# judged, cards 1..N-1 have already written theirs. If one of those files is a
+# file card N was compiled from, card N's answer was written against a version
+# of the project that no longer exists, and accepting it overwrites a sibling's
+# accepted work with no trace: both cards report ``written`` and the run is
+# green. :mod:`cards.hazards` refuses such a deck up front; this is the runtime
+# half of the same guarantee, and it also covers what no deck check can -- a
+# human editing the tree while a batch is in a provider's queue for an hour.
+#
+# WHAT is watched, and why it is not everything the executor saw. The inputs
+# checked are the card's DECLARED ones: its targets, plus the paths its
+# ``context_slice`` names. The whole-project walk an EMPTY slice resolves to is
+# deliberately not watched, although the executor did read it. Watching it would
+# declare every card of a generation stale the moment the first one is accepted
+# -- an empty slice contains every sibling's target -- and so buy one extra
+# provider queue (20-40 minutes, ``Head_Pains.md`` 3.3) per generation to
+# regenerate answers that are almost always fine. An empty slice IS a
+# declaration that the project is read as a snapshot; :mod:`cards.hazards`
+# reports what that snapshot will miss (``implicit-read``) at the only time
+# anything can be done about it, while the deck is being written.
+#
+# What the watched set does cover is the whole of the destructive case: a card
+# can only destroy another card's accepted work through a file it WRITES, and
+# every target is watched. A stale read of a named slice file is watched too,
+# because naming a file is a statement that its contents matter to this card.
+#
+# The paths are captured rather than re-derived, so the check re-reads exactly
+# the files the record was taken from -- a file the tree merely GREW in the
+# meantime (``.pytest_cache/README.md``, dropped by the first acceptance run of
+# the very generation being judged) is not a change to anything this card was
+# compiled from, and must not read as one.
+
+# Per-path content digest width. Full SHA-256 is 64 hex characters and this map
+# is persisted per card in ``.morph/state.json``; 16 hex characters are 64 bits,
+# which no accidental edit collides with, and keeps a whole-project card's
+# record to a couple of kilobytes.
+_DIGEST_WIDTH = 16
+
+# What :func:`_digest_file` records for a path that is not there. Distinct from
+# any hash, so a file appearing or disappearing reads as a change like any other.
+_ABSENT = "absent"
+
+
+def _digest_file(path: str) -> str:
+    """The content digest of one file, or :data:`_ABSENT` when it is missing.
+
+    Read in binary and hashed whole: a card is stale when the BYTES it was
+    compiled from differ, and nothing cheaper is trustworthy here -- the
+    acceptance layer deliberately rewrites mtimes (see
+    :func:`cards.acceptance._stamp_distinct_mtime`), so any stat-based shortcut
+    would be reading the one field another guard is already moving on purpose.
+    """
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return _ABSENT
+    return hashlib.sha256(data).hexdigest()[:_DIGEST_WIDTH]
+
+
+def card_inputs(card: MorphCard, root: str = ".") -> List[str]:
+    """The files a card DECLARES it is compiled from, relative to ``root``, sorted.
+
+    Its ``context_slice`` as written -- an empty one resolves to the whole
+    project for the prompt, but declares nothing here, for the reason given
+    above -- plus its targets, which ``patch`` and ``todo`` ship as "Original
+    file" and which a ``generate`` card may legitimately overwrite.
+    Deduplicated by canonical path, so a file named twice under two spellings is
+    one input.
+    """
+    paths = sorted(card.context_slice)
+    seen = {_path_key(root, path) for path in paths}
+    for target in card.targets:
+        key = _path_key(root, target)
+        if key not in seen:
+            seen.add(key)
+            paths.append(target)
+    return sorted(paths)
+
+
+@dataclass(frozen=True)
+class CompiledInputs:
+    """The files one compilation read, and what they held at that moment.
+
+    Captured next to :func:`compile_card` and carried until the card's answer is
+    judged -- through ``.morph/state.json`` when the two happen in different CLI
+    sessions. :meth:`changed` is the question it exists to answer, and it names
+    the files rather than merely reporting a boolean, because "this card was
+    compiled from a foo.py that no longer exists" is only actionable if the log
+    says ``foo.py``.
+    """
+
+    digests: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def paths(self) -> List[str]:
+        """The files read, sorted -- what the executor actually saw."""
+        return sorted(self.digests)
+
+    @classmethod
+    def capture(cls, card: MorphCard, root: str = ".") -> "CompiledInputs":
+        """Record what a compilation of ``card`` declares it reads, right now."""
+        return cls({path: _digest_file(os.path.join(root, path))
+                    for path in card_inputs(card, root)})
+
+    def changed(self, root: str = ".") -> List[str]:
+        """The captured paths whose bytes differ now, sorted; empty if none do.
+
+        Only the captured paths are re-read: a file the tree has GROWN since,
+        or one an empty slice swept into the prompt without declaring, is
+        deliberately invisible here -- see the note above :func:`_digest_file`.
+        """
+        return sorted(path for path, digest in self.digests.items()
+                      if _digest_file(os.path.join(root, path)) != digest)
+
+    def to_dict(self) -> dict:
+        """The persisted shape (``.morph/state.json``)."""
+        return {"digests": dict(self.digests)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CompiledInputs":
+        """Read back :meth:`to_dict`; a missing/!malformed record captures nothing.
+
+        A record that cannot be read comes back EMPTY, which means "no captured
+        inputs" and disables the staleness check for that card rather than
+        failing the run: this guard exists to prevent silent loss, and turning a
+        state file written by an older version into a crash would be a louder
+        failure than the one it prevents.
+        """
+        if not isinstance(data, dict):
+            return cls({})
+        digests = data.get("digests")
+        if not isinstance(digests, dict):
+            return cls({})
+        return cls({str(path): str(digest) for path, digest in digests.items()})
 
 
 def _context_messages(card: MorphCard, root: str, skip_target: bool = False) -> List[dict]:
