@@ -1,0 +1,17 @@
+[
+  {
+    "custom_id": "self-batch-reason",
+    "meta": {
+      "intent": "patch",
+      "targets": [
+        "processors/batch.py",
+        "tests/test_batch_failure_reason.py"
+      ],
+      "context_slice": [
+        "tests/test_batch_backends.py"
+      ],
+      "acceptance": "python3 -m pytest tests/test_batch_failure_reason.py -q && python3 -m pytest -q"
+    },
+    "instruction": "OpenRouterBatchBackend throws away the provider's explanation when a batch is rejected. The batch object returned by GET <base>/batches/<id> carries it as {\"error\": {\"message\": \"HTTP 400: invalid batch inference job: job-submission-count for account alex-79b5d6, in use: 16, quota: 16\"}}, but status() normalizes only the status string, so a run whose batch the provider rejected reports every card as failed with no reason at all and the operator has to curl the API by hand to find out why.\n\nAdd a public method failure_reason(batch_id) to OpenRouterBatchBackend that performs one _retrieve and returns the provider's error message as a string, or None when the batch object carries no error message. Reuse _retrieve so the read-after-write grace window keeps working, and return None -- never raise -- when the batch is not visible yet (_BatchNotVisibleYet). Leave the behaviour of every existing public method exactly as it is.\n\nAlso write a NEW self-contained pytest file tests/test_batch_failure_reason.py covering: the message is returned for a rejected batch, None for a batch object with no error, and None when the batch is not visible yet. Drive it through the constructor's transport=... seam the same way tests/test_batch_backends.py does, but define your own fakes inside the new file -- do not import from another test module."
+  }
+]

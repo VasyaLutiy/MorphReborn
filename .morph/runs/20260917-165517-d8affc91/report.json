@@ -1,0 +1,29 @@
+{
+  "deck_id": "20260917-165517-d8affc91",
+  "completed_at": "2026-09-17T17:32:36.541",
+  "branch": "morph/20260917-165517-d8affc91",
+  "backend_label": "glm",
+  "generations": [
+    [
+      "self-batch-reason"
+    ]
+  ],
+  "batch_ids": [
+    "batch-1789653318-fESQ1YOvfd5hzZvyVKeb",
+    "batch-1789654219-LjPtAg4wsInyDg8MnKvp"
+  ],
+  "outcomes": {
+    "self-batch-reason": {
+      "custom_id": "self-batch-reason",
+      "status": "written",
+      "paths": [
+        "./processors/batch.py",
+        "./tests/test_batch_failure_reason.py"
+      ],
+      "reason": null,
+      "attempts": 2,
+      "winning_variant": "self-batch-reason.r1",
+      "acceptance_output": null
+    }
+  }
+}
