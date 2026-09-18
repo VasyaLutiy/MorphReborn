@@ -101,6 +101,11 @@ STATE_FILE = "state.json"
 RUNS_DIR = "runs"
 REPORT_FILE = "report.json"
 
+# Where a run's deck is written IN the repository at the moment it starts
+# (write_run_deck): deliberately OUTSIDE ``.morph/``, which a project's
+# gitignore typically covers -- the point is a record git keeps.
+DECKS_DIR = "decks"
+
 # Card display statuses derived from state + backlog (Phase 5).
 STATUS_PENDING = "pending"
 STATUS_IN_FLIGHT = "in_flight"
@@ -778,6 +783,10 @@ def begin_run(
     state["backend_label"] = backend_label
     state["deck_id"] = _unique_deck_id(store, cards)
     state["branch"] = _open_branch(root, state["deck_id"], use_git, log)
+    # The deck goes into the repository BEFORE anything runs on it: a run that
+    # dies mid-flight still has its plan in the branch's history
+    # (write_run_deck).
+    write_run_deck(state, cards, root=root, log=log)
     store.save_state(state)
     return state
 
@@ -874,6 +883,57 @@ def _write_json(path: str, payload) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+
+
+def write_run_deck(
+    state: dict,
+    cards: List[MorphCard],
+    root: str = ".",
+    log: Callable[[str], None] = print,
+) -> None:
+    """Write the deck a run is about to execute INTO the repository, at its start.
+
+    The archive (:func:`archive_run`) is written when a run FINISHES. A run that
+    never finishes -- the nightly pass and the machine dying at 02:00 is the case
+    that motivated this -- has by then left its accepted cards on the branch as
+    commits and its plan nowhere, because the only copy of the order it was
+    executing lived in ``.morph/deck.json``, which the repository ignores. This
+    writes the deck to ``decks/<deck-id>.json`` and commits it on the run's own
+    branch BEFORE the first card is compiled, so ``git log`` answers "what was
+    this run supposed to do" for a run that died halfway as well as one that
+    finished.
+
+    The content is the archived deck's serialization exactly -- the same
+    :func:`card_to_dict`, through the same :func:`_write_json` -- so
+    :func:`cards.deck.load_deck` reads it back into the same cards and the
+    system holds no second deck format.
+
+    A run that holds no branch still gets the file: ``nogit`` opts out of
+    commits, not of keeping a record on disk. A commit git refuses is reported
+    and the run goes on -- the order is on disk either way, which is the
+    decision :func:`archive_run` already made for the archive and is copied
+    here deliberately.
+    """
+    deck_id = state.get("deck_id")
+    if not deck_id:
+        # No identity, no file name; begin_run mints one before calling.
+        return
+    directory = os.path.join(root, DECKS_DIR)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{deck_id}.json")
+    _write_json(path, [card_to_dict(card) for card in cards])
+    if not state.get("branch"):
+        return
+    try:
+        sha = repo.commit_paths(
+            root, [path],
+            f"morph run {deck_id}: the deck as submitted",
+            {"Morph-Run": deck_id})
+    except repo.GitError as error:
+        log(f"mrph> git: the run's deck is on disk but not committed: {error}")
+        return
+    if sha:
+        log(f"mrph> git: the run's deck committed as {sha[:10]}.")
 
 
 def archive_run(
