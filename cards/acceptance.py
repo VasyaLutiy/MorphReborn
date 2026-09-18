@@ -72,43 +72,196 @@ def _elision_line(dropped: int) -> str:
     return _ELISION_TEMPLATE.format(dropped)
 
 
+DIAGNOSIS_MARKERS = (
+    "Error",
+    "error:",
+    "assert",
+    "FAILED",
+    "Traceback",
+    "E ",
+)
+"""Substrings that mark a clipped log's line as a diagnosis line.
+
+:func:`clip_output` rescues a line of the elided middle when it carries any of
+these -- a plain, case-sensitive substring test, the same for every entry
+(``E `` is spelled for the error-detail lines pytest writes with an ``E ``
+prefix, and matches those lines the same way the others match theirs). The
+rescue exists because a regeneration can fix a cause it is shown and cannot
+fix one it is not; extend the tuple in place when a new failure vocabulary
+shows up and every entry will be matched the same way.
+"""
+
+
 def clip_output(text: str) -> str:
-    """Clip ``text`` to the :data:`_OUTPUT_TAIL_CAP` budget, head AND tail kept.
+    """Clip ``text`` to the :data:`_OUTPUT_TAIL_CAP` budget, head AND tail
+    kept, the diagnosis lines of the elided middle rescued.
 
-    Text at or under the budget is returned unchanged. Longer text keeps its
-    first quarter -- where a failing suite puts its first, and most causal,
-    traceback -- and its last three quarters (the summary, the final errors),
-    with the noisy middle replaced by a line naming how many characters were
-    dropped. The marker is paid for out of the tail's three-quarter share, so
-    the result never exceeds the budget.
+    Text at or under the budget is returned unchanged. Longer text is rebuilt
+    from WHOLE LINES: every line of the result is either a whole line of the
+    input or an elision marker line, so a cut never lands inside a line. The
+    head keeps the input's opening lines within the first-quarter share of the
+    budget, the tail keeps its closing lines within what remains, and -- the
+    reason this clipper reads lines at all -- a line of the elided middle that
+    carries any marker in :data:`DIAGNOSIS_MARKERS` is rescued instead of
+    dropped. Rescued lines keep their input order and are filled BEFORE the
+    tail spends the rest of the budget: the line naming the cause is worth
+    more than the fortieth line of a summary. (The measured failure that
+    bought this: a dropped middle once held ``intent must be one of ...``,
+    the entire diagnosis, and a card burned every retry on a cause it was
+    never shown.)
 
-    The dropped count in that marker is exact: the number of characters of
-    ``text`` absent from the result. The marker's length depends on that
-    count's width, and the count on the marker's length, so the two are
-    settled together -- each pass moves the count only by the marker's own
-    length, which converges in two or three passes for any output a command
-    can produce, and the loop below is bounded regardless.
+    Every gap between two kept stretches is named by exactly one elision
+    marker built from :data:`_ELISION_TEMPLATE`, and the number it carries is
+    EXACT: the count of input characters dropped in that gap -- several gaps,
+    several markers. The result is therefore ``part_1 + marker_1 + part_2 +
+    ... + part_n``, with every ``part_i`` a contiguous substring of the input,
+    and a walk that adds ``len(part_i)`` for each part and the number
+    ``marker_i`` names for each marker ends exactly at ``len(text)`` -- the
+    property ``tests/test_clip_output.py`` checks by performing that walk.
+    Line alignment guarantees the kept part before a gap ends its own line,
+    so the marker there omits the newline the template opens with rather than
+    invent a blank line; the template's line itself is what names the gap.
+
+    One exception, pinned by ``tests/test_clip_output.py``: an input whose
+    single line is itself longer than the cap has no whole line to keep, and
+    a partial line is the honest answer there -- it falls back to the
+    character-level cut this function made before it learned to read lines
+    (first quarter, marker, last three quarters, the template used verbatim
+    because the cuts land mid-line and need its newlines). Two further
+    degradations, forced by line alignment rather than chosen: a first line
+    longer than the head budget is never cut to fit, so the head starts empty
+    and the first marker names the loss; and a diagnosis line too large for
+    the budget left is left dropped in the middle it came from, kept whole or
+    not at all.
     """
     if len(text) <= _OUTPUT_TAIL_CAP:
         return text
-    head_len = _OUTPUT_TAIL_CAP // 4           # the first-quarter share
-    tail_budget = _OUTPUT_TAIL_CAP - head_len  # the last-three-quarters share
-    # Start as if the marker were free, then settle marker length against tail
-    # length: settled means head_len + len(line) + tail_len == the cap exactly,
-    # with the count the marker prints equal to the characters it replaces.
-    tail_len = tail_budget
-    line = _elision_line(len(text) - head_len - tail_len)
-    for _ in range(8):
-        settled = tail_budget - len(line)
-        if settled == tail_len:
+
+    lines = text.splitlines(keepends=True)
+
+    # The pinned exception: one line, longer than the cap, so nothing whole
+    # can be kept from it. Cut characters the way this function always did --
+    # first quarter, marker, last three quarters -- settling the marker's
+    # length against the tail's share exactly as before.
+    if len(lines) == 1:
+        head_len = _OUTPUT_TAIL_CAP // 4
+        tail_budget = _OUTPUT_TAIL_CAP - head_len
+        tail_len = tail_budget
+        marker = _elision_line(len(text) - head_len - tail_len)
+        for _ in range(8):
+            settled = tail_budget - len(marker)
+            if settled == tail_len:
+                break
+            tail_len = settled
+            marker = _elision_line(len(text) - head_len - tail_len)
+        tail_len = min(tail_len, _OUTPUT_TAIL_CAP - head_len - len(marker))
+        tail_text = text[-tail_len:] if tail_len > 0 else ""
+        return text[:head_len] + marker + tail_text
+
+    # Char offsets: where each line starts, plus the sentinel past the last,
+    # so a run of lines spans offsets[start] .. offsets[end].
+    offsets = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    offsets.append(offset)
+
+    # Head: the input's opening whole lines, within the first-quarter share.
+    # A first line longer than the budget is never cut (line alignment); the
+    # head then starts empty and the first marker names the loss.
+    head_budget = _OUTPUT_TAIL_CAP // 4
+    head_end = 0
+    head_len = 0
+    for line in lines:
+        if head_len + len(line) > head_budget:
             break
-        tail_len = settled
-        line = _elision_line(len(text) - head_len - tail_len)
-    # Pure insurance (the loop above always settles): whatever the pair agreed
-    # on, the marker may never push the result past the budget.
-    tail_len = min(tail_len, _OUTPUT_TAIL_CAP - head_len - len(line))
-    tail_text = text[-tail_len:] if tail_len > 0 else ""
-    return text[:head_len] + line + tail_text
+        head_end += 1
+        head_len += len(line)
+
+    # Diagnosis rescue: middle lines carrying a DIAGNOSIS_MARKERS marker, in
+    # input order, filled before the tail spends the rest of the budget. Each
+    # maximal run of rescued lines opens one gap and so adds one marker, and
+    # marker_ub bounds any marker from above (no marker can name more dropped
+    # characters than the input has), which keeps the budget honest before
+    # the exact markers exist.
+    marker_ub = len(_elision_line(len(text)))
+    rescued = []
+    rescued_len = 0
+    runs = 0
+    prev = head_end - 1 if head_end else None
+    for index in range(head_end, len(lines)):
+        line = lines[index]
+        if not any(candidate in line for candidate in DIAGNOSIS_MARKERS):
+            continue
+        adjacent = prev is not None and index == prev + 1
+        new_runs = runs if adjacent else runs + 1
+        new_len = rescued_len + len(line)
+        if head_len + new_len + (new_runs + 1) * marker_ub > _OUTPUT_TAIL_CAP:
+            continue  # does not fit whole, and a cut may not land inside it
+        rescued.append(index)
+        rescued_len = new_len
+        runs = new_runs
+        prev = index
+
+    # Tail: the input's closing whole lines, within what the head, the
+    # rescued lines and their markers have left. The walk stops at the first
+    # rescued line (a suffix may not skip over one) and at the first line
+    # that does not fit (a suffix may not be broken to keep more of it).
+    rescued_set = set(rescued)
+    tail_budget = _OUTPUT_TAIL_CAP - head_len - rescued_len - (runs + 1) * marker_ub
+    tail_start = len(lines)
+    tail_len = 0
+    for index in range(len(lines) - 1, head_end - 1, -1):
+        if index in rescued_set:
+            break
+        if tail_len + len(lines[index]) > tail_budget:
+            break
+        tail_start = index
+        tail_len += len(lines[index])
+
+    # Assemble: the maximal runs of kept lines are the parts, and every gap
+    # between two of them is named by one exact marker. The head is a prefix
+    # and the tail a suffix, so the kept set's runs, in order, are the parts.
+    kept = [False] * len(lines)
+    for index in range(head_end):
+        kept[index] = True
+    for index in rescued:
+        kept[index] = True
+    for index in range(tail_start, len(lines)):
+        kept[index] = True
+
+    pieces = []
+    covered = 0  # input characters accounted for: parts written, gaps named
+    index = 0
+    while index < len(lines):
+        if not kept[index]:
+            index += 1
+            continue
+        run_start = index
+        while index < len(lines) and kept[index]:
+            index += 1
+        dropped = offsets[run_start] - covered
+        if dropped:
+            marker = _elision_line(dropped)
+            if not pieces or pieces[-1].endswith("\n"):
+                # The part before the gap already ended its own line -- or
+                # the marker opens the result -- so the newline the template
+                # opens with would only invent a blank line.
+                marker = marker[1:]
+            pieces.append(marker)
+        pieces.append("".join(lines[run_start:index]))
+        covered = offsets[index]
+
+    # The tail is a suffix, so a trailing gap exists only when it is empty
+    # and the kept lines stop short of the input's last line.
+    if covered < len(text):
+        marker = _elision_line(len(text) - covered)
+        if not pieces or pieces[-1].endswith("\n"):
+            marker = marker[1:]
+        pieces.append(marker)
+
+    return "".join(pieces)
 
 
 # -- the stale-bytecode guard ------------------------------------------------

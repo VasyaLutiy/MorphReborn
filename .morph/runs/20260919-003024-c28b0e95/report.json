@@ -1,0 +1,236 @@
+{
+  "deck_id": "20260919-003024-c28b0e95",
+  "completed_at": "2026-09-19T02:31:56.439",
+  "branch": "morph/20260919-003024-c28b0e95",
+  "backend_label": "glm",
+  "generations": [
+    [
+      "clip-rescues-diagnosis",
+      "budget-module",
+      "notify-module",
+      "deck-order-in-git",
+      "repl-collect-resilience"
+    ],
+    [
+      "run-budget-wiring",
+      "notify-wiring"
+    ],
+    [
+      "budget-flags"
+    ]
+  ],
+  "batch_ids": [
+    "batch-1789767025-AHUgLOi1IlWJNMY81VaU",
+    "batch-1789769697-pySWM69pnl3ZXFWwcqgK",
+    "batch-1789771222-fDLmDjvSrnqDezJ79m71",
+    "batch-1789772932-wGpWJbsxaqWzzW3P0NUN"
+  ],
+  "outcomes": {
+    "clip-rescues-diagnosis": {
+      "custom_id": "clip-rescues-diagnosis",
+      "status": "written",
+      "paths": [
+        "./cards/acceptance.py",
+        "./tests/test_clip_output.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "clip-rescues-diagnosis",
+      "acceptance_output": null,
+      "commit": "7355131353e22ecac7d243b6edb979d0394e29bf",
+      "diffstat": [
+        {
+          "path": "cards/acceptance.py",
+          "insertions": 185,
+          "deletions": 32
+        },
+        {
+          "path": "tests/test_clip_output.py",
+          "insertions": 461,
+          "deletions": 0
+        }
+      ]
+    },
+    "budget-module": {
+      "custom_id": "budget-module",
+      "status": "written",
+      "paths": [
+        "./cards/budget.py",
+        "./tests/test_budget.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "budget-module",
+      "acceptance_output": null,
+      "commit": "729a9f1685d7b2dd1c39b428555f1b5493111599",
+      "diffstat": [
+        {
+          "path": "cards/budget.py",
+          "insertions": 193,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_budget.py",
+          "insertions": 288,
+          "deletions": 0
+        }
+      ]
+    },
+    "notify-module": {
+      "custom_id": "notify-module",
+      "status": "written",
+      "paths": [
+        "./cards/notify.py",
+        "./tests/test_notify.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "notify-module",
+      "acceptance_output": null,
+      "commit": "5c1fa257c39cf83626a89c52642d7be97a3ff555",
+      "diffstat": [
+        {
+          "path": "cards/notify.py",
+          "insertions": 207,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_notify.py",
+          "insertions": 241,
+          "deletions": 0
+        }
+      ]
+    },
+    "deck-order-in-git": {
+      "custom_id": "deck-order-in-git",
+      "status": "written",
+      "paths": [
+        "./cards/store.py",
+        "./tests/test_deck_order.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "deck-order-in-git",
+      "acceptance_output": null,
+      "commit": "82b44f6411fad76d35f481702b816e21f699271b",
+      "diffstat": [
+        {
+          "path": "cards/store.py",
+          "insertions": 60,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_deck_order.py",
+          "insertions": 282,
+          "deletions": 0
+        }
+      ]
+    },
+    "repl-collect-resilience": {
+      "custom_id": "repl-collect-resilience",
+      "status": "written",
+      "paths": [
+        "./flows/morph.py",
+        "./tests/test_flows_transitions.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "repl-collect-resilience",
+      "acceptance_output": null,
+      "commit": "1d55c97a6e48ea8e21f582d635efc514717577e3",
+      "diffstat": [
+        {
+          "path": "flows/morph.py",
+          "insertions": 31,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_flows_transitions.py",
+          "insertions": 91,
+          "deletions": 1
+        }
+      ]
+    },
+    "notify-wiring": {
+      "custom_id": "notify-wiring",
+      "status": "written",
+      "paths": [
+        "./cards/cli_cycle.py",
+        "./tests/test_notify_wiring.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "notify-wiring",
+      "acceptance_output": null,
+      "commit": "9860767edad68301fa27d23f7baff88fe77b3547",
+      "diffstat": [
+        {
+          "path": "cards/cli_cycle.py",
+          "insertions": 26,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_notify_wiring.py",
+          "insertions": 362,
+          "deletions": 0
+        }
+      ]
+    },
+    "run-budget-wiring": {
+      "custom_id": "run-budget-wiring",
+      "status": "written",
+      "paths": [
+        "./cards/generations.py",
+        "./tests/test_run_budget.py"
+      ],
+      "reason": null,
+      "attempts": 2,
+      "winning_variant": "run-budget-wiring.r1",
+      "acceptance_output": null,
+      "commit": "b56a870fb0763cd107c72ed6842c4a4934b6b254",
+      "diffstat": [
+        {
+          "path": "cards/generations.py",
+          "insertions": 65,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_run_budget.py",
+          "insertions": 254,
+          "deletions": 0
+        }
+      ]
+    },
+    "budget-flags": {
+      "custom_id": "budget-flags",
+      "status": "written",
+      "paths": [
+        "./cards/cli.py",
+        "./cards/cli_cycle.py",
+        "./tests/test_budget_flags.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "budget-flags",
+      "acceptance_output": null,
+      "commit": "41c36a90e348f1c1d4819b586db6f6f3df8875c4",
+      "diffstat": [
+        {
+          "path": "cards/cli.py",
+          "insertions": 32,
+          "deletions": 5
+        },
+        {
+          "path": "cards/cli_cycle.py",
+          "insertions": 4,
+          "deletions": 1
+        },
+        {
+          "path": "tests/test_budget_flags.py",
+          "insertions": 272,
+          "deletions": 0
+        }
+      ]
+    }
+  }
+}

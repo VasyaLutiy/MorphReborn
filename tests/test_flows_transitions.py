@@ -32,6 +32,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from cards.cli_wait import ResilientBackend
 from cards.store import DeckStore, collect_generation, submit_generation
 from flows.morph import MorphBot
 
@@ -269,6 +270,53 @@ class _QueuedBackend:
         }
 
 
+class _BlinkingBackend:
+    """A queue whose first status poll dies the way a provider does.
+
+    One ``ConnectionResetError`` on the first poll, normal answers from then
+    on -- the transport blink that used to tear a whole ``/collect wait``
+    down and lose the run behind it. Responses are the default fenced block,
+    as in :class:`_QueuedBackend`.
+    """
+
+    def __init__(self):
+        self.polls = 0
+        self.submissions = []
+
+    def submit(self, requests):
+        self.submissions.append(requests)
+        return "cloud-batch-1"
+
+    def status(self, batch_id):
+        self.polls += 1
+        if self.polls == 1:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return "completed"
+
+    def collect(self, batch_id):
+        return {request["custom_id"]: "```python\nOK = 1\n```"
+                for request in self.submissions[0]}
+
+
+class _FakeClock:
+    """The clock :class:`cards.cli_wait.ResilientBackend` waits on, faked.
+
+    ``sleep`` records the backoff delay and advances ``now`` instead of
+    sleeping, so a wait that backs off costs the suite no time at all.
+    """
+
+    def __init__(self):
+        self.moment = 0.0
+        self.slept = []
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.moment += seconds
+
+    def now(self):
+        return self.moment
+
+
 class CollectWaitTests(unittest.TestCase):
     """``/collect`` polls once; ``/collect wait`` polls until the work lands."""
 
@@ -397,17 +445,58 @@ class CollectWaitTests(unittest.TestCase):
         self.assertEqual(len(self.nested_calls), 1)
 
     def test_collect_wait_reports_an_unexpected_failure_instead_of_looping(self):
+        # The wait now wraps its backend in cards.cli_wait.ResilientBackend, so
+        # a poll that fails EVERY time is retried until the wait's budget is
+        # spent. The budget is pinned to zero here -- a spent budget gives up
+        # after the first attempt -- and the assertions stay what they were:
+        # the operator is told the failure by name, the run state is untouched.
         self._add("card-a", "gen_a.py")
         submit_generation(self.store, _Exploding(on="never"), root=".",
                           backend_label="fake", log=lambda _l: None)
 
-        with mock.patch("flows.morph.COLLECT_WAIT_POLL_SECONDS", 0):
+        with mock.patch("flows.morph.COLLECT_WAIT_POLL_SECONDS", 0), \
+                mock.patch("flows.morph.COLLECT_WAIT_TIMEOUT_SECONDS", 0):
             messages = self._collect(_Exploding(on="status"), text="/collect wait")
 
         text = "\n".join(messages)
         self.assertIn("RuntimeError", text)
         self.assertIn("still in flight", text)
         self.assertEqual(self.store.load_state()["phase"], "submitted")
+        self.assertEqual(len(self.nested_calls), 1)
+
+    def test_collect_wait_survives_a_blinked_connection(self):
+        # One failed GET in the small hours used to tear the whole wait down:
+        # here the FIRST status poll raises ConnectionResetError and every poll
+        # after it answers normally. The wrapper is built by the real class with
+        # an injected fake clock -- the backoff delay is recorded, not slept --
+        # so the wait lands the generation instead of reporting the failure, and
+        # the suite pays no time for it.
+        self._add("card-a", "gen_a.py")
+        backend = _BlinkingBackend()
+        submit_generation(self.store, backend, root=".", backend_label="fake",
+                          log=lambda _l: None)
+
+        clock = _FakeClock()
+
+        def factory(inner, **kwargs):
+            return ResilientBackend(inner, sleep=clock.sleep, now=clock.now,
+                                    **kwargs)
+
+        with mock.patch("flows.morph.COLLECT_WAIT_POLL_SECONDS", 0), \
+                mock.patch("flows.morph.ResilientBackend", factory):
+            messages = self._collect(backend, text="/collect wait")
+
+        text = "\n".join(messages)
+        self.assertIn("Collected generation 1/1", text)
+        self.assertNotIn("Unexpected failure", text)
+        # The blinked poll left its line instead of silence: the wrapper's log
+        # reaches the chat.
+        self.assertIn("batch status: ConnectionResetError", text)
+        self.assertIn("retrying in 5s", text)
+        # The backoff ran on the injected clock.
+        self.assertEqual(clock.slept, [5.0])
+        self.assertTrue(os.path.exists("gen_a.py"))
+        self.assertEqual(self.store.load_state()["phase"], "done")
         self.assertEqual(len(self.nested_calls), 1)
 
 
@@ -533,3 +622,4 @@ class TruncatedInteractiveSaveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
