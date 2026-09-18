@@ -58,6 +58,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from cards.budget import (
+    BudgetExceeded,
+    BudgetLedger,
+    RunBudget,
+    STATUS_BUDGET_EXCEEDED,
+)
 from cards.compiler import CompiledInputs, compile_card
 from cards.schema import MorphCard
 
@@ -995,6 +1001,8 @@ def run_deck(
     acceptance_timeout: float = 300.0,
     max_regenerations: int = 2,
     on_accepted: Optional[AcceptedHook] = None,
+    budget: Optional[RunBudget] = None,
+    now: Callable[[], float] = time.monotonic,
 ) -> DeckResult:
     """Execute a deck generation by generation through one batch backend.
 
@@ -1041,6 +1049,30 @@ def run_deck(
     need to share for that, since everything else about a commit is derived from
     the card and its outcome.
 
+    An unattended run may also give itself limits (:mod:`cards.budget`):
+    ``budget``, when given, is a :class:`~cards.budget.RunBudget` judged by a
+    :class:`~cards.budget.BudgetLedger` built here on the injected ``now`` clock
+    (the default reads ``time.monotonic``; a test hands in a fake and advances
+    it instead of sleeping). The ledger is asked ONCE per generation, at the
+    boundary and before anything of that generation is submitted, with
+    PROSPECTIVE counts: the cards settled so far plus the ones about to be
+    submitted, and the regeneration batches already spent -- which need no
+    bookkeeping in the retry path at all, because every submission of this run
+    (generation and retry alike) appends one id to ``batch_ids``, so
+    ``len(batch_ids)`` minus the generation batches submitted is the retry count
+    exactly. The ledger is never consulted inside a generation or its retries,
+    so a limit can only ever stop the run BETWEEN generations: whatever was
+    submitted before the refusal finishes being judged and written ordinarily.
+    A refusal is an ordinary stop, not an error:
+    :class:`~cards.budget.BudgetExceeded` is caught here and never leaves this
+    function -- every card of the deck still without an outcome is stamped
+    ``cards.budget.STATUS_BUDGET_EXCEEDED`` with the refusal's reason (one
+    sentence naming the limit and both numbers, also logged as one line) and
+    blocked, and the run returns its :class:`DeckResult` exactly as on any
+    other finish, so the caller archives, commits and reports a budgeted run
+    like any other. ``budget=None`` (the default) is a ledger that never
+    refuses: today's behaviour, unchanged.
+
     ``backend`` is duck-typed: only ``submit(requests) -> batch_id``,
     ``status(batch_id) -> str`` and ``collect(batch_id) -> {custom_id: text|None}``
     are called. Returns a :class:`DeckResult` whose ``generations`` records the
@@ -1056,11 +1088,43 @@ def run_deck(
     # custom_ids that failed or were skipped: their dependents cannot run.
     blocked: set = set()
     batch_ids: List[str] = []
+    # The run's self-imposed limits (:mod:`cards.budget`), consulted once per
+    # generation boundary and nowhere else -- deliberately not from inside the
+    # retry path, so a limit can only ever stop the run between generations.
+    ledger = BudgetLedger(budget, now=now)
+    # Generation batches submitted so far. Every submission of this run -- a
+    # generation batch here and, from inside :func:`process_generation`, a retry
+    # batch alike -- appends one id to ``batch_ids``, so at each boundary
+    # ``len(batch_ids) - generations_submitted`` is exactly the number of
+    # regeneration batches already spent, and the retry path keeps no budget
+    # bookkeeping at all.
+    generations_submitted = 0
 
     for index, generation in enumerate(generations, start=1):
         runnable = resolve_runnable(generation, index, total, outcomes, blocked, log)
         if not runnable:
             continue
+
+        # The budget gate, at the boundary and before anything is submitted.
+        # Prospective counts: the cards settled so far plus the ones this
+        # generation is about to submit, and the regeneration batches already
+        # spent. A refusal is caught right here and becomes an ordinary finish:
+        # every card still without an outcome is stamped budget-exceeded with
+        # the reason, nothing further is submitted, and the run returns its
+        # DeckResult like any other.
+        try:
+            ledger.check(len(outcomes) + len(runnable),
+                         len(batch_ids) - generations_submitted)
+        except BudgetExceeded as exceeded:
+            log(f"mrph> {exceeded.reason}")
+            for card in cards:
+                if card.custom_id not in outcomes:
+                    outcomes[card.custom_id] = CardOutcome(
+                        card.custom_id, STATUS_BUDGET_EXCEEDED,
+                        reason=exceeded.reason)
+                    blocked.add(card.custom_id)
+            return DeckResult(outcomes=outcomes, generations=composition,
+                              batch_ids=batch_ids)
 
         ids = [card.custom_id for card in runnable]
         log(
@@ -1077,6 +1141,7 @@ def run_deck(
 
         batch_id, results = _submit_poll_collect(requests, backend, poll_interval)
         batch_ids.append(batch_id)
+        generations_submitted += 1
 
         process_generation(
             runnable,
