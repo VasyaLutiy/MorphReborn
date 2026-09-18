@@ -18,6 +18,7 @@ from llm_dialog import LLMDialog
 from scheduler import JobScheduler
 from settings import load_settings, load_registry
 
+from cards.cli_wait import ResilientBackend
 from cards.schema import CardError
 from cards.deck import DeckError
 from cards.hazards import (
@@ -1340,6 +1341,15 @@ every slot is busy. /settings shows what is idle, busy or queued.
         (:func:`cards.store.collect_generation`) -- carries on across it instead
         of stopping there. Every poll goes through the same single-poll call, so
         waiting cannot cost more than not waiting.
+
+        WHY the waiting poll wraps its backend in
+        :class:`cards.cli_wait.ResilientBackend`. A wait is hours of polls, and
+        one failed GET in the small hours used to tear all of them down -- a run
+        whose deck was fine, lost to a transport blink. The wrapper retries
+        transient failures under the wait's own budget
+        (``COLLECT_WAIT_TIMEOUT_SECONDS``, the same one the loop gives up at)
+        and logs each retry to the chat; a bare ``/collect`` stays unwrapped,
+        because one poll is its contract and a retry would break it.
         """
         async def transition(action):
             chat_id = action["update"]["effective_chat"]["id"]
@@ -1374,8 +1384,25 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     await nested_transition(action)
                     return
 
+            # A wait wraps its backend ONCE, here, before the loop, so the
+            # wrapper's shared deadline budgets the WHOLE wait and not a single
+            # poll of it (the why is in the docstring above). The wrapper logs
+            # its retries into ``retry_notes`` instead of sending them itself:
+            # a retry happens on the worker thread the executor runs
+            # ``collect_generation`` on, where nothing can await a send, so the
+            # notes are drained to the chat after each poll.
+            retry_notes = []
+            if waiting:
+                backend = ResilientBackend(
+                    backend, timeout=COLLECT_WAIT_TIMEOUT_SECONDS,
+                    log=retry_notes.append)
+
             async def send(text):
                 await action["context"].bot.send_message(chat_id=chat_id, text=text)
+
+            async def flush_retries():
+                while retry_notes:
+                    await send(f"mrph> {retry_notes.pop(0)}")
 
             loop = asyncio.get_event_loop()
             started = time.monotonic()
@@ -1387,6 +1414,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
                         functools.partial(collect_generation, store, backend,
                                           root=".", log=notes.append))
                 except StoreError as error:
+                    await flush_retries()
                     await send(f"mrph> {error}")
                     break
                 except Exception as error:
@@ -1399,12 +1427,14 @@ every slot is busy. /settings shows what is idle, busy or queued.
                     # side, local ones in this process) is still there to be
                     # collected again. ``self._active_backend`` is deliberately
                     # left set so the retry needs no re-resolution.
+                    await flush_retries()
                     await send(self.report_unexpected(
                         error, "collecting the generation",
                         "mrph> The generation is still in flight and nothing was "
                         "marked done -- the results are not lost, so run /collect "
                         "again (fix the card first if the error names one)."))
                     break
+                await flush_retries()
 
                 if not result.in_progress:
                     self._active_backend = None
@@ -1754,3 +1784,4 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 None,
                 matcher=re.compile("^.*$"),
                 on_transition=self.build_patch_prompt_input_transition(main_menu_transition))
+
