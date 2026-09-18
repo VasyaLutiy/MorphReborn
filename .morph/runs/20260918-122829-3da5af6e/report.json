@@ -1,0 +1,216 @@
+{
+  "deck_id": "20260918-122829-3da5af6e",
+  "completed_at": "2026-09-18T14:24:38.846",
+  "branch": "morph/20260918-122829-3da5af6e",
+  "backend_label": "glm",
+  "generations": [
+    [
+      "cli-json-envelope",
+      "cli-wait-backoff",
+      "cli-views",
+      "cli-backend-resolve"
+    ],
+    [
+      "cli-deck-handlers",
+      "cli-submit-collect",
+      "cli-run-cycle"
+    ],
+    [
+      "cli-main-dispatch"
+    ],
+    [
+      "cli-contract-judge"
+    ]
+  ],
+  "batch_ids": [
+    "batch-1789723711-RNE5aPkjsGpFVd3dR5zL",
+    "batch-1789725510-FvfLIbmUkZ1oXdPNhpvN",
+    "batch-1789727532-g3M39MdNSXcGpnedXntN",
+    "batch-1789728975-0nkFyDB4PrsXtvU7M3aD"
+  ],
+  "outcomes": {
+    "cli-json-envelope": {
+      "custom_id": "cli-json-envelope",
+      "status": "written",
+      "paths": [
+        "./cards/cli_json.py",
+        "./tests/test_cli_json.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "cli-json-envelope",
+      "acceptance_output": null,
+      "commit": "831e81ff6676f3e8cfa457dd7ba1c3fdfaa186b0",
+      "diffstat": [
+        {
+          "path": "cards/cli_json.py",
+          "insertions": 251,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_cli_json.py",
+          "insertions": 326,
+          "deletions": 0
+        }
+      ]
+    },
+    "cli-wait-backoff": {
+      "custom_id": "cli-wait-backoff",
+      "status": "written",
+      "paths": [
+        "./cards/cli_wait.py",
+        "./tests/test_cli_wait.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "cli-wait-backoff",
+      "acceptance_output": null,
+      "commit": "0fc4c95ee4c954a9338c0b91e2cc3497f301f2fc",
+      "diffstat": [
+        {
+          "path": "cards/cli_wait.py",
+          "insertions": 289,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_cli_wait.py",
+          "insertions": 413,
+          "deletions": 0
+        }
+      ]
+    },
+    "cli-views": {
+      "custom_id": "cli-views",
+      "status": "written",
+      "paths": [
+        "./cards/cli_views.py",
+        "./tests/test_cli_views.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "cli-views",
+      "acceptance_output": null,
+      "commit": "3375465a7cfec6f52f2a9d4dbe35e1dfb1b00f4f",
+      "diffstat": [
+        {
+          "path": "cards/cli_views.py",
+          "insertions": 203,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_cli_views.py",
+          "insertions": 576,
+          "deletions": 0
+        }
+      ]
+    },
+    "cli-backend-resolve": {
+      "custom_id": "cli-backend-resolve",
+      "status": "written",
+      "paths": [
+        "./cards/cli_backend.py",
+        "./tests/test_cli_backend.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "cli-backend-resolve",
+      "acceptance_output": null,
+      "commit": "51367e524938f70066ecba48ff4126c5cbe07d20",
+      "diffstat": [
+        {
+          "path": "cards/cli_backend.py",
+          "insertions": 152,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_cli_backend.py",
+          "insertions": 226,
+          "deletions": 0
+        }
+      ]
+    },
+    "cli-deck-handlers": {
+      "custom_id": "cli-deck-handlers",
+      "status": "written",
+      "paths": [
+        "./cards/cli_deck.py",
+        "./tests/test_cli_deck.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "cli-deck-handlers",
+      "acceptance_output": null,
+      "commit": "ff7997bb8593e1ae5208c02709028b04a83ea8d7",
+      "diffstat": [
+        {
+          "path": "cards/cli_deck.py",
+          "insertions": 214,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_cli_deck.py",
+          "insertions": 409,
+          "deletions": 0
+        }
+      ]
+    },
+    "cli-submit-collect": {
+      "custom_id": "cli-submit-collect",
+      "status": "written",
+      "paths": [
+        "./cards/cli_run.py",
+        "./tests/test_cli_run.py"
+      ],
+      "reason": null,
+      "attempts": 2,
+      "winning_variant": "cli-submit-collect.r1",
+      "acceptance_output": null,
+      "commit": "84fc424d9fe5d298a449603d0beb517805b5263f",
+      "diffstat": [
+        {
+          "path": "cards/cli_run.py",
+          "insertions": 252,
+          "deletions": 0
+        },
+        {
+          "path": "tests/test_cli_run.py",
+          "insertions": 316,
+          "deletions": 0
+        }
+      ]
+    },
+    "cli-run-cycle": {
+      "custom_id": "cli-run-cycle",
+      "status": "failed",
+      "paths": [],
+      "reason": null,
+      "attempts": 3,
+      "winning_variant": null,
+      "acceptance_output": "F.FFFFFF                                                                 [100%]\n=================================== FAILURES ===================================\n___ TestRun.test_dependency_runs_in_two_generations_and_report_records_both ____\n\nself = <test_cli_cycle.TestRun testMethod=test_dependency_runs_in_two_generations_and_report_records_both>\n\n    def test_dependency_runs_in_two_generations_and_report_records_both(self):\n        self._write_deck([\n            _card(\"card-a\", \"hello.py\"),\n            _card(\"card-b\", \"bye.py\", depends_on=[\"card-a\"]),\n        ])\n        backend = _FakeBackend({\"card-a\": \"A = 1\\n\", \"card-b\": \"B = 2\\n\"})\n>       payload, code, lines, stdout = self._run(backend)\n\ntests/test_cli_cycle.py:213: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \ntests/test_cli_cycle.py:144: in _run\n    payload, code = cli_cycle.run(\ncards/cli_cycle.py:229: in run\n    cards = store.load_cards()\ncards/store.py:292: in load_cards\n    return load_\n... [13836 characters elided] ...\n, \"clash.py\"),\n            _card(\"clash-2\", \"clash.py\"),\n        ])\n        lines = []\n        stdout = io.StringIO()\n        with contextlib.redirect_stdout(stdout):\n            with self.assertRaises(\n                    HazardError,\n                    msg=\"two cards of one generation writing one file must \"\n                        \"be refused, not run\"):\n>               cli_cycle.run(root=self.root, nogit=True, log=lines.append,\n                              backend=_ForbiddenBackend(),\n                              sleep=self.clock.sleep, now=self.clock.now)\n\ntests/test_cli_cycle.py:245: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \ncards/cli_cycle.py:229: in run\n    cards = store.load_cards()\ncards/store.py:292: in load_cards\n    return load_deck(self.deck_path)\ncards/deck.py:59: in load_deck\n    cards = [MorphCard.from_dict(item) for item in raw]\ncards/deck.py:59: in <listcomp>\n    cards = [MorphCard.from_dict(item) for item in raw]\ncards/schema.py:296: in from_dict\n    return cls(**kwargs)\n<string>:14: in __init__\n    ???\ncards/schema.py:92: in __post_init__\n    self.validate()\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\n    def validate(self) -> None:\n        \"\"\"Raise :class:`CardError` if any field is malformed.\"\"\"\n        cid = self.custom_id\n    \n        # custom_id: required, non-empty, safe character set.\n        if not isinstance(self.custom_id, str) or not self.custom_id:\n            raise _err(None, \"custom_id is required and must be a non-empty string\")\n        if not CUSTOM_ID_RE.match(self.custom_id):\n            raise _err(\n                cid,\n                \"custom_id must match ^[A-Za-z0-9._-]+$ \"\n                \"(no spaces or path separators)\",\n            )\n    \n        # intent: one of the known flows.\n        if self.intent not in VALID_INTENTS:\n>           raise _err(\n                cid,\n                \"intent must be one of \"\n                f\"{{{', '.join(VALID_INTENTS)}}}, got {self.intent!r}\",\n            )\nE           cards.schema.CardError: card 'clash-1': intent must be one of {generate, patch, todo}, got 'write clash.py'\n\ncards/schema.py:154: CardError\n=========================== short test summary info ============================\nFAILED tests/test_cli_cycle.py::TestRun::test_dependency_runs_in_two_generations_and_report_records_both\nFAILED tests/test_cli_cycle.py::TestRun::test_failing_acceptance_ends_failed_and_exits_one\nFAILED tests/test_cli_cycle.py::TestRun::test_finished_run_is_archived_and_list_runs_finds_it\nFAILED tests/test_cli_cycle.py::TestRun::test_log_receives_progress_and_stdout_stays_empty\nFAILED tests/test_cli_cycle.py::TestRun::test_passing_acceptance_exits_zero_with_written_outcome\nFAILED tests/test_cli_cycle.py::TestRun::test_payload_survives_json_dumps - c...\nFAILED tests/test_cli_cycle.py::TestRun::test_write_write_conflict_raises_and_writes_nothing\n7 failed, 1 passed in 0.14s\n",
+      "commit": null,
+      "diffstat": null
+    },
+    "cli-main-dispatch": {
+      "custom_id": "cli-main-dispatch",
+      "status": "skipped",
+      "paths": [],
+      "reason": "cli-run-cycle",
+      "attempts": 0,
+      "winning_variant": null,
+      "acceptance_output": null,
+      "commit": null,
+      "diffstat": null
+    },
+    "cli-contract-judge": {
+      "custom_id": "cli-contract-judge",
+      "status": "skipped",
+      "paths": [],
+      "reason": "cli-main-dispatch",
+      "attempts": 0,
+      "winning_variant": null,
+      "acceptance_output": null,
+      "commit": null,
+      "diffstat": null
+    }
+  }
+}
