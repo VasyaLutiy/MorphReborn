@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 
+import sys
+
 from settings import load_settings
-from flows.morph import MorphBot
 
 load_settings()
+
+if len(sys.argv) > 1:
+    # Headless: one JSON document on stdout, one exit code to the shell
+    # (cards.cli.main). The import lives inside the branch on purpose: a
+    # scripted run must complete without the console bot ever loading, and
+    # cards.cli imports nothing from flows -- transitively either.
+    from cards.cli import main
+
+    sys.exit(main(sys.argv[1:]))
+
+# No arguments: the interactive console bot, exactly as before.
+from flows.morph import MorphBot
+
 MorphBot(None).run()
