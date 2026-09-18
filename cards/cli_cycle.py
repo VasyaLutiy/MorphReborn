@@ -85,6 +85,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 from cards import cli_views
 from cards import notify
+from cards.budget import RunBudget
 from cards.cli_backend import resolve_backend
 from cards.cli_json import EXIT_INCOMPLETE, EXIT_OK
 from cards.cli_wait import ResilientBackend
@@ -126,6 +127,7 @@ def run(
     backend=None,
     sleep: Optional[Callable[[float], None]] = None,
     now: Optional[Callable[[], float]] = None,
+    budget: Optional[RunBudget] = None,
 ) -> Tuple[dict, int]:
     """Run the whole deck once, blocking, and return ``(payload, exit_code)``.
 
@@ -227,7 +229,8 @@ def run(
     #    begin_run returned, exactly as the blocking route builds it; a run
     #    with no branch (nogit, or no repository) gets None and no commits.
     committer = make_card_committer(root, state, log=log)
-    result = run_deck(cards, proxy, root=root, log=log, on_accepted=committer)
+    result = run_deck(cards, proxy, root=root, log=log, on_accepted=committer,
+                      budget=budget)
 
     # 6. Persist and archive. run_state is what keeps this run's own deck id
     #    instead of adopting the previous run's.

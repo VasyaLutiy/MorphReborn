@@ -44,6 +44,7 @@ import sys
 from typing import Callable, List, NoReturn, Optional, Tuple, Union
 
 from cards import cli_cycle, cli_deck, cli_run
+from cards.budget import RunBudget
 from cards.cli_json import EXIT_OK, EXIT_USAGE, emit, error_document, run_cli
 
 __all__ = ["main"]
@@ -178,6 +179,23 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT,
         help="seconds the WHOLE wait may take (default: 21600, six hours)")
+    # The run's self-limits, folded by the handler below into one
+    # cards.budget.RunBudget. They live on ``run`` alone: a budget bounds a
+    # WHOLE deck decision, not a step, so no other subcommand takes one.
+    # Each defaults to None -- no limit -- and each help names its unit, so
+    # an operator reading ``mrph run --help`` never guesses one.
+    run.add_argument(
+        "--max-cards", type=int, default=None,
+        help="most CARDS the run may spend; it stops itself rather than "
+             "spend one more (default: None, no limit)")
+    run.add_argument(
+        "--max-regenerations", type=int, default=None,
+        help="most REGENERATION ATTEMPTS the run may make (default: None, "
+             "no limit)")
+    run.add_argument(
+        "--deadline", type=float, default=None,
+        help="wall-clock SECONDS the run itself may last (default: None, "
+             "no limit)")
 
     report = commands.add_parser(
         "report", help="show one archived run report")
@@ -207,10 +225,12 @@ def _handler(
     will call.
 
     Pure wiring -- each branch names its handler and hands over exactly the
-    parsed values, and nothing else. The stderr logger goes to precisely the
-    three handlers that accept one (the two provider-facing steps and the
-    whole cycle); the read-only commands have nothing to log and take
-    nothing else.
+    parsed values, and nothing else. The one exception is ``run``'s three
+    budget flags, which fold into the single :class:`cards.budget.RunBudget`
+    the cycle understands before they are handed over. The stderr logger goes
+    to precisely the three handlers that accept one (the two provider-facing
+    steps and the whole cycle); the read-only commands have nothing to log
+    and take nothing else.
     """
     if args.command == "deck":
         if args.deck_command == "add":
@@ -231,9 +251,16 @@ def _handler(
             args.root, processor=args.processor, wait=args.wait,
             timeout=args.timeout, log=_stderr_log)
     if args.command == "run":
+        # The three flags fold into the one object the run understands; an
+        # absent flag is a None field, and a RunBudget of three Nones limits
+        # nothing -- exactly what a caller who gave no flags asked for.
+        budget = RunBudget(
+            max_cards=args.max_cards,
+            max_regenerations=args.max_regenerations,
+            deadline_seconds=args.deadline)
         return lambda: cli_cycle.run(
             args.root, processor=args.processor, nogit=args.nogit,
-            timeout=args.timeout, log=_stderr_log)
+            timeout=args.timeout, budget=budget, log=_stderr_log)
     return lambda: cli_deck.report(args.root, args.deck_id)
 
 
