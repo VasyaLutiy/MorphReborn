@@ -1,6 +1,23 @@
 # Morph 2.0: The Batch Orchestrator
 
-> **Status: design proposal.** Nothing in this document is implemented yet.
+> **Status: built, and running.** This document was written as a design
+> proposal; it is kept as the *rationale* — why the machine is shaped this way —
+> and no longer describes anything unbuilt. As of 2026-09-18 phases 0-7 of
+> [`DEVELOPMENT_PLAN.md`](./DEVELOPMENT_PLAN.md) are shipped: morph cards,
+> the deck compiler, batch backends, generations, mechanical acceptance with
+> best-of-N and rollback, the CLI orchestrator, the git substrate (a branch per
+> run, one provenance commit per card, changeset cards) and a headless
+> command surface. 583 tests. Morph has written several of its own features as
+> decks, including the one that lets it report what each card changed.
+>
+> **Where the current state actually lives**, because prose about a running
+> machine rots faster than the machine changes:
+> [`README_Morph2.md`](../README_Morph2.md) — how it is built today and every
+> measurement taken; [`Head_Pains.md`](../Head_Pains.md) — what hurts, with
+> evidence; [`Morph_SKILL.md`](./Morph_SKILL.md) — how to operate it;
+> [`TASK_TEMPLATE.md`](./TASK_TEMPLATE.md) — how to write a deck's
+> specification.
+>
 > It builds directly on two shipped foundations:
 > [`modeling-approach.md`](./modeling-approach.md) (stateless whole-context
 > morphs) and [`parallel-generate-scheduling.md`](./parallel-generate-scheduling.md)
