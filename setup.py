@@ -4,7 +4,7 @@ setup(
     name="mrph",
     version="1.0.55",
     scripts=["bin/mrph"],
-    py_modules=["flows.morph", "settings", "scheduler", "llm_dialog", "context_folder_dialog",
+    py_modules=["flows.morph", "flows.banner", "settings", "scheduler", "llm_dialog", "context_folder_dialog",
                 "processors.registry", "processors.ollama_processor",
                 "processors.llama_cpp_processor", "processors.openai_processor",
                 "processors.anthropic_processor", "processors.batch",

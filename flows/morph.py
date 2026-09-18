@@ -11,6 +11,8 @@ import pkg_resources
 
 from pysyun.conversation.flow.console_bot import ConsoleBot
 
+from flows.banner import render_banner
+
 from context_folder_dialog import ContextFolderDialog
 from llm_dialog import LLMDialog
 from scheduler import JobScheduler
@@ -1602,23 +1604,9 @@ every slot is busy. /settings shows what is idle, busy or queued.
     def build_state_machine(self, builder):
         menu_items = [["Generate", "Patch"], ["Deck"], ["Settings", "Help", "Exit"], ["Graph", "Version"]]
 
-        welcome_transition = self.build_menu_response_transition(
-            r'''┌────────────────────────────────────────────────────────────────────────────┐
-│ GPT Morph :: GRANDPA v1.0.55          THE GRANDPA OF CLAUDE CODE           │
-├────────────────────────────────────────────────────────────────────────────┤
-│      .----------------.          > HOW CAN I HELP YOU, KIDDO?              │
-│     /   _        _     \                                                   │
-│    |   [ ]      [ ]     |         Grandpa writes clean code.               │
-│    |       ___          |         No frameworks. No fluff.                 │
-│    |      /___\         |         Memory: 64K   Wisdom: ∞                  │
-│     \    .____.        /                                                   │
-│      '---|____|-------'          > _                                       │
-│          /|  |\                                                            │
-├────────────────────────────────────────────────────────────────────────────┤
-│ "WE DEBUGGED WITH PRINT STATEMENTS."                                       │
-└────────────────────────────────────────────────────────────────────────────┘
-''',
-            menu_items)
+        # The banner is built HERE, once, so the colour decision is taken while
+        # the process still knows whether stdout is a terminal (flows/banner.py).
+        welcome_transition = self.build_menu_response_transition(render_banner(), menu_items)
         short_menu_transition = self.build_menu_response_transition("mrph> Main menu:", menu_items)
 
         async def main_menu_transition(action):
