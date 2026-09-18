@@ -1207,12 +1207,22 @@ def submit_generation(
     phase = state.get("phase", PHASE_IDLE)
     if phase == PHASE_SUBMITTED:
         raise StoreError(
-            "a generation is already submitted; run /collect before /submit")
+            "a generation is already submitted; collect it first "
+            "(/collect in the REPL, `mrph collect` headless)")
     if phase == PHASE_DONE:
         raise StoreError(
-            "the deck run is complete; run /deck reset before submitting again")
+            "the deck run is complete; discard the run state before submitting "
+            "again (/deck reset in the REPL, `mrph deck reset` headless)")
 
     cards = store.load_cards()
+    if not cards:
+        # Пустой бэклог — это не прогон. Раньше ветка открывалась ДО того, как
+        # выяснялось, что отправлять нечего, и каждый холостой /submit оставлял
+        # в истории ветку и коммит пустого архива. ``run`` на том же входе
+        # всегда отвечал честным no-op; теперь обе команды согласованы.
+        return SubmitResult(
+            submitted=False, done=True, generation_number=0,
+            total_generations=0, batch_id=None)
     cards = _ensure_run_started(
         store, state, cards, root=root, use_git=use_git, log=log)
     # Persist the run's identity the moment it has one. Waiting until the batch
@@ -1488,8 +1498,9 @@ def collect_generation(
     state = store.load_state()
     if state.get("phase") != PHASE_SUBMITTED:
         raise StoreError(
-            "nothing is in flight; run /submit before /collect "
-            "(or /deck reset to discard the run state)")
+            "nothing is in flight; submit a generation first, or discard the "
+            "run state (/submit and /deck reset in the REPL, `mrph submit` and "
+            "`mrph deck reset` headless)")
 
     batch_id = state["batch_id"]
     total = len(state["generations"])

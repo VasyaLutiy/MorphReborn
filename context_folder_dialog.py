@@ -1,4 +1,5 @@
 import os
+import sys
 from datetime import datetime
 from typing import List, Optional
 from llm_dialog import LLMDialog
@@ -28,6 +29,13 @@ class ContextFolderDialog(LLMDialog):
         self.file_list = file_list
 
     def process(self, _):
+        # Прогресс идёт в stderr, а не в stdout. WHY: эта же сборка контекста
+        # лежит на пути безголовой команды (``mrph submit``/``run`` ->
+        # ``cards.compiler``), чей контракт обещает, что stdout — ровно один
+        # JSON-документ. Одна строка на файл среза ломала это обещание на
+        # первом же реальном вызове, и ни один тест этого не видел: все
+        # контрактные проверки падали ДО компиляции. Для человека в REPL ничего
+        # не меняется — stderr идёт в тот же терминал.
 
         dialog = self
 
@@ -40,7 +48,7 @@ class ContextFolderDialog(LLMDialog):
                     )
                 time = datetime.fromtimestamp(os.path.getmtime(file_path))
                 with open(file_path, encoding='utf-8') as file:
-                    print(f"Folder context file: {file_path}")
+                    print(f"Folder context file: {file_path}", file=sys.stderr)
                     file_contents = file.read()
                     self.assign("user", f"Contents for another file \"{file_path}\" in this project:\n\n---\n{file_contents}\n---\n", int(time.timestamp()) * 1000)
             return dialog
@@ -54,7 +62,7 @@ class ContextFolderDialog(LLMDialog):
 
                 time = datetime.fromtimestamp(os.path.getmtime(file_path))
                 with open(file_path, encoding='utf-8') as file:
-                    print(f"Folder context file: {file_path}")
+                    print(f"Folder context file: {file_path}", file=sys.stderr)
                     file_contents = file.read()
                     self.assign("user", f"Contents for another file \"{file_path}\" in this project:\n\n---\n{file_contents}\n---\n", int(time.timestamp()) * 1000)
 

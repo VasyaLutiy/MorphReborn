@@ -170,6 +170,56 @@ def deck_status(root: str) -> Dict[str, object]:
     return deck_status_to_dict(build_deck_status(DeckStore(root)))
 
 
+def deck_reset(root: str) -> Dict[str, object]:
+    """Discard the run state, keep the backlog; report what was discarded.
+
+    The headless counterpart of ``/deck reset``, and the ONLY way out of a
+    wedged run without a human editing ``.morph/`` by hand. Until it existed,
+    two error messages -- the one ``collect`` prints with nothing in flight and
+    the one ``submit`` prints on a finished run -- told the caller to run
+    ``/deck reset``, a command that lives only in the REPL: a machine-facing
+    surface advising a command the machine does not have. A runner that gets
+    stuck under cron cannot switch to an interactive session, so the advice was
+    worse than useless.
+
+    Deliberately NOT refused while a batch is in flight: that is precisely when
+    it is needed. The cards return to ``pending`` and the provider's batch is
+    left alone -- it is already paid for and can still be collected once the
+    state is rebuilt, which is the same bargain the interactive command makes.
+    """
+    store = DeckStore(root)
+    state = store.load_state()
+    had_run = bool(state.get("generations"))
+    store.reset_state()
+    return {
+        "reset": True,
+        "had_run": had_run,
+        "phase_before": state.get("phase"),
+        "branch": state.get("branch"),
+        "cards_kept": len(store.load_cards()),
+    }
+
+
+def deck_clear(root: str) -> Dict[str, object]:
+    """Empty the backlog, keep the run state; refuse while a batch is in flight.
+
+    The headless counterpart of ``/deck clear``, and it keeps that command's one
+    refusal: a generation sitting in a provider's queue is already paid for, and
+    its results can only land on cards that still exist. Clearing the backlog
+    under it would strand them. ``deck reset`` first, then ``deck clear``.
+    """
+    store = DeckStore(root)
+    cards = store.load_cards()
+    if store.load_state().get("phase") == "submitted":
+        raise CliError(
+            EXIT_REFUSED, "StoreError",
+            "a generation is still in flight; clearing the backlog would "
+            "strand its results. Run 'mrph deck reset' first, then "
+            "'mrph deck clear'")
+    store.clear()
+    return {"cleared": True, "cards_removed": len(cards)}
+
+
 def report(root: str, deck_id: Optional[str] = None) -> Dict[str, object]:
     """One archived run report, through :func:`cards.cli_views.report_to_dict`.
 

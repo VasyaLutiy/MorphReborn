@@ -176,12 +176,28 @@ class ResilientBackend:
     """
 
     def __init__(self, backend, *, timeout: float = 6 * 3600.0,
+                 submit_timeout: float = 120.0,
                  start_delay: float = 5.0, max_delay: float = 120.0,
                  permanent: Tuple[Type[BaseException], ...] = (),
                  sleep: Callable[[float], None] = time.sleep,
                  now: Callable[[], float] = time.monotonic,
                  log: Optional[Callable[[str], None]] = None):
         self._backend = backend
+        # WHY submit has its own, much shorter budget. Waiting is what
+        # legitimately takes hours: the provider queue runs 20-40 minutes and a
+        # poll that fails is worth retrying all night. SUBMISSION is not -- it
+        # is answered or refused in one call, and an error that repeats there
+        # is almost always a refusal wearing a transport costume: no
+        # credentials, a bad slug, a malformed request. 18.09 `mrph run`
+        # without an .env retried "Missing credentials" against the whole
+        # six-hour budget and would have slept through an entire unattended
+        # night. Classifying provider exceptions cannot be relied on to prevent
+        # that -- in the openai SDK every transport error and every
+        # configuration error share one base class -- so the guard is
+        # structural instead: submission may spend at most this much of the
+        # budget, whatever the error turns out to be. It never EXCEEDS the
+        # shared deadline; it only caps it.
+        self._submit_timeout = submit_timeout
         self._start_delay = start_delay
         self._max_delay = max_delay
         self._permanent = permanent
@@ -203,17 +219,32 @@ class ResilientBackend:
         """The time left, floored at zero: this call's retry timeout."""
         return max(self.remaining, 0.0)
 
-    def _through_retry(self, call: Callable[[], T], what: str) -> T:
-        """Run one backend call under the shared budget's remaining time."""
-        return retry(call, timeout=self._budget(),
+    def _through_retry(self, call: Callable[[], T], what: str,
+                       cap: Optional[float] = None) -> T:
+        """Run one backend call under the shared budget's remaining time.
+
+        ``cap`` shortens THIS call's slice of the budget without touching the
+        shared deadline: the call gets ``min(remaining, cap)``. Only submission
+        uses it -- see :attr:`_submit_timeout`.
+        """
+        budget = self._budget()
+        if cap is not None:
+            budget = min(budget, cap)
+        return retry(call, timeout=budget,
                      start_delay=self._start_delay, max_delay=self._max_delay,
                      permanent=self._permanent, sleep=self._sleep,
                      now=self._now, log=self._log, what=what)
 
     def submit(self, requests: List[dict]) -> str:
-        """Submit the deck through :func:`retry`; return the batch id."""
+        """Submit the deck through :func:`retry`; return the batch id.
+
+        Capped at :attr:`_submit_timeout`, unlike the polling calls: a refusal
+        that looks like a transport failure must not be allowed to eat the
+        whole night.
+        """
         return self._through_retry(
-            lambda: self._backend.submit(requests), "batch submit")
+            lambda: self._backend.submit(requests), "batch submit",
+            cap=self._submit_timeout)
 
     def status(self, batch_id: str) -> str:
         """Poll the batch status through :func:`retry`."""

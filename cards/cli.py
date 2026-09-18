@@ -133,6 +133,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "status", help="show the backlog and the run state")
     _add_common_options(status)
 
+    # Выход из заклиненного прогона без REPL и без рук в .morph/. Тексты
+    # ошибок `collect` и `submit` советуют именно их.
+    reset = deck_commands.add_parser(
+        "reset", help="discard the run state, keep the backlog")
+    _add_common_options(reset)
+
+    clear = deck_commands.add_parser(
+        "clear", help="empty the backlog, keep the run state")
+    _add_common_options(clear)
+
     submit = commands.add_parser(
         "submit", help="compile and submit the deck's current generation")
     _add_common_options(submit)
@@ -207,6 +217,10 @@ def _handler(
             return lambda: cli_deck.deck_add(args.root, args.file)
         if args.deck_command == "check":
             return lambda: cli_deck.deck_check(args.root)
+        if args.deck_command == "reset":
+            return lambda: cli_deck.deck_reset(args.root)
+        if args.deck_command == "clear":
+            return lambda: cli_deck.deck_clear(args.root)
         return lambda: cli_deck.deck_status(args.root)
     if args.command == "submit":
         return lambda: cli_run.submit(
