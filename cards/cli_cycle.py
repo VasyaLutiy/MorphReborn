@@ -53,6 +53,18 @@ The pieces, in the order they run:
    one. Should the read-back be unreachable, a ``cards.store.RunReport`` is
    built over the result and rendered by the same serialiser, so the shape is
    the same either way.
+8. The notification: the run speaks once, at the very end.
+   ``cards.notify.build_run_message`` renders the archived report into one
+   line -- deck id, branch, the written / failed / skipped counts, the
+   generations, the minutes -- and that line goes two places: through
+   ``cards.notify.send_notification`` into whatever channel
+   ``$MORPH_NOTIFY_CMD`` names, and to ``log``, because the terminal
+   deserves the summary that just went elsewhere. No channel configured, or
+   a channel that refused, is a ``False`` and nothing more: not an error,
+   not a changed payload, not a changed exit code. The notification is the
+   LAST thing the run does and must not be able to fail the run, so its
+   return value is discarded and the success split below is spelled exactly
+   as it was before a notification existed.
 
 Errors beyond the paths it completes are not this function's vocabulary: a
 :class:`cards.hazards.HazardError`, a :class:`cards.store.StoreError`, a
@@ -72,6 +84,7 @@ promises. Nothing here imports from ``flows``.
 from typing import Callable, Dict, Optional, Tuple
 
 from cards import cli_views
+from cards import notify
 from cards.cli_backend import resolve_backend
 from cards.cli_json import EXIT_INCOMPLETE, EXIT_OK
 from cards.cli_wait import ResilientBackend
@@ -241,6 +254,19 @@ def run(
             outcomes=dict(result.outcomes),
         )
     payload = cli_views.report_to_dict(archived)
+
+    # 8. The run speaks, and this is the last thing it does: the archived
+    #    report as the one line, handed to the channel $MORPH_NOTIFY_CMD
+    #    names, and the same line to the log -- the terminal deserves the
+    #    summary that just went elsewhere. A False back is no channel
+    #    configured, or a channel that refused: not an error, and it changes
+    #    nothing -- the payload above and the exit-code rule below are
+    #    exactly what they were before a notification existed. The return
+    #    value is discarded on purpose: send_notification answers False
+    #    rather than raising, so the run's last act cannot fail the run.
+    message = notify.build_run_message(archived)
+    notify.send_notification(message)
+    log(message)
 
     # The exit-code rule, derived from the report's own counts: every card
     # ended written, or the run is incomplete. A card with no outcome at all
