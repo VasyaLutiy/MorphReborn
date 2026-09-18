@@ -1,0 +1,67 @@
+{
+  "deck_id": "20260918-150640-34c1caaf",
+  "completed_at": "2026-09-18T17:16:41.998",
+  "branch": null,
+  "backend_label": "glm",
+  "generations": [
+    [
+      "cli-run-cycle"
+    ],
+    [
+      "cli-main-dispatch"
+    ],
+    [
+      "cli-contract-judge"
+    ]
+  ],
+  "batch_ids": [
+    "batch-1789733202-LDWizYrtXfCYduwNyaZq",
+    "batch-1789734858-BbCJ3hK4NhiLmIdOtdmo",
+    "batch-1789736556-W3LvWq7YzHFzxVq7VcQL",
+    "batch-1789739480-lY0hPIxRpDvHFQLM6sa1"
+  ],
+  "outcomes": {
+    "cli-run-cycle": {
+      "custom_id": "cli-run-cycle",
+      "status": "written",
+      "paths": [
+        "./cards/cli_cycle.py",
+        "./tests/test_cli_cycle.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "cli-run-cycle",
+      "acceptance_output": null,
+      "commit": null,
+      "diffstat": null
+    },
+    "cli-main-dispatch": {
+      "custom_id": "cli-main-dispatch",
+      "status": "written",
+      "paths": [
+        "./cards/cli.py",
+        "./bin/mrph",
+        "./tests/test_cli_main.py"
+      ],
+      "reason": null,
+      "attempts": 1,
+      "winning_variant": "cli-main-dispatch",
+      "acceptance_output": null,
+      "commit": null,
+      "diffstat": null
+    },
+    "cli-contract-judge": {
+      "custom_id": "cli-contract-judge",
+      "status": "written",
+      "paths": [
+        "./tests/test_cli_contract.py"
+      ],
+      "reason": null,
+      "attempts": 2,
+      "winning_variant": "cli-contract-judge.r1",
+      "acceptance_output": null,
+      "commit": null,
+      "diffstat": null
+    }
+  }
+}
