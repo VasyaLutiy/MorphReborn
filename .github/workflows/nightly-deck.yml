@@ -1,0 +1,165 @@
+# Прогон колоды Морфа на раннере: заказ приезжает файлом из репозитория,
+# результат уезжает веткой morph/<deck-id>. Мержит человек.
+#
+# Автоматизируется ОЖИДАНИЕ, а не решение: job засевает бэклог закоммиченной
+# колодой, гоняет её, кладёт архив артефактом и пушит только ту ветку, которую
+# прогон сам открыл. Ни мержа, ни пуша в main здесь нет и быть не должно.
+#
+# Почему job именно такой формы -- documentation/GITHUB_ACTIONS.md.
+name: Nightly deck run
+
+on:
+  schedule:
+    # 02:00 UTC ежедневно.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      deck:
+        description: "Колода в репозитории"
+        required: false
+        default: "decks/nightly.json"
+        type: string
+      processor:
+        description: "Идентификатор исполнителя (под него раскладываются секреты)"
+        required: false
+        default: "nightly"
+        type: string
+      max_cards:
+        description: "Больше скольких карт прогон не потратит"
+        required: false
+        default: "40"
+        type: string
+      max_regenerations:
+        description: "Больше скольких перегенераций прогон не сделает"
+        required: false
+        default: "6"
+        type: string
+      deadline:
+        description: "Предел прогона в секундах; обязан быть меньше лимита job"
+        required: false
+        default: "19800"
+        type: string
+
+# Раннер пушит СВОЮ ветку и только её. Дефолт репозитория -- read-only, и без
+# этой строки прогон дойдёт до конца и потеряет результат на последнем шаге.
+permissions:
+  contents: write
+
+# Два прогона в одном рабочем каталоге не живут (Head_Pains 4.5). Очередь, а не
+# отмена: прогон, который уже платит провайдеру, дорезает своё.
+concurrency:
+  group: morph-nightly-deck
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Прогнать колоду до архива
+    runs-on: ubuntu-latest
+    # Лимит job на GitHub-hosted раннере -- шесть часов. Свой держим ниже, чтобы
+    # успеть выгрузить архив и запушить ветку: убитый раннером job не
+    # архивирует ничего.
+    timeout-minutes: 350
+
+    # На событии schedule контекст inputs ПУСТ, поэтому у каждого значения есть
+    # литерал здесь, а не только в defaults выше. Без этого ночной запуск
+    # передаёт пустые строки и падает на разборе аргументов.
+    env:
+      DECK: ${{ inputs.deck || 'decks/nightly.json' }}
+      PROCESSOR: ${{ inputs.processor || 'nightly' }}
+      MAX_CARDS: ${{ inputs.max_cards || '40' }}
+      MAX_REGENERATIONS: ${{ inputs.max_regenerations || '6' }}
+      DEADLINE: ${{ inputs.deadline || '19800' }}
+
+    steps:
+      - name: Забрать репозиторий целиком
+        uses: actions/checkout@v4
+        with:
+          # Прогон коммитит по карте на своей ветке; мелкий клон делает
+          # финальный пуш гаданием.
+          fetch-depth: 0
+
+      - name: Питон той версии, на которой снята базовая линия
+        uses: actions/setup-python@v5
+        with:
+          # Пин обязателен и именно 3.9: базовая линия тестов снята на ней, а
+          # на ubuntu-latest по умолчанию 3.12, где pkg_resources из
+          # безусловного импорта flows/morph.py уже нет.
+          python-version: "3.9"
+
+      - name: Окружение в ./venv
+        # Каталог именно venv/ и именно в корне: приёмки карт пишутся как
+        # "venv/bin/python -m pytest ...", и колода, собранная на машине
+        # оператора, обязана исполниться здесь дословно. pytest ставится сюда
+        # же -- без него не запустится ни одна приёмка.
+        run: |
+          python -m venv venv
+          venv/bin/python -m pip install --upgrade pip
+          venv/bin/python -m pip install -e . pytest
+
+      - name: Личность для покарточных коммитов
+        run: |
+          git config user.name "mrph nightly"
+          git config user.email "mrph-nightly@users.noreply.github.com"
+
+      - name: Исполнитель из секретов
+        # Имена переменных зависят от идентификатора, поэтому собираются здесь,
+        # а не в env: job. Значения приходят из секретов и в лог не печатаются.
+        env:
+          TYPE: ${{ secrets.NIGHTLY_PROCESSOR_TYPE }}
+          MODEL: ${{ secrets.NIGHTLY_PROCESSOR_MODEL }}
+          ENDPOINT_URI: ${{ secrets.NIGHTLY_PROCESSOR_ENDPOINT_URI }}
+          API_KEY: ${{ secrets.NIGHTLY_PROCESSOR_API_KEY }}
+        run: |
+          test -n "$MODEL" || { echo "::error::секрет NIGHTLY_PROCESSOR_MODEL не заведён"; exit 1; }
+          upper="$(echo "$PROCESSOR" | tr '[:lower:]-' '[:upper:]_')"
+          {
+            echo "MRPH_PROCESSORS=$PROCESSOR"
+            echo "MRPH_PROCESSOR_${PROCESSOR}_TYPE=${TYPE:-openrouter}"
+            echo "MRPH_PROCESSOR_${PROCESSOR}_MODEL=$MODEL"
+            test -n "$ENDPOINT_URI" && echo "MRPH_PROCESSOR_${PROCESSOR}_ENDPOINT_URI=$ENDPOINT_URI"
+            test -n "$API_KEY" && echo "MRPH_PROCESSOR_${PROCESSOR}_API_KEY=$API_KEY"
+            echo "MRPH_PROCESSOR_UPPER=$upper"
+          } >> "$GITHUB_ENV"
+
+      - name: Засеять бэклог колодой из репозитория
+        run: |
+          test -f "$DECK" || { echo "::error::колоды нет по пути $DECK"; exit 1; }
+          venv/bin/mrph deck add --file "$DECK" --pretty
+
+      - name: Прогон
+        # Итоговую строку собирает сам Морф (cards.notify.build_run_message) и
+        # отдаёт в MORPH_NOTIFY_CMD -- сюда, в сводку job. Второй сборки текста
+        # не заводим.
+        env:
+          MORPH_NOTIFY_CMD: cat >> $GITHUB_STEP_SUMMARY
+        run: |
+          venv/bin/mrph run \
+            --processor "$PROCESSOR" \
+            --max-cards "$MAX_CARDS" \
+            --max-regenerations "$MAX_REGENERATIONS" \
+            --deadline "$DEADLINE" \
+            --pretty | tee run-payload.json
+
+      - name: Архив прогона артефактом
+        # Утром это единственная улика, поэтому шаг идёт и после падения
+        # прогона, и после упора в предел.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-run-archive
+          path: |
+            .morph/runs/**
+            run-payload.json
+          if-no-files-found: warn
+
+      - name: Запушить ветку прогона (мержит человек)
+        # ПОСЛЕДНИМ и узко: только ветка morph/*, которую прогон оставил
+        # выкаченной. Никогда main, никогда мерж. Если HEAD не такая ветка --
+        # прогон сделал не то, и автоматика останавливается отказом, а не
+        # предупреждением, которое никто не прочитает.
+        run: |
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          case "$branch" in
+            morph/*) git push origin "$branch" ;;
+            *) echo "::error::HEAD это '$branch', а не ветка прогона morph/* -- пушить нечего"; exit 1 ;;
+          esac
